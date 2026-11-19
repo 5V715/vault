@@ -2,6 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
+    <!-- build.mjs fills this in with the policy serve.mjs sends as a header (connect-src = the relay). -->
+    <meta http-equiv="Content-Security-Policy" content="__CSP__">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="referrer" content="no-referrer">
     <title>Vault to-do</title>

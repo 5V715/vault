@@ -181,7 +181,8 @@ export function createUi(doc: Document, root: HTMLElement, opts: { dev: boolean 
       const parts: Node[] = [el(doc, "h1", undefined, "Connect"), el(doc, "p", "lead", "Scan with your vault")];
       parts.push(offer.qr ? renderQr(doc, offer.qr) : el(doc, "p", "notice", "QR code unavailable."));
       parts.push(el(doc, "p", "hint", "The code expires after 60 seconds."));
-      if (opts.dev && h.onCopy) {
+      // `__DEV__` is false in release builds, so esbuild drops this branch and its strings.
+      if (__DEV__ && opts.dev && h.onCopy) {
         const onCopy = h.onCopy;
         parts.push(
           el(

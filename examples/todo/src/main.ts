@@ -13,9 +13,6 @@ import wasmBytes from "vault-web/web/vault_web_bg.wasm";
 import { TodoApp } from "./app.js";
 import { createUi } from "./view.js";
 
-declare const __RELAY_ORIGIN__: string;
-declare const __DEV__: boolean;
-
 async function main(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) throw new Error("vault-todo: #app missing");

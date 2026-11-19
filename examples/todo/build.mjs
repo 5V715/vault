@@ -10,12 +10,12 @@
 // Needs vault-web built first (in vault-web/js: npm ci, npm run build, npm run build:wasm).
 // The wasm is bundled into main.js as bytes, since the CSP has no connect-src 'self'.
 
-import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
 
-import { checkRelayOrigin } from "./serve.mjs";
+import { checkRelayOrigin, cspFor } from "./serve.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -54,7 +54,11 @@ export async function build({ relay, dev, out }) {
     legalComments: "none",
     logLevel: "warning",
   });
-  copyFileSync(join(here, "index.html"), join(out, "index.html"));
+  // The same CSP as a <meta> too, for hosts that do not send the header (a
+  // meta policy cannot enforce frame-ancestors: send the header where you can).
+  const html = readFileSync(join(here, "index.html"), "utf8");
+  if (html.split("__CSP__").length !== 2) throw new Error("index.html must have exactly one __CSP__ placeholder");
+  writeFileSync(join(out, "index.html"), html.replace("__CSP__", cspFor(relay)));
   copyFileSync(join(here, "styles.css"), join(out, "styles.css"));
   writeFileSync(join(out, ".build.json"), `${JSON.stringify({ relayOrigin: relay, dev }, null, 2)}\n`);
 }

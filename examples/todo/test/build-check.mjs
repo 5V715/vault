@@ -11,6 +11,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { build, parseArgs } from "../build.mjs";
+import { cspFor } from "../serve.mjs";
 
 const pkgWeb = resolve(dirname(fileURLToPath(import.meta.url)), "../node_modules/vault-web/pkg/web/vault_web_bg.wasm");
 
@@ -41,10 +42,20 @@ async function main() {
     assert.ok(devJs.includes('"http://127.0.0.1:8787"'));
     assert.ok(!relJs.includes("clipboard"), "no clipboard access in a release build");
     assert.ok(devJs.includes("clipboard"), "the dev build copies the pairing text");
+    for (const devOnly of ["Copy pairing text", "Development build", "dev-copy"]) {
+      assert.ok(!relJs.includes(devOnly), `release bundle contains dev-only ${JSON.stringify(devOnly)}`);
+      assert.ok(devJs.includes(devOnly), `dev bundle lacks ${JSON.stringify(devOnly)}`);
+    }
     assert.ok(!/__DEV__|__RELAY_ORIGIN__/.test(relJs), "defines replaced");
     assert.ok(!/\binnerHTML\b|\bouterHTML\b|insertAdjacentHTML|document\.write/.test(relJs), "no HTML sinks in the bundle");
 
     const html = readFileSync(join(rel, "index.html"), "utf8");
+    const meta = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]*)">/);
+    assert.ok(meta, "a CSP meta tag");
+    assert.equal(meta[1], cspFor("https://relay.example"), "the meta CSP matches the served header");
+    assert.ok(!html.includes("__CSP__"));
+    const devHtml = readFileSync(join(dev, "index.html"), "utf8");
+    assert.ok(devHtml.includes("connect-src http://127.0.0.1:8787;"));
     assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(html), "no inline script");
     assert.ok(!/<style\b|\sstyle=|\son[a-z]+=/i.test(html), "no inline style or handlers");
     console.log(`build-check: ok (release main.js ${relJs.length} bytes, dev ${devJs.length} bytes)`);
