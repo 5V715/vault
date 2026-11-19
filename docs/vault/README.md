@@ -34,7 +34,7 @@ cargo build -p vault-container --release --bin vaultctl
 ## Quick start
 
 Every command takes `--dir D`, the local container directory (must be empty or new for
-`create`). The passphrase protecting the CLI's secrets file is prompted for
+`init`). The passphrase protecting the CLI's secrets file is prompted for
 (recommended; an empty passphrase is refused). For scripts, read it without echo and
 export it for the session:
 
@@ -48,7 +48,9 @@ to same-user processes via `/proc`). The same applies to `VAULTCTL_S3_SECRET_KEY
 `VAULTCTL_WEBDAV_PASSWORD` and `VAULTCTL_RECOVERY_KEY`; each is also prompted for when unset.
 
 ```sh
-vaultctl --dir ~/vault create          # prints the recovery key + QR code once
+vaultctl --dir ~/vault init --app signal-web --origin https://app.example
+                                       # prints the recovery key + QR code once
+vaultctl --dir ~/vault info            # app: ..., origin: ..., seq: ...
 vaultctl --dir ~/vault put greeting hello
 vaultctl --dir ~/vault get greeting
 vaultctl --dir ~/vault scan gr          # key<TAB>value; add --base64 for binary values
@@ -56,6 +58,19 @@ vaultctl --dir ~/vault scan gr          # key<TAB>value; add --base64 for binary
 
 `put` commits immediately (each invocation is its own process); `commit` prints the
 current sequence number.
+
+**App binding.** A container serves exactly one app at one web origin, fixed at `init`;
+both flags are required (`create` is an alias of `init` and needs them too). `--app` is
+the app id the browser client declares (`^[a-z0-9][a-z0-9.-]{0,63}$`, for example
+`signal-web`). `--origin` is the web origin of the page, `https://host[:port]`
+(`http://` only for `localhost`, `127.0.0.1` and `[::1]`), with no path, query, fragment
+or userinfo and an ASCII host (punycode for internationalized names). It is stored in
+canonical form: lower-case host, the default port (`:443`, `:80`) dropped, so
+`HTTPS://App.Example:443` is stored as `https://app.example`. Pairings for any other app
+or origin are refused before the approval prompt. `vaultctl info` prints the binding;
+replication and restore carry it (it is in the header). The origin is a declared label
+that the vault pins, not a proof of where the page came from (see
+`docs/protocol/vault.md`, "Threat notes").
 
 ### Replica: S3 with MinIO
 
@@ -134,9 +149,14 @@ state end to end before the Android app exists. It is part of the `vault-server`
 cargo build -p vault-server --release --bin vault-dev
 # binary: target/release/vault-dev
 
-vaultctl --dir ~/vault create                 # once; remember the passphrase
+vaultctl --dir ~/vault init --app signal-web --origin https://app.example
+                                              # once; remember the passphrase
 vault-dev serve --dir ~/vault --pair "vault-pair:v1:..."
 ```
+
+The `--app` and `--origin` given to `init` must be the app id and the origin of the
+web app page you pair from (for a local development server, for example
+`--origin http://localhost:5173`).
 
 1. Open the web app. The "Connect to your vault" screen shows a QR code.
 2. Get the pairing text (`vault-pair:v1:...`) from it. **Gap:** the web app has no
@@ -148,19 +168,22 @@ vault-dev serve --dir ~/vault --pair "vault-pair:v1:..."
    it, do not show the QR on a shared screen.
 3. Run the command within about 60 seconds of the QR appearing: the relay drops an
    unpaired mailbox after 60 s. Enter the passphrase when prompted (no echo).
-4. The terminal prints the device name, the relay host from the pairing text, a 6-digit
-   code and a prompt number, for example `[#1] Code: 123456`. **Approve only if the code
-   matches the one the browser shows and the relay is the address of the page you
-   opened**: type `y 1` (the number is part of the answer) to allow, `n` to deny. End of
+4. The terminal prints the device name, the app id and origin the page declared, the
+   relay host from the pairing text, a 6-digit code and a prompt number, for example
+   `[#1] Code: 123456`. **Approve only if the code matches the one the browser shows and
+   the origin and relay are those of the page you opened**: type `y 1` (the number is part of the answer) to allow, `n` to deny. End of
    input denies. A mismatch means someone else may be in the middle: type `n`.
 5. In the browser, press **Codes match** only if the terminal shows the same code
    (either before or after approving there); otherwise press **Cancel**. The browser
    opens the vault only after both confirmations. If `vault-dev` instead prints
    `WARNING ... already used by another device` (the relay answered HTTP 409: the
    mailbox is taken), someone else got the pairing text first: do **not** press Codes
-   match; press Cancel, close the tab and start over.
+   match; press Cancel, close the tab and start over. If it prints `WARNING: this vault
+   is bound to app ... at ..., but the pairing text is for ...`, the page is another app
+   or origin than the container was created for: the session is refused without a
+   prompt and the browser reports `wrong app`.
 6. The process exits (code 0) when the session ends (browser disconnect, denial,
-   replaced, timeout; it prints `session ended: <reason>`). Run it again with the new
+   replaced, wrong app, timeout; it prints `session ended: <reason>`). Run it again with the new
    QR text for the next session. Ctrl-C locks and exits (the high-water mark of the
    last commit is saved; staged, uncommitted writes are dropped).
 
@@ -211,12 +234,17 @@ from it (see `docs/protocol/vault.md`, "Known answers").
 
 - **Container format version:** `1` (`vault_container::CONTAINER_FORMAT_VERSION`).
 - **`header` object:** `"vault"` (5 ASCII bytes, a fixed marker) `||
-  format_version (u8) || postcard{ recovery_wrapped_crk: bytes }`, at most 4096
-  bytes, no trailing bytes. `format_version` is the first field after the marker
-  and is checked before anything else is decoded: an unknown value is refused as
-  `unsupported container format version N`. A header without the marker is not a
-  v1 container. Containers created before the split carry no marker and no
-  format version.
+  format_version (u8) || postcard{ recovery_wrapped_crk: bytes, binding: { app_id:
+  string, origin: string } }`, at most 4096 bytes, no trailing bytes.
+  `format_version` is the first field after the marker and is checked before
+  anything else is decoded: an unknown value is refused as `unsupported container
+  format version N`. A header without the marker is not a v1 container; if its
+  first byte is `1` (the layout before the split: `version || postcard(body)`, no
+  marker) it is refused as `unsupported container format (created before vault
+  v1)`. The binding must be valid and in canonical form (`docs/protocol/vault.md`,
+  "App binding"). The header is plaintext; the manifest carries the same wrapped
+  CRK and binding under its `auth_tag`, and opening (and restore) refuse a header
+  that does not match its manifest.
 - **Subkeys:** each is `HKDF-SHA256(ikm = CRK, salt = none, info = label, L = 32)`
   (`salt = none` is RFC 5869's default: 32 zero bytes).
 
@@ -238,13 +266,14 @@ from it (see `docs/protocol/vault.md`, "Known answers").
 - **Wrapped CRK:** `0x01 || nonce (12) || AES-256-GCM(recovery wrap key, CRK)` with
   AAD `"vault/v1/crk-wrap" || 0x01`.
 - **Manifest `auth_tag`:** `HMAC-SHA256(manifest_auth, "vault/v1/manifest-auth-tag" ||
-  0x01 || postcard((seq, prev, segments, recovery_wrapped_crk)))`.
+  0x01 || postcard((seq, prev, segments, recovery_wrapped_crk, binding)))`, where
+  `binding` is the `{ app_id, origin }` pair of the header.
 
 Labels are ASCII byte strings without a terminator, concatenated as shown.
 
 ## Recovery key handling
 
-- It is shown once at `create`, as 16 groups of 4 characters plus a QR code. It cannot be
+- It is shown once at `init`, as 16 groups of 4 characters plus a QR code. It cannot be
   displayed again (the CLI keeps a copy only inside its passphrase-encrypted secrets file).
   The recovery key alone restores everything, so keep it offline and private.
 - Write it on paper (or use the QR) and keep it offline, apart from the passphrase.

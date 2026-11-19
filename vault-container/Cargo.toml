@@ -21,6 +21,7 @@ rpassword = { version = "7", optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
 argon2 = { version = "0.5", optional = true }
 thiserror.workspace = true
+vault-proto = { path = "../vault-proto" }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 hkdf = "0.12"
 sha2 = "0.10"

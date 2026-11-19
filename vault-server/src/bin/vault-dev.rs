@@ -4,12 +4,15 @@
 //! before the Android vault exists.
 //!
 //! `vault-dev serve --dir D --pair "<qr text>"` opens the container in `D` (created
-//! with `vaultctl create`), dials the relay named in the pairing text, runs the vault
-//! side of the pairing handshake and asks on the terminal whether to approve the
-//! browser (device name, 6-digit code, prompt number; answer `y <number>` or `n` on
-//! stdin). One pairing text serves one session; run the command again for the next.
+//! with `vaultctl init --app <id> --origin <url>`), dials the relay named in the
+//! pairing text, runs the vault side of the pairing handshake and asks on the
+//! terminal whether to approve the browser (app id, origin, relay host, device
+//! name, 6-digit code, prompt number; answer `y <number>` or `n` on stdin). A
+//! pairing text for another app or origin than the container's binding is refused
+//! before any prompt (the browser is told `WrongApp`). One pairing text serves one
+//! session; run the command again for the next.
 //!
-//! The passphrase (the one given to `vaultctl create`) is prompted for without echo.
+//! The passphrase (the one given to `vaultctl init`) is prompted for without echo.
 //! For automation, `--passphrase-file PATH` or `--passphrase-fd N` read it instead;
 //! it is never accepted on the command line or in the environment. The vault's
 //! long-term Noise key is kept in `D/.vault-dev-identity`, sealed under the same
@@ -59,7 +62,7 @@ enum Cmd {
 
 #[derive(Args)]
 struct ServeArgs {
-    /// Container directory created by `vaultctl create`.
+    /// Container directory created by `vaultctl init`.
     #[arg(long)]
     dir: PathBuf,
     /// Pairing text from the web app (`vault-pair:v1:...`).
@@ -137,12 +140,6 @@ Someone else may have read the pairing text and may be posing as your vault.
 Do NOT press \"Codes match\" in the browser. Press Cancel, close the tab and
 start over with a new code (and do not share the pairing text).";
 
-/// Host (and port) of the relay URL in the pairing text, for the prompt.
-fn relay_host(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    rest.split('/').next().unwrap_or(rest)
-}
-
 fn server_error(e: ServerError) -> String {
     match e {
         ServerError::MailboxTaken => MAILBOX_TAKEN_WARNING.into(),
@@ -183,10 +180,23 @@ async fn serve(a: ServeArgs) -> R<()> {
         .map_err(|e| format!("cannot open container: {e}"))?;
     let identity = load_identity(&a.dir, &pass)?;
 
+    let (app_id, origin) = container.binding();
+    let bound = offer.app_id == app_id && offer.origin == origin;
+    if !bound {
+        eprintln!(
+            "WARNING: this vault is bound to app {} at {}, but the pairing text is for app {} at {}. \
+             The session will be refused (the browser is told: wrong app).",
+            app_id.escape_debug(),
+            origin.escape_debug(),
+            offer.app_id.escape_debug(),
+            offer.origin.escape_debug(),
+        );
+    }
+
     let server = VaultServer::new(
         container,
         identity,
-        Arc::new(TerminalApprover::new().with_relay_host(relay_host(&offer.relay_url))),
+        Arc::new(TerminalApprover::new()),
         ServerConfig::default(),
     )
     .map_err(server_error)?;

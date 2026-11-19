@@ -17,6 +17,42 @@ pub use keys::{Crk, RecoveryKey, Subkeys, unwrap_crk, wrap_crk};
 /// A container with any other version is refused.
 pub const CONTAINER_FORMAT_VERSION: u8 = 1;
 
+/// The one app and web origin a container is bound to, set at creation.
+///
+/// Stored in the plaintext header (so a vault can refuse a wrong app before it
+/// unlocks anything) and in every manifest, where the manifest authentication
+/// tag covers it; opening checks that both agree. `origin` is a declared,
+/// pinned label, not an authenticated claim (see `docs/protocol/vault.md`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Binding {
+    /// Matches `^[a-z0-9][a-z0-9.-]{0,63}$`.
+    pub app_id: String,
+    /// Canonical origin (`vault_proto::binding::normalize_origin`).
+    pub origin: String,
+}
+
+impl Binding {
+    /// Validates `app_id` and normalizes `origin` (lower-case host, default port
+    /// dropped); refuses anything else with [`Error::InvalidBinding`].
+    pub fn new(app_id: &str, origin: &str) -> Result<Self> {
+        vault_proto::binding::validate_app_id(app_id)
+            .map_err(|e| Error::InvalidBinding(e.to_string()))?;
+        let origin = vault_proto::binding::normalize_origin(origin)
+            .map_err(|e| Error::InvalidBinding(e.to_string()))?;
+        Ok(Self {
+            app_id: app_id.to_string(),
+            origin,
+        })
+    }
+
+    /// Both fields valid and the origin in canonical form (strict decoding).
+    pub(crate) fn check(&self) -> Result<()> {
+        vault_proto::binding::validate_app_id(&self.app_id)
+            .and_then(|()| vault_proto::binding::validate_origin(&self.origin))
+            .map_err(|e| Error::Format(format!("stored app binding: {e}")))
+    }
+}
+
 /// Errors returned by the container crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -48,6 +84,13 @@ pub enum Error {
     /// The container header carries a format version this code does not know.
     #[error("unsupported container format version {0}")]
     UnsupportedFormatVersion(u8),
+    /// The container was written before the vault split (its header has no
+    /// marker or format version); this code cannot open it.
+    #[error("unsupported container format (created before vault v1)")]
+    PreV1Container,
+    /// An app id or origin given for a new container is not allowed.
+    #[error("invalid app binding: {0}")]
+    InvalidBinding(String),
     /// The data uses an unsupported format version or feature.
     #[error("unsupported: {0}")]
     Unsupported(String),
@@ -81,7 +124,7 @@ fn _futures_are_send<B: backend::ContainerBackend + 'static>(
     )],
 ) {
     fn send<T: Send>(_: T) {}
-    send(engine::Container::create(b1));
+    send(engine::Container::create(b1, "a", "https://a.example"));
     send(engine::Container::open_with_crk(b2, crk, None));
     send(engine::Container::open_with_recovery(b3, rk, None));
     send(c.commit());

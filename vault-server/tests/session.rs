@@ -20,12 +20,15 @@ use vault_proto::{
     Chunk, Chunker, ErrorCode, Notice, PairOffer, Reassembler, Request, RequestBody, ResponseBody,
 };
 use vault_server::{
-    Approver, CompactionPolicy, EndReason, ServerConfig, ServerError, SessionHandle, SharedBackend,
-    VaultServer,
+    ApprovalRequest, Approver, CompactionPolicy, EndReason, ServerConfig, ServerError,
+    SessionHandle, SharedBackend, VaultServer,
 };
 use zeroize::Zeroizing;
 
 const T: Duration = Duration::from_secs(10);
+/// The binding of the test vaults.
+const APP: &str = "test-app";
+const ORIGIN: &str = "https://app.example";
 
 // ---------- relay ----------
 
@@ -57,6 +60,8 @@ impl Relay {
 struct Auto {
     answer: bool,
     calls: Mutex<Vec<(String, String)>>,
+    /// (app id, origin, relay host) of each prompt.
+    shown: Mutex<Vec<(String, String, String)>>,
 }
 
 impl Auto {
@@ -64,6 +69,7 @@ impl Auto {
         Arc::new(Self {
             answer,
             calls: Mutex::default(),
+            shown: Mutex::default(),
         })
     }
     fn calls(&self) -> Vec<(String, String)> {
@@ -73,11 +79,16 @@ impl Auto {
 
 #[async_trait::async_trait]
 impl Approver for Auto {
-    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
         self.calls
             .lock()
             .unwrap()
-            .push((device_name.into(), sas.into()));
+            .push((req.device_name.into(), req.sas.into()));
+        self.shown.lock().unwrap().push((
+            req.app_id.into(),
+            req.origin.into(),
+            req.relay_host.into(),
+        ));
         self.answer
     }
 }
@@ -132,7 +143,8 @@ impl Drop for InFlight<'_> {
 
 #[async_trait::async_trait]
 impl Approver for Gate {
-    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
+        let (device_name, sas) = (req.device_name, req.sas);
         let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         let _g = InFlight(&self.in_flight);
         self.max_in_flight.fetch_max(n, Ordering::SeqCst);
@@ -150,7 +162,7 @@ struct Never;
 
 #[async_trait::async_trait]
 impl Approver for Never {
-    async fn approve(&self, _: &str, _: &str) -> bool {
+    async fn approve(&self, _: &ApprovalRequest<'_>) -> bool {
         std::future::pending().await
     }
 }
@@ -204,7 +216,7 @@ async fn server_on(
     approver: Arc<dyn Approver>,
     config: ServerConfig,
 ) -> (VaultServer, vault_container::RecoveryKey) {
-    let (c, rk) = Container::create(backend).await.unwrap();
+    let (c, rk) = Container::create(backend, APP, ORIGIN).await.unwrap();
     let s = VaultServer::new(c, vault_secret(), approver, config).unwrap();
     (s, rk)
 }
@@ -299,7 +311,7 @@ impl Browser {
 
 /// Handshake only (no `OpenSession`).
 async fn pair(server: &VaultServer, relay: &Relay) -> (Browser, SessionHandle) {
-    let keys = PairKeys::generate(relay.url(), mailbox_id()).unwrap();
+    let keys = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
     let offer: PairOffer = keys.offer().clone();
     let (mut ws, _) = tokio_tungstenite::connect_async(format!(
         "ws://{}/mailbox/{}",
@@ -427,6 +439,11 @@ async fn denied_approval_closes() {
     b.expect_closed().await;
     assert_eq!(ended(h).await, EndReason::Denied);
     assert_eq!(approver.calls(), vec![("Laptop".to_string(), sas)]);
+    // The prompt shows the app, the origin and the relay host as well.
+    assert_eq!(
+        *approver.shown.lock().unwrap(),
+        vec![(APP.to_string(), ORIGIN.to_string(), relay.addr.to_string())]
+    );
     let log = s.session_log();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].device_name, "Laptop");
@@ -608,7 +625,7 @@ async fn lock_ends_session() {
     assert_eq!(s.active_session(), None);
 
     // No new sessions while locked.
-    let keys = PairKeys::generate(relay.url(), mailbox_id()).unwrap();
+    let keys = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
     assert!(matches!(
         s.serve_offer(keys.offer().clone()).await,
         Err(ServerError::Locked)
@@ -807,8 +824,9 @@ async fn handshake_with_wrong_browser_key_fails() {
     let relay = relay().await;
     let s = server(Auto::new(true), ServerConfig::default()).await;
     // The vault scans offer A but the browser handshakes with key B (same mailbox).
-    let a = PairKeys::generate(relay.url(), mailbox_id()).unwrap();
-    let b = PairKeys::generate(relay.url(), a.offer().mailbox_id).unwrap();
+    let a = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
+    let b =
+        PairKeys::generate(relay.url(), a.offer().mailbox_id, APP.into(), ORIGIN.into()).unwrap();
     let offer_a = a.offer().clone();
     let (mut ws, _) = tokio_tungstenite::connect_async(format!(
         "ws://{}/mailbox/{}",

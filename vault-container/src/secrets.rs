@@ -175,7 +175,7 @@ pub fn open_secrets(blob: &[u8], pass: &str) -> Result<Secrets> {
 pub fn load_secrets(dir: &Path, pass: &str) -> Result<Secrets> {
     let blob = std::fs::read(dir.join(SECRETS_FILE)).map_err(|e| {
         Error::Io(format!(
-            "cannot read {}/{SECRETS_FILE}: {e} (run `vaultctl create`?)",
+            "cannot read {}/{SECRETS_FILE}: {e} (run `vaultctl init`?)",
             dir.display()
         ))
     })?;

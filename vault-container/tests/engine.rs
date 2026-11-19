@@ -98,7 +98,9 @@ fn kv(k: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
 
 #[tokio::test]
 async fn crud_and_scan_roundtrip() {
-    let (mut c, _rk) = Container::create(MemoryBackend::new()).await.unwrap();
+    let (mut c, _rk) = Container::create(MemoryBackend::new(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     assert_eq!(c.seq(), 0);
     c.put(b"a/1", b"one").unwrap();
     c.put(b"a/2", b"two").unwrap();
@@ -133,7 +135,9 @@ async fn crud_and_scan_roundtrip() {
 
 async fn crash_case<B: ContainerBackend + Clone>(backend: B) {
     let f = Faulty::new(backend.clone());
-    let (mut c, rk) = Container::create(f.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(f.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"committed").unwrap();
     c.commit().await.unwrap();
     let hw = c.high_water();
@@ -173,7 +177,9 @@ async fn crash_before_manifest_commit_recovers_last_state_local() {
 #[tokio::test]
 async fn reopen_replays_to_same_state() {
     let backend = local();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     for round in 0..5u32 {
         for i in 0..20u32 {
             c.put(
@@ -210,7 +216,9 @@ async fn reopen_replays_to_same_state() {
 #[tokio::test]
 async fn compaction_preserves_state_and_drops_old_segments() {
     let backend = local();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     for round in 0..4u32 {
         c.put(b"same", format!("v{round}").as_bytes()).unwrap();
         c.put(format!("only{round}").as_bytes(), b"x").unwrap();
@@ -244,7 +252,9 @@ async fn compaction_preserves_state_and_drops_old_segments() {
 #[tokio::test]
 async fn stats_track_live_and_dead_bytes() {
     let backend = MemoryBackend::new();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let st = c.stats();
     assert_eq!((st.segments, st.stored_bytes, st.live_bytes), (0, 0, 0));
     c.put(b"k", &[1u8; 1000]).unwrap();
@@ -290,7 +300,9 @@ async fn stats_track_live_and_dead_bytes() {
 #[tokio::test]
 async fn compaction_of_empty_container() {
     let backend = MemoryBackend::new();
-    let (mut c, _) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, _) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"v").unwrap();
     c.commit().await.unwrap();
     c.delete(b"k");
@@ -305,7 +317,9 @@ async fn compaction_of_empty_container() {
 async fn orphan_segments_garbage_collected() {
     let backend = MemoryBackend::new();
     let f = Faulty::new(backend.clone());
-    let (mut c, rk) = Container::create(f.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(f.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"keep", b"1").unwrap();
     c.commit().await.unwrap();
     c.put(b"orphaned", b"2").unwrap();
@@ -334,7 +348,9 @@ async fn orphan_segments_garbage_collected() {
 #[tokio::test]
 async fn gc_refuses_when_manifest_moved() {
     let backend = MemoryBackend::new();
-    let (mut a, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut a, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let (mut b, _) = Container::open_with_recovery(backend.clone(), &rk, None)
         .await
         .unwrap();
@@ -351,7 +367,9 @@ async fn gc_refuses_when_manifest_moved() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_manifest_commit_conflicts() {
     let backend = local();
-    let (c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     drop(c);
     for round in 0..5u32 {
         let (mut a, _) = Container::open_with_recovery(backend.clone(), &rk, None)
@@ -394,7 +412,9 @@ async fn concurrent_manifest_commit_conflicts() {
 #[tokio::test]
 async fn reopen_with_high_water_rejects_rollback() {
     let backend = MemoryBackend::new();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"1").unwrap();
     c.commit().await.unwrap();
     let hw1 = c.high_water();
@@ -442,7 +462,9 @@ async fn reopen_with_high_water_rejects_rollback() {
 #[tokio::test]
 async fn reload_rejects_rollback() {
     let backend = MemoryBackend::new();
-    let (mut c, _) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, _) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let (genesis, _) = backend.get("manifest").await.unwrap().unwrap();
     c.put(b"k", b"1").unwrap();
     c.commit().await.unwrap();
@@ -460,7 +482,9 @@ async fn reload_rejects_rollback() {
 #[tokio::test]
 async fn commit_conflict_keeps_pending() {
     let backend = MemoryBackend::new();
-    let (mut a, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut a, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let (mut b, _) = Container::open_with_recovery(backend.clone(), &rk, None)
         .await
         .unwrap();
@@ -496,7 +520,9 @@ async fn commit_conflict_keeps_pending() {
 #[tokio::test]
 async fn delete_then_reopen() {
     let backend = local();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"v").unwrap();
     c.put(b"k2", b"v2").unwrap();
     c.commit().await.unwrap();
@@ -518,7 +544,9 @@ async fn delete_then_reopen() {
 
 #[tokio::test]
 async fn scan_prefix_ordering() {
-    let (mut c, _) = Container::create(MemoryBackend::new()).await.unwrap();
+    let (mut c, _) = Container::create(MemoryBackend::new(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     for k in [&b"ab"[..], b"a\xff", b"b", b"a", b"`z"] {
         c.put(k, b"c").unwrap();
     }
@@ -542,10 +570,12 @@ async fn scan_prefix_ordering() {
 #[tokio::test]
 async fn create_on_non_empty_backend_conflicts() {
     let backend = MemoryBackend::new();
-    let (c, _) = Container::create(backend.clone()).await.unwrap();
+    let (c, _) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     drop(c);
     assert!(matches!(
-        Container::create(backend).await,
+        Container::create(backend, "test-app", "https://app.example").await,
         Err(Error::Conflict)
     ));
     // a stray segment alone also makes the backend non-empty
@@ -555,7 +585,7 @@ async fn create_on_non_empty_backend_conflicts() {
         .await
         .unwrap();
     assert!(matches!(
-        Container::create(other).await,
+        Container::create(other, "test-app", "https://app.example").await,
         Err(Error::Conflict)
     ));
 }
@@ -563,9 +593,13 @@ async fn create_on_non_empty_backend_conflicts() {
 #[tokio::test]
 async fn open_with_wrong_keys_fails() {
     let backend = MemoryBackend::new();
-    let (c, _) = Container::create(backend.clone()).await.unwrap();
+    let (c, _) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     drop(c);
-    let (_, other_rk) = Container::create(MemoryBackend::new()).await.unwrap();
+    let (_, other_rk) = Container::create(MemoryBackend::new(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     assert!(matches!(
         Container::open_with_recovery(backend.clone(), &other_rk, None).await,
         Err(Error::Crypto)
@@ -583,7 +617,9 @@ async fn open_with_wrong_keys_fails() {
 #[tokio::test]
 async fn segment_id_collision_retries_once() {
     let f = Faulty::new(MemoryBackend::new());
-    let (mut c, _) = Container::create(f.clone()).await.unwrap();
+    let (mut c, _) = Container::create(f.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     f.seg_conflicts.store(1, Ordering::SeqCst);
     c.put(b"k", b"v").unwrap();
     assert_eq!(c.commit().await.unwrap(), 1);
@@ -600,7 +636,9 @@ async fn segment_id_collision_retries_once() {
 #[tokio::test]
 async fn missing_segment_is_an_error() {
     let backend = MemoryBackend::new();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"v").unwrap();
     c.commit().await.unwrap();
     let name = live_seg_names(&c).await.remove(0);
@@ -614,7 +652,9 @@ async fn missing_segment_is_an_error() {
 
 #[tokio::test]
 async fn oversized_record_rejected_without_side_effects() {
-    let (mut c, _) = Container::create(MemoryBackend::new()).await.unwrap();
+    let (mut c, _) = Container::create(MemoryBackend::new(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let huge = vec![0u8; 33 * 1024 * 1024];
     assert!(matches!(c.put(b"k", &huge), Err(Error::Unsupported(_))));
     assert!(matches!(
@@ -628,7 +668,9 @@ async fn oversized_record_rejected_without_side_effects() {
 #[tokio::test]
 async fn missing_manifest_is_rollback_or_incomplete_create() {
     let backend = MemoryBackend::new();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"v").unwrap();
     c.commit().await.unwrap();
     let hw = c.high_water();
@@ -649,7 +691,9 @@ async fn missing_manifest_is_rollback_or_incomplete_create() {
 #[tokio::test]
 async fn reload_with_missing_manifest_is_rollback() {
     let backend = MemoryBackend::new();
-    let (mut c, _) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, _) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     backend.delete("manifest").await.unwrap();
     assert!(matches!(c.reload().await, Err(Error::Rollback)));
 }
@@ -657,7 +701,9 @@ async fn reload_with_missing_manifest_is_rollback() {
 #[tokio::test]
 async fn successor_not_chained_to_high_water_is_rollback() {
     let backend = MemoryBackend::new();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"k", b"v").unwrap();
     c.commit().await.unwrap();
     let hw1 = c.high_water();
@@ -676,6 +722,7 @@ async fn successor_not_chained_to_high_water_is_rollback() {
         prev: [9; 32],
         segments: m.segments.clone(),
         recovery_wrapped_crk: m.recovery_wrapped_crk.clone(),
+        binding: m.binding.clone(),
         auth_tag: [0; 32],
     };
     forked.authenticate(&auth).unwrap();
@@ -714,7 +761,9 @@ async fn successor_not_chained_to_high_water_is_rollback() {
 async fn manifest_forged_with_only_manifest_key_is_rejected() {
     use vault_container::manifest::{self, Manifest};
     let backend = MemoryBackend::new();
-    let (mut c, rk) = Container::create(backend.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"a", b"1").unwrap();
     c.commit().await.unwrap();
     c.put(b"b", b"2").unwrap();
@@ -759,4 +808,145 @@ async fn manifest_forged_with_only_manifest_key_is_rejected() {
         Container::open_with_recovery(backend, &rk, None).await,
         Err(Error::Crypto)
     ));
+}
+
+#[tokio::test]
+async fn binding_is_set_at_creation_and_normalized() {
+    let backend = MemoryBackend::new();
+    let (c, rk) = Container::create(
+        backend.clone(),
+        "org.example.notes",
+        "HTTPS://Notes.Example:443",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.binding(), ("org.example.notes", "https://notes.example"));
+    drop(c);
+    let (c, _) = Container::open_with_recovery(backend, &rk, None)
+        .await
+        .unwrap();
+    assert_eq!(c.binding(), ("org.example.notes", "https://notes.example"));
+    for (app, origin) in [
+        ("Notes", "https://notes.example"),
+        ("notes", "http://notes.example"),
+        ("notes", "https://notes.example/"),
+    ] {
+        let b = MemoryBackend::new();
+        assert!(
+            matches!(
+                Container::create(b.clone(), app, origin).await,
+                Err(Error::InvalidBinding(_))
+            ),
+            "{app} {origin}"
+        );
+        assert!(b.get("header").await.unwrap().is_none(), "nothing written");
+    }
+}
+
+/// Replace the binding at the end of a v1 header (`... || str app_id || str origin`).
+fn rebind_header(header: &[u8], app: &str, origin: &str) -> Vec<u8> {
+    let at = header
+        .windows(9)
+        .position(|w| w == b"\x08test-app")
+        .expect("binding in header");
+    let mut out = header[..at].to_vec();
+    for s in [app, origin] {
+        out.push(s.len() as u8);
+        out.extend_from_slice(s.as_bytes());
+    }
+    out
+}
+
+#[tokio::test]
+async fn binding_is_covered_by_manifest_auth() {
+    let backend = MemoryBackend::new();
+    let (mut c, rk) = Container::create(backend.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
+    c.put(b"k", b"v").unwrap();
+    c.commit().await.unwrap();
+    let hw = c.high_water();
+    drop(c);
+    let (original, _) = backend.get("header").await.unwrap().unwrap();
+    // The binding is in the header, after the marker and format version.
+    assert!(original.starts_with(b"vault\x01"));
+    assert!(original.ends_with(b"\x08test-app\x13https://app.example"));
+    assert_eq!(
+        rebind_header(&original, "test-app", "https://app.example"),
+        original
+    );
+
+    for (app, origin) in [
+        ("evil-app", "https://app.example"),
+        ("test-app", "https://evil.example"),
+        ("test-app", "http://localhost"),
+    ] {
+        let (_, etag) = backend.get("header").await.unwrap().unwrap();
+        let tampered = rebind_header(&original, app, origin);
+        assert!(matches!(
+            backend
+                .put_if_match("header", &tampered, &etag)
+                .await
+                .unwrap(),
+            PutOutcome::Written(_)
+        ));
+        // A well-formed header whose binding the authenticated manifest does not carry.
+        let e = Container::open_with_recovery(backend.clone(), &rk, Some(hw))
+            .await
+            .err()
+            .expect("tampered header opened");
+        assert!(
+            matches!(&e, Error::Format(m) if m.contains("manifest does not match header")),
+            "{app} {origin}: {e}"
+        );
+    }
+    // Restoring the original header opens again, with the original binding.
+    let (_, etag) = backend.get("header").await.unwrap().unwrap();
+    backend
+        .put_if_match("header", &original, &etag)
+        .await
+        .unwrap();
+    let (c, _) = Container::open_with_recovery(backend, &rk, Some(hw))
+        .await
+        .unwrap();
+    assert_eq!(c.binding(), ("test-app", "https://app.example"));
+    assert_eq!(c.get(b"k").as_deref(), Some(&b"v"[..]));
+}
+
+/// The fixture in `tests/fixtures/pre-v1/` was written by the code from before the
+/// split (see its README); it must be refused with the clear pre-v1 error, not a
+/// decrypt or MAC failure.
+#[tokio::test]
+async fn pre_v1_container_is_rejected_with_clear_error() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre-v1");
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("seg")).unwrap();
+    for name in ["header", "manifest"] {
+        std::fs::copy(src.join(name), dir.path().join(name)).unwrap();
+    }
+    for e in std::fs::read_dir(src.join("seg")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), dir.path().join("seg").join(e.file_name())).unwrap();
+    }
+    let backend = LocalBackend::open(dir.path()).await.unwrap();
+    let (header, _) = backend.get("header").await.unwrap().unwrap();
+    assert_eq!(header[0], 1, "old layout: version byte first, no marker");
+    // The fixture's own recovery key (README) no longer parses: the v1 checksum
+    // label changed. The header is checked before any key is used, so any key
+    // gets the format error.
+    let rk = vault_container::RecoveryKey::generate();
+    let e = Container::open_with_recovery(backend.clone(), &rk, None)
+        .await
+        .err()
+        .expect("pre-v1 container opened");
+    assert!(matches!(e, Error::PreV1Container), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        "unsupported container format (created before vault v1)"
+    );
+    let e = Container::open_with_crk(backend, vault_container::Crk::generate(), None)
+        .await
+        .err()
+        .expect("pre-v1 container opened");
+    assert!(matches!(e, Error::PreV1Container), "{e:?}");
 }

@@ -2016,6 +2016,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "vault-proto",
  "zeroize",
 ]
 

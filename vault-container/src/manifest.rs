@@ -10,7 +10,7 @@
 //! Two authenticators: the AEAD under the `manifest` subkey (which the vault keeps
 //! without user authentication for background replication), and inside the sealed body
 //! [`Manifest::auth_tag`] = HMAC-SHA256(`manifest_auth` subkey, canonical bytes of
-//! `{seq, prev, segments, recovery_wrapped_crk}`). The `manifest_auth` subkey is derived
+//! `{seq, prev, segments, recovery_wrapped_crk, binding}`). The `manifest_auth` subkey is derived
 //! from the CRK and never stored with the manifest key, so a holder of the manifest key
 //! alone can read `seq`/segment ids and copy sealed manifests but cannot forge one.
 //! [`open`] checks only the AEAD (enough for replication); readers that hold the CRK
@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 
-use crate::{Error, Result};
+use crate::{Binding, Error, Result};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
@@ -51,6 +51,9 @@ pub struct Manifest {
     pub segments: Vec<[u8; 16]>,
     /// The CRK wrapped under the recovery key (see `keys::wrap_crk`).
     pub recovery_wrapped_crk: Vec<u8>,
+    /// The app and origin the container is bound to (a copy of the header's;
+    /// covered by the auth tag, so a tampered header is detected on open).
+    pub binding: Binding,
     /// HMAC-SHA256 under the `manifest_auth` subkey over the fields above (see
     /// [`Manifest::compute_auth_tag`]); all zero until [`Manifest::authenticate`].
     pub auth_tag: [u8; 32],
@@ -59,24 +62,26 @@ pub struct Manifest {
 impl Manifest {
     /// The first manifest of a container: seq 0, no predecessor, no segments. Not
     /// yet authenticated: call [`Manifest::authenticate`] before sealing.
-    pub fn genesis(recovery_wrapped_crk: Vec<u8>) -> Self {
+    pub fn genesis(recovery_wrapped_crk: Vec<u8>, binding: Binding) -> Self {
         Self {
             seq: 0,
             prev: [0u8; 32],
             segments: Vec::new(),
             recovery_wrapped_crk,
+            binding,
             auth_tag: [0u8; 32],
         }
     }
 
     /// Canonical bytes covered by the tag: domain label || version ||
-    /// postcard((seq, prev, segments, recovery_wrapped_crk)).
+    /// postcard((seq, prev, segments, recovery_wrapped_crk, binding)).
     fn auth_input(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(&(
             self.seq,
             &self.prev,
             &self.segments,
             &self.recovery_wrapped_crk,
+            &self.binding,
         ))
         .map_err(|_| Error::Format("manifest encoding failed".into()))?;
         let mut out = Vec::with_capacity(AUTH_DOMAIN.len() + 1 + body.len());
@@ -87,7 +92,7 @@ impl Manifest {
     }
 
     /// HMAC-SHA256(`auth_key`, canonical bytes of `{seq, prev, segments,
-    /// recovery_wrapped_crk}`).
+    /// recovery_wrapped_crk, binding}`).
     pub fn compute_auth_tag(&self, auth_key: &[u8; 32]) -> Result<[u8; 32]> {
         let mut mac =
             <Hmac<Sha256> as Mac>::new_from_slice(auth_key).expect("HMAC accepts any key size");
@@ -150,6 +155,7 @@ pub(crate) fn seal_with(
     if m.recovery_wrapped_crk.len() > MAX_WRAPPED_CRK {
         return Err(Error::Format("wrapped CRK too large".into()));
     }
+    m.binding.check()?;
     check_unique(&m.segments)?;
     let body = Zeroizing::new(
         postcard::to_allocvec(m).map_err(|_| Error::Format("manifest encoding failed".into()))?,
@@ -220,6 +226,7 @@ pub fn open(bytes: &[u8], manifest_key: &[u8; 32]) -> Result<Manifest> {
     if m.recovery_wrapped_crk.len() > MAX_WRAPPED_CRK {
         return Err(Error::Format("wrapped CRK too large".into()));
     }
+    m.binding.check()?;
     // Genesis (seq 0) has no predecessor; every later manifest must chain to one.
     if (m.seq == 0) != (m.prev == [0u8; 32]) {
         return Err(Error::Format("inconsistent seq/prev chain link".into()));
@@ -280,6 +287,10 @@ mod tests {
 
     const KEY: [u8; 32] = [7u8; 32];
 
+    fn bind() -> Binding {
+        Binding::new("test-app", "https://app.example").unwrap()
+    }
+
     fn rng(seed: u64) -> ChaCha20Rng {
         ChaCha20Rng::seed_from_u64(seed)
     }
@@ -296,6 +307,7 @@ mod tests {
                 })
                 .collect(),
             recovery_wrapped_crk: vec![9u8; 61],
+            binding: bind(),
             auth_tag: [5u8; 32],
         }
     }
@@ -322,7 +334,7 @@ mod tests {
         assert_ne!(a[1..13], b[1..13]);
         assert_eq!(open(&a, &KEY).unwrap(), m);
         // genesis
-        let g = Manifest::genesis(vec![1, 2, 3]);
+        let g = Manifest::genesis(vec![1, 2, 3], bind());
         assert_eq!((g.seq, g.prev, g.segments.len()), (0, [0u8; 32], 0));
         assert_eq!(open(&seal(&g, &KEY).unwrap(), &KEY).unwrap(), g);
     }
@@ -406,17 +418,17 @@ mod tests {
         // authentic but undecodable plaintext
         let sealed = seal_body(&[0xFF; 40], &KEY, &mut rng(8)).unwrap();
         assert!(matches!(open(&sealed, &KEY), Err(Error::Format(_))));
-        // an all-zero plaintext is a valid (empty) genesis encoding, not an error
+        // an all-zero plaintext decodes (an empty genesis) but has no valid binding
         let sealed = seal_body(&[], &KEY, &mut rng(9)).unwrap();
-        assert_eq!(open(&sealed, &KEY).unwrap(), Manifest::genesis(Vec::new()));
+        assert!(matches!(open(&sealed, &KEY), Err(Error::Format(_))));
     }
 
     #[test]
     fn wrapped_crk_capped() {
-        let ok = Manifest::genesis(vec![1; MAX_WRAPPED_CRK]);
+        let ok = Manifest::genesis(vec![1; MAX_WRAPPED_CRK], bind());
         let sealed = seal_with(&ok, &KEY, &mut rng(13)).unwrap();
         assert_eq!(open(&sealed, &KEY).unwrap(), ok);
-        let big = Manifest::genesis(vec![1; MAX_WRAPPED_CRK + 1]);
+        let big = Manifest::genesis(vec![1; MAX_WRAPPED_CRK + 1], bind());
         assert!(matches!(
             seal_with(&big, &KEY, &mut rng(14)),
             Err(Error::Format(_))
@@ -457,6 +469,14 @@ mod tests {
                 ..m.clone()
             },
             Manifest {
+                binding: Binding::new("other-app", "https://app.example").unwrap(),
+                ..m.clone()
+            },
+            Manifest {
+                binding: Binding::new("test-app", "https://evil.example").unwrap(),
+                ..m.clone()
+            },
+            Manifest {
                 auth_tag: [0u8; 32],
                 ..m.clone()
             },
@@ -470,6 +490,33 @@ mod tests {
                 open_verified(&sealed, &KEY, &AUTH),
                 Err(Error::Crypto)
             ));
+        }
+    }
+
+    #[test]
+    fn invalid_stored_binding_rejected() {
+        for binding in [
+            Binding {
+                app_id: "Bad".into(),
+                origin: "https://app.example".into(),
+            },
+            Binding {
+                app_id: "test-app".into(),
+                origin: "https://App.example".into(),
+            },
+            Binding {
+                app_id: "test-app".into(),
+                origin: "http://app.example".into(),
+            },
+        ] {
+            let m = Manifest {
+                binding,
+                ..sample(1, 1)
+            };
+            assert!(matches!(seal(&m, &KEY), Err(Error::Format(_))));
+            let body = postcard::to_allocvec(&m).unwrap();
+            let sealed = seal_body(&body, &KEY, &mut rng(20)).unwrap();
+            assert!(matches!(open(&sealed, &KEY), Err(Error::Format(_))));
         }
     }
 
@@ -494,11 +541,11 @@ mod tests {
     fn open_rejects_inconsistent_chain_link() {
         let genesis_with_prev = Manifest {
             prev: [1; 32],
-            ..Manifest::genesis(vec![1])
+            ..Manifest::genesis(vec![1], bind())
         };
         let later_without_prev = Manifest {
             seq: 3,
-            ..Manifest::genesis(vec![1])
+            ..Manifest::genesis(vec![1], bind())
         };
         for m in [genesis_with_prev, later_without_prev] {
             let body = postcard::to_allocvec(&m).unwrap();
@@ -509,7 +556,7 @@ mod tests {
 
     #[test]
     fn successor_requires_seq_plus_and_prev_hash() {
-        let g = Manifest::genesis(vec![1; 61]);
+        let g = Manifest::genesis(vec![1; 61], bind());
         let g_sealed = seal_with(&g, &KEY, &mut rng(10)).unwrap();
         let h = hash(&g_sealed);
         assert_eq!(h, <[u8; 32]>::from(Sha256::digest(&g_sealed)));

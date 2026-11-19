@@ -4,6 +4,7 @@
 //! Pure data and framing: no I/O, no clock, no async runtime, so it compiles
 //! for `wasm32-unknown-unknown`. The full protocol is in `docs/protocol/vault.md`.
 
+pub mod binding;
 pub mod frame;
 pub mod msg;
 pub mod noise;
@@ -16,7 +17,8 @@ pub use msg::{ErrorCode, Notice, PairOffer, Request, RequestBody, Response, Resp
 pub const PROTOCOL_VERSION: u8 = 1;
 /// Noise protocol name.
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
-/// Noise prologue label; the full prologue is label ‖ mailbox_id ‖ browser_eph_pub.
+/// Noise prologue label; the full prologue is label ‖ version ‖ u16be(len) app_id ‖
+/// u16be(len) origin ‖ mailbox_id ‖ browser_eph_pub.
 pub const PROLOGUE_LABEL: &[u8] = b"vault/v1";
 /// HKDF info string for the short authentication string.
 pub const SAS_INFO: &[u8] = b"vault/v1/sas";
@@ -32,6 +34,10 @@ pub enum ProtoError {
     UnsupportedVersion(u8),
     #[error("invalid relay url: {0}")]
     BadRelayUrl(&'static str),
+    #[error("invalid app id (must match ^[a-z0-9][a-z0-9.-]{{0,63}}$)")]
+    BadAppId,
+    #[error("invalid origin: {0}")]
+    BadOrigin(&'static str),
     #[error("malformed message")]
     Malformed,
     #[error("message or field too large")]

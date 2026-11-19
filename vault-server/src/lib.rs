@@ -2,11 +2,17 @@
 //! Vault side of the vault protocol (`docs/protocol/vault.md`).
 //!
 //! Given a scanned [`PairOffer`], [`VaultServer::serve_offer`] dials the relay
-//! mailbox, runs the Noise XX responder, then (in a spawned task) waits for the
-//! browser's `OpenSession`, asks the [`Approver`] (device name + SAS) and serves
-//! `KvBackend`-style requests against the encrypted [`Container`].
+//! mailbox, runs the Noise XX responder, then (in a spawned task) checks the
+//! offer's app id and origin against the container's binding, waits for the
+//! browser's `OpenSession`, asks the [`Approver`] (app, origin, relay host, device
+//! name, SAS) and serves `KvBackend`-style requests against the encrypted
+//! [`Container`].
 //!
 //! Invariants:
+//! - A session whose offer names another app or origin than the container is
+//!   bound to gets `Notice::WrongApp` right after the handshake and ends
+//!   ([`EndReason::WrongApp`]): before any request is read, before the approver
+//!   is asked and without touching the container.
 //! - One approval prompt at a time (server-wide); at most
 //!   [`MAX_AWAITING_APPROVAL`] sessions wait for approval, further `OpenSession`s
 //!   are answered `Denied`. Each prompt's timeout starts when it is shown.
@@ -42,7 +48,7 @@ use vault_proto::PairOffer;
 use vault_proto::noise::Responder;
 use zeroize::Zeroizing;
 
-pub use approver::{Approver, TerminalApprover};
+pub use approver::{ApprovalRequest, Approver, TerminalApprover};
 
 /// Sessions that may wait for (or be in) user approval at the same time.
 pub const MAX_AWAITING_APPROVAL: usize = 2;
@@ -183,6 +189,9 @@ pub enum EndReason {
     Busy,
     /// The session task failed (panicked); cleanup still ran.
     Internal,
+    /// The offer's app id or origin is not the container's binding
+    /// (`Notice::WrongApp` was sent; nobody was asked).
+    WrongApp,
 }
 
 impl EndReason {
@@ -200,6 +209,7 @@ impl EndReason {
             Self::ProtocolError => "protocol error",
             Self::Busy => "busy",
             Self::Internal => "internal error",
+            Self::WrongApp => "wrong app",
         }
     }
 }
@@ -270,9 +280,23 @@ pub(crate) struct State {
     pub log: Vec<SessionRecord>,
 }
 
+/// The app binding of the container, as `(app_id, origin)`.
+pub(crate) type BindingPair = (String, String);
+
+/// What the offer declared, for the binding check and the approval prompt.
+pub(crate) struct Offered {
+    pub app_id: String,
+    pub origin: String,
+    pub relay_host: String,
+    /// The offer's app id and origin are the container's binding.
+    pub bound: bool,
+}
+
 pub(crate) struct Inner {
     /// `None` while locked. Lock order: `container`, then `state`.
     pub container: Mutex<Option<VaultContainer>>,
+    /// Binding of the installed container (kept while locked; not secret).
+    binding: StdMutex<BindingPair>,
     static_secret: StdMutex<Option<Zeroizing<[u8; 32]>>>,
     pub approver: Arc<dyn Approver>,
     /// One approval prompt at a time.
@@ -292,6 +316,21 @@ impl Inner {
     fn secret(&self) -> MutexGuard<'_, Option<Zeroizing<[u8; 32]>>> {
         self.static_secret.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn binding(&self) -> MutexGuard<'_, BindingPair> {
+        self.binding.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn binding_of(c: &VaultContainer) -> BindingPair {
+    let (a, o) = c.binding();
+    (a.to_string(), o.to_string())
+}
+
+/// Host (and port) of a relay URL, for the approval prompt.
+pub fn relay_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
 /// Compact the container if the policy says so, no session is active and no
@@ -349,8 +388,10 @@ impl VaultServer {
         config: ServerConfig,
     ) -> Result<Self, ServerError> {
         let tls = Arc::new(transport::tls_config(config.extra_ca_pem.as_deref())?);
+        let binding = binding_of(&container);
         Ok(Self {
             inner: Arc::new(Inner {
+                binding: StdMutex::new(binding),
                 container: Mutex::new(Some(container)),
                 static_secret: StdMutex::new(Some(static_secret)),
                 approver,
@@ -365,8 +406,21 @@ impl VaultServer {
 
     /// Dial the offer's relay mailbox and run the Noise handshake (bounded by
     /// `handshake_timeout`); on success the session continues in a spawned task
-    /// (approval, then serving) and its handle is returned.
+    /// (binding check, approval, then serving) and its handle is returned.
+    ///
+    /// An offer for another app or origin than the container's binding still
+    /// gets the handshake, so that the browser learns why: the session then
+    /// only sends `Notice::WrongApp` and ends with [`EndReason::WrongApp`].
     pub async fn serve_offer(&self, offer: PairOffer) -> Result<SessionHandle, ServerError> {
+        let offered = {
+            let b = self.inner.binding();
+            Offered {
+                bound: offer.app_id == b.0 && offer.origin == b.1,
+                app_id: offer.app_id.clone(),
+                origin: offer.origin.clone(),
+                relay_host: relay_host(&offer.relay_url).to_string(),
+            }
+        };
         let responder = {
             let secret = self.inner.secret();
             let secret = secret.as_ref().ok_or(ServerError::Locked)?;
@@ -410,6 +464,7 @@ impl VaultServer {
             id,
             channel,
             sas.clone(),
+            offered,
             rx,
         ));
         Ok(SessionHandle { id, sas, task })
@@ -442,6 +497,7 @@ impl VaultServer {
     /// Install a re-opened container and the static key after [`VaultServer::lock`].
     pub async fn unlock(&self, container: VaultContainer, static_secret: Zeroizing<[u8; 32]>) {
         let mut c = self.inner.container.lock().await;
+        *self.inner.binding() = binding_of(&container);
         if let Some(mut old) = c.replace(container) {
             old.discard_pending();
         }
@@ -474,6 +530,12 @@ impl VaultServer {
     /// Returns the new manifest seq if it compacted.
     pub async fn compact_if_needed(&self) -> Result<Option<u64>, vault_container::Error> {
         compact_if_needed(&self.inner).await
+    }
+
+    /// The container's app binding, `(app_id, origin)`; offers for anything else
+    /// are refused with `Notice::WrongApp`.
+    pub fn binding(&self) -> (String, String) {
+        self.inner.binding().clone()
     }
 
     pub fn is_locked(&self) -> bool {

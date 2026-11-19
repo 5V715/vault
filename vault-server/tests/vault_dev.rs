@@ -25,6 +25,9 @@ use vault_proto::{Chunk, Chunker, Reassembler, Request, RequestBody, ResponseBod
 const T: Duration = Duration::from_secs(20);
 const PASS: &str = "correct horse";
 const BIN: &str = env!("CARGO_BIN_EXE_vault-dev");
+/// The binding of the test vault directories.
+const APP: &str = "test-app";
+const ORIGIN: &str = "https://app.example";
 
 struct Relay {
     addr: SocketAddr,
@@ -42,11 +45,11 @@ async fn relay() -> Relay {
     Relay { addr, _stop: tx }
 }
 
-/// A container directory as `vaultctl create` leaves it.
+/// A container directory as `vaultctl init --app test-app --origin https://app.example` leaves it.
 async fn make_dir(pass: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let backend = LocalBackend::open(dir.path()).await.unwrap();
-    let (c, rk) = Container::create(backend).await.unwrap();
+    let (c, rk) = Container::create(backend, APP, ORIGIN).await.unwrap();
     let secrets = Secrets {
         recovery_key: (*rk.to_display()).clone(),
         high_water: Some(c.high_water()),
@@ -211,7 +214,17 @@ struct Offer {
 }
 
 fn offer(relay: &Relay, tag: u8) -> Offer {
-    let keys = PairKeys::generate(format!("http://{}", relay.addr), [tag; 16]).unwrap();
+    offer_for(relay, tag, APP, ORIGIN)
+}
+
+fn offer_for(relay: &Relay, tag: u8, app: &str, origin: &str) -> Offer {
+    let keys = PairKeys::generate(
+        format!("http://{}", relay.addr),
+        [tag; 16],
+        app.into(),
+        origin.into(),
+    )
+    .unwrap();
     let text = keys.offer().to_qr().unwrap();
     Offer { keys, text }
 }
@@ -273,6 +286,11 @@ async fn approve_persists_put_and_commit() {
     assert!(
         err.contains(&format!("Relay: {}", relay.addr)),
         "relay host shown: {err}"
+    );
+    assert!(err.contains(&format!("App: {APP}")), "app shown: {err}");
+    assert!(
+        err.contains(&format!("Origin: {ORIGIN}")),
+        "origin shown: {err}"
     );
     assert!(!err.contains(PASS));
     let n = prompt_number(&err);
@@ -359,7 +377,8 @@ async fn bad_offer_and_unreachable_relay_exit_nonzero() {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     drop(l);
-    let keys = PairKeys::generate(format!("http://{addr}"), [4; 16]).unwrap();
+    let keys =
+        PairKeys::generate(format!("http://{addr}"), [4; 16], APP.into(), ORIGIN.into()).unwrap();
     let text = keys.offer().to_qr().unwrap();
     let mut v = spawn_vault(dir.path(), PASS, &text, &tmp.path().join("pw"));
     assert!(!v.exit().await.success());
@@ -475,4 +494,30 @@ async fn ctrl_c_saves_high_water() {
     assert!(v.settled_out().await.contains("session ended: interrupted"));
     let hw = load_secrets(dir.path(), PASS).unwrap().high_water.unwrap();
     assert_eq!(hw.seq, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_app_pairing_text_is_refused_without_a_prompt() {
+    for (app, origin) in [("other-app", ORIGIN), (APP, "https://evil.example")] {
+        let relay = relay().await;
+        let dir = make_dir(PASS).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let o = offer_for(&relay, 6, app, origin);
+        let mut v = spawn_vault(dir.path(), PASS, &o.text, &tmp.path().join("pw"));
+        let mut b = handshake(&relay, o).await;
+        // The browser is told before it even asks.
+        assert_eq!(
+            b.recv().await,
+            Some(VaultMessage::Notice(vault_proto::Notice::WrongApp))
+        );
+        let st = v.exit().await;
+        assert!(st.success(), "{st:?}; stderr {}", v.err.lock().unwrap());
+        assert!(v.settled_out().await.contains("session ended: wrong app"));
+        let err = v.err.lock().unwrap().clone();
+        assert!(
+            err.contains("WARNING: this vault is bound to app test-app at https://app.example"),
+            "{err}"
+        );
+        assert!(!err.contains("Type 'y "), "no prompt: {err}");
+    }
 }

@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::backend::{ContainerBackend, Etag, PutOutcome};
-use crate::engine::{HighWater, decode_header, seg_name};
+use crate::engine::{HeaderBody, HighWater, decode_header, seg_name};
 use crate::manifest::{self, Manifest};
 use crate::segment::SegmentReader;
 use crate::{Crk, Error, RecoveryKey, Result, Subkeys, unwrap_crk};
@@ -144,7 +144,8 @@ struct Source {
     sealed: Vec<u8>,
     mark: HighWater,
     segments: Vec<String>,
-    recovery_wrapped_crk: Vec<u8>,
+    /// The decoded header (wrapped CRK and binding), checked against the manifest.
+    body: HeaderBody,
 }
 
 fn now_ms() -> Option<u64> {
@@ -351,7 +352,8 @@ async fn read_source(primary: &dyn ContainerBackend, key: &[u8; 32]) -> Result<S
         .ok_or_else(|| Error::Format("no manifest".into()))?;
     let m = manifest::open(&sealed, key)?;
     // Never spread a header that does not belong to the manifest it travels with.
-    if decode_header(&header)?.recovery_wrapped_crk != m.recovery_wrapped_crk {
+    let body = decode_header(&header)?;
+    if !body.matches(&m) {
         return Err(Error::Format(
             "primary header does not match its manifest".into(),
         ));
@@ -363,7 +365,7 @@ async fn read_source(primary: &dyn ContainerBackend, key: &[u8; 32]) -> Result<S
             hash: manifest::hash(&sealed),
         },
         segments: m.segments.iter().map(seg_name).collect(),
-        recovery_wrapped_crk: m.recovery_wrapped_crk,
+        body,
         sealed,
     })
 }
@@ -458,7 +460,7 @@ async fn prepare(
         })
     };
     // 1. Classify before writing anything: the header (compared by the wrapped CRK
-    // it carries), then the manifest. A diverged replica gets nothing from us, not
+    // and the binding it carries), then the manifest. A diverged replica gets nothing from us, not
     // even our header.
     // TODO(recovery-key rotation): rotation changes the wrapped CRK; replicas' headers
     // will then need an explicit update instead of being reported diverged.
@@ -466,8 +468,7 @@ async fn prepare(
     let mut header_adopted = None;
     let replica_header = replica.get(HEADER).await?;
     if let Some((h, etag)) = &replica_header {
-        let ours =
-            decode_header(h).is_ok_and(|b| b.recovery_wrapped_crk == source.recovery_wrapped_crk);
+        let ours = decode_header(h).is_ok_and(|b| b == source.body);
         if !ours {
             let observed = ObservedMark::Header {
                 hash: manifest::hash(h),
@@ -667,7 +668,7 @@ async fn read_candidate(
     // AEAD and inner auth tag: a manifest resealed with only the manifest key is broken.
     let manifest = match manifest::open_verified(&sealed, &subkeys.manifest, &subkeys.manifest_auth)
     {
-        Ok(m) if m.recovery_wrapped_crk == body.recovery_wrapped_crk => m,
+        Ok(m) if body.matches(&m) => m,
         _ => return Err((id, ReadFail::Broken)),
     };
     Ok(Candidate {

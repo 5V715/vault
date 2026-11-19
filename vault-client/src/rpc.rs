@@ -207,6 +207,7 @@ impl Rpc {
                 Ok(Some(CloseReason::Terminated(reason)))
             }
             VaultMessage::Notice(Notice::Locked) => Ok(Some(CloseReason::Locked)),
+            VaultMessage::Notice(Notice::WrongApp) => Ok(Some(CloseReason::WrongApp)),
         }
     }
 

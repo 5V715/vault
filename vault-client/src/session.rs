@@ -228,7 +228,12 @@ impl Drop for VaultSession {
 }
 
 impl VaultSession {
-    /// Pair with a vault through the relay at `relay_origin`. Returns the handle
+    /// Pair with a vault through the relay at `relay_origin`, declaring the app
+    /// `app_id` (`^[a-z0-9][a-z0-9.-]{0,63}$`) and the page's web `origin`
+    /// (`location.origin` in a browser; normalized: lower-case host, default port
+    /// dropped; https, or http only for loopback; no path). The vault refuses a
+    /// pairing for another app or origin than it is bound to, before asking the
+    /// user: the session then ends with [`CloseReason::WrongApp`]. Returns the handle
     /// and the future that runs the whole session (spawn it on a local
     /// executor and let it run to completion; dropping it early skips the
     /// cleanup that discards the backend): it reports the QR text, the SAS and the [`SessionState`]s.
@@ -239,11 +244,14 @@ impl VaultSession {
     ///
     /// Before both the vault's `Approved` and [`Self::confirm_sas`], only
     /// `OpenSession`, `Ping` and `Close` are sent.
+    #[allow(clippy::too_many_arguments)]
     pub fn pair<F, C>(
         factory: F,
         clock: C,
         rng: &dyn Rng,
         relay_origin: &str,
+        app_id: &str,
+        origin: &str,
         device_name: &str,
         callbacks: SessionCallbacks,
     ) -> Result<(VaultSession, LocalBoxFuture<'static, ()>), ClientError>
@@ -256,6 +264,8 @@ impl VaultSession {
             clock,
             rng,
             relay_origin,
+            app_id,
+            origin,
             device_name,
             callbacks,
             SessionOptions::default(),
@@ -263,11 +273,14 @@ impl VaultSession {
     }
 
     /// [`Self::pair`] with custom [`SessionOptions`].
+    #[allow(clippy::too_many_arguments)]
     pub fn pair_with<F, C>(
         factory: F,
         clock: C,
         rng: &dyn Rng,
         relay_origin: &str,
+        app_id: &str,
+        origin: &str,
         device_name: &str,
         callbacks: SessionCallbacks,
         options: SessionOptions,
@@ -279,21 +292,24 @@ impl VaultSession {
         if !valid_device_name(device_name) {
             return Err(perr("device name too long or with control characters"));
         }
+        vault_proto::binding::validate_app_id(app_id).map_err(|e| perr(e.to_string()))?;
+        let page_origin =
+            vault_proto::binding::normalize_origin(origin).map_err(|e| perr(e.to_string()))?;
         if !(1..=PING_INTERVAL_MS).contains(&options.ping_interval_ms) {
             return Err(perr(format!(
                 "ping interval must be 1..={PING_INTERVAL_MS} ms (protocol: at least every 30 s)"
             )));
         }
-        let origin = relay_origin.trim_end_matches('/').to_string();
+        let relay = relay_origin.trim_end_matches('/').to_string();
         let mut id = [0u8; 16];
         rng.fill(&mut id);
-        let keys = PairKeys::generate(origin.clone(), id)
+        let keys = PairKeys::generate(relay.clone(), id, app_id.to_string(), page_origin)
             .map_err(|_| perr("cannot generate pairing keys"))?;
         let qr = keys
             .offer()
             .to_qr()
             .map_err(|e| perr(format!("relay url: {e}")))?;
-        let url = mailbox_url(&origin, &id)?;
+        let url = mailbox_url(&relay, &id)?;
         let shared = Rc::new(Shared {
             state: RefCell::new(SessionState::Pairing),
             backend: RefCell::new(None),
@@ -458,6 +474,7 @@ impl<F: MailboxFactory, C: Clock> Run<F, C> {
         if let Err(e) = rpc::open_session(rpc, device).await {
             return match e {
                 ClientError::Denied => CloseReason::Denied,
+                ClientError::Closed(CloseReason::WrongApp) => CloseReason::WrongApp,
                 e => CloseReason::PairingFailed(e.to_string()),
             };
         }

@@ -20,7 +20,11 @@ use vault_container::Result as CResult;
 use vault_container::backend::{ContainerBackend, Etag, MemoryBackend, PutOutcome};
 use vault_container::engine::Container;
 use vault_proto::PairOffer;
-use vault_server::{Approver, ServerConfig, SharedBackend, VaultServer};
+use vault_server::{ApprovalRequest, Approver, ServerConfig, SharedBackend, VaultServer};
+
+/// The binding of every test vault (and what test clients declare by default).
+pub const APP_ID: &str = "test-app";
+pub const ORIGIN: &str = "https://app.example";
 use zeroize::Zeroizing;
 
 /// Container backend whose writes can be held back or made to fail.
@@ -85,11 +89,11 @@ impl TestApprover {
 
 #[async_trait::async_trait]
 impl Approver for TestApprover {
-    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
         self.calls
             .lock()
             .unwrap()
-            .push((device_name.into(), sas.into()));
+            .push((req.device_name.into(), req.sas.into()));
         while self.hold.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -101,7 +105,7 @@ impl Approver for TestApprover {
 pub fn vault_server(rt: &tokio::runtime::Runtime, approver: Arc<TestApprover>) -> VaultServer {
     rt.block_on(async move {
         let backend: SharedBackend = Arc::new(MemoryBackend::default());
-        let (c, _rk) = Container::create(backend).await.unwrap();
+        let (c, _rk) = Container::create(backend, APP_ID, ORIGIN).await.unwrap();
         VaultServer::new(
             c,
             Zeroizing::new([7u8; 32]),
@@ -154,7 +158,7 @@ impl Stack {
             let backend: SharedBackend = knobs.clone();
             let appr = approver.clone();
             rt.block_on(async move {
-                let (c, _rk) = Container::create(backend).await.unwrap();
+                let (c, _rk) = Container::create(backend, APP_ID, ORIGIN).await.unwrap();
                 VaultServer::new(c, Zeroizing::new([42u8; 32]), appr, ServerConfig::default())
                     .unwrap()
             })

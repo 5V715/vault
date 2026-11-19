@@ -19,10 +19,14 @@ fn assert_send<T: Send>(t: T) -> T {
 async fn arc_dyn_backend_runs_on_spawned_tasks() {
     let mem = MemoryBackend::new();
     let b: Dyn = Arc::new(mem.clone());
-    let (mut c, rk) = tokio::spawn(Container::create(Arc::clone(&b)))
-        .await
-        .unwrap()
-        .unwrap();
+    let (mut c, rk) = tokio::spawn(Container::create(
+        Arc::clone(&b),
+        "test-app",
+        "https://app.example",
+    ))
+    .await
+    .unwrap()
+    .unwrap();
     c.put(b"k", b"v").unwrap();
     let mut c = tokio::spawn(async move {
         assert_send(c.commit()).await.unwrap();

@@ -24,7 +24,15 @@ protocol), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each te
 ```sh
 cargo test --workspace
 cargo build -p vault-container --release --bin vaultctl
+# a container is bound to one app and web origin when it is created:
+vaultctl --dir ~/vault init --app signal-web --origin https://app.example
+vaultctl --dir ~/vault info
 ```
+
+A vault serves one app at one origin: the browser declares both in the pair offer, the
+Noise prologue binds them, and the vault refuses any other with `WrongApp` before it asks
+the user. The origin is a declared, pinned label, not an authenticated claim
+(`docs/protocol/vault.md`, "App binding" and "Threat notes").
 
 ## Versions
 

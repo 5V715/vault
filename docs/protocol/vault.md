@@ -6,7 +6,9 @@ user data; it reads and writes all state in the vault's encrypted container
 through request/response messages. Reference implementation of the message
 types, QR offer and chunking: the `vault-proto` crate. Vault-side session
 server (mailbox dial, responder, approval, request serving): the `vault-server`
-crate. Design context: `docs/superpowers/specs/2026-11-18-vault-design.md` ("Pairing and sessions").
+crate. Browser side (pairing lifecycle, write-back store): the `vault-client`
+crate. Design context: `docs/design/vault.md` ("Pairing and sessions (V2)") and
+`docs/superpowers/specs/2026-11-19-vault-split-design.md` (app binding, versions).
 
 ## Roles and transport
 
@@ -23,7 +25,7 @@ crate. Design context: `docs/superpowers/specs/2026-11-18-vault-design.md` ("Pai
 ## QR pair offer
 
 ```
-vault-pair:v1:<base64url-no-pad( postcard{ version: u8, relay_url, mailbox_id[16], browser_eph_pub[32] } )>
+vault-pair:v1:<base64url-no-pad( postcard{ version: u8, relay_url, mailbox_id[16], browser_eph_pub[32], app_id, origin } )>
 ```
 
 - `version`: the protocol version, `1` (`vault_proto::PROTOCOL_VERSION`). It is
@@ -37,7 +39,42 @@ vault-pair:v1:<base64url-no-pad( postcard{ version: u8, relay_url, mailbox_id[16
   or non-ASCII bytes. Validated on encode and on decode.
 - `browser_eph_pub`: the browser's ephemeral X25519 public key for this session
   (its Noise static `s` in XX).
+- `app_id`: string, the app the browser runs (see "App binding").
+- `origin`: string, the page's web origin in canonical form (see "App binding").
+  Both are validated on encode and on decode (`BadAppId`, `BadOrigin`); a
+  non-canonical origin is refused, not normalized, by the decoder.
 - Any other prefix (including a different version) is rejected.
+
+## App binding
+
+A vault is bound to one app and one web origin. The pair is set when the
+container is created (`vaultctl init --app <id> --origin <url>`), stored in the
+container header and in every manifest (covered by the manifest `auth_tag`, see
+`docs/vault/README.md`), and never changes; replication and restore copy it with
+the header.
+
+- `app_id` matches `^[a-z0-9][a-z0-9.-]{0,63}$` (1 to 64 bytes).
+- `origin` is `scheme "://" host [":" port]` with nothing after the authority:
+  no path (not even `/`), no query, no fragment, no userinfo. The scheme is
+  `https`, or `http` only for the loopback hosts `localhost`, `127.0.0.1` and
+  `[::1]`. The host is ASCII: a DNS name of letters, digits, `-` and `.` (an
+  internationalized name must be written in punycode, `xn--...`), an IPv4
+  address, or a bracketed IPv6 address. At most 300 bytes.
+- Canonical form, the only form offers, prologues and containers carry (they are
+  compared byte for byte): scheme and host in lower case, the port without
+  leading zeros, and the scheme's default port (`:443` for https, `:80` for
+  http) left out. `https://App.Example:443` becomes `https://app.example`.
+  Clients normalize what the page gives them (`location.origin` already is in
+  this form) before building the offer; `vaultctl init` stores the normalized
+  form. Reference: `vault_proto::binding::{validate_app_id, normalize_origin,
+  validate_origin}`.
+- After the handshake, before reading any request, the vault compares the
+  offer's `app_id` and `origin` with its binding. On a mismatch it sends
+  `Notice::WrongApp` and closes the session: no approval prompt is shown, no
+  `OpenSession` is read and no data is touched. The browser reports the session
+  as `closed(wrong app)` (`CloseReason::WrongApp`).
+- The approval prompt shows the app id, the origin and the relay host along with
+  the device name and the SAS.
 
 ## Handshake
 
@@ -45,12 +82,15 @@ Pattern `Noise_XX_25519_ChaChaPoly_SHA256`.
 Prologue (both sides, byte concatenation):
 
 ```
-"vault/v1" || mailbox_id (16 bytes) || browser_eph_pub (32 bytes)
+"vault/v1" || version (1 byte) || u16_be(len(app_id)) || app_id
+           || u16_be(len(origin)) || origin || mailbox_id (16 bytes) || browser_eph_pub (32 bytes)
 ```
 
-The vault builds the prologue from the scanned QR; the browser from its own
-values. If the QR was altered in transit (different mailbox or key), the
-prologues differ and the handshake fails.
+`app_id` and `origin` are the UTF-8 (ASCII) bytes of the offer's fields, each
+prefixed by its length as a big-endian `u16`. The vault builds the prologue from
+the scanned QR; the browser from its own values. If the QR was altered in transit
+(different version, app, origin, mailbox or key), the prologues differ and the
+handshake fails.
 
 **The vault MUST check that the Noise remote static key received in the
 handshake equals `browser_eph_pub` from the scanned QR, and abort otherwise.**
@@ -81,7 +121,7 @@ Offer -> Handshake -> AwaitApproval -> Active -> Closed
 | State | Meaning | Leaves on |
 |---|---|---|
 | Offer | Browser shows the QR and waits on its mailbox | vault connects (-> Handshake); 60 s expiry (-> Closed) |
-| Handshake | Noise XX messages 1-3 as raw WS frames | success (-> AwaitApproval); any failure (-> Closed) |
+| Handshake | Noise XX messages 1-3 as raw WS frames | success (-> AwaitApproval); any failure (-> Closed); offer not for this vault's app and origin: `Notice::WrongApp` (-> Closed, reason `wrong app`) before any prompt |
 | AwaitApproval | SAS shown on both sides; the browser sent `OpenSession`; the vault shows "Allow <device>?" and asks for biometrics; the browser asks "Codes match?" | vault side: `Approved` (-> Active). Browser side: `Approved` **and** the local "Codes match", in either order (-> Active); `Denied`, timeout or the local "Cancel" (-> Closed, reason `denied`) |
 | Active | Store requests are served | `Close`, disconnect, lock, timeout (default 12 h), revocation, replacement by a newer session (-> Closed) |
 | Closed | Keys discarded | terminal |
@@ -117,6 +157,10 @@ Implemented by the `vault-client` crate, which the embedding app wraps (a write-
 the browser connects to `{relay origin}/mailbox/<hex>` with
 its own WebSocket.
 
+- The app passes its `app_id` and the page origin (`location.origin`) when it
+  starts a pairing (`VaultSession::pair`); the client validates and normalizes
+  them and puts them in the offer. `Notice::WrongApp` ends the session with
+  reason `wrong app`.
 - Before `Approved` and the user's local confirmation (the app's
   `confirm_sas`) the browser sends only `OpenSession`, `Ping` and
   `Close`, and links/connects nothing; `cancel_pairing` ends the session with reason `denied`. The state is
@@ -201,6 +245,7 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
 |---|---|
 | SessionTerminated{ reason } | vault ended the session (replaced, revoked, timeout) |
 | Locked | vault locked; session is over |
+| WrongApp | the offer's `app_id` or `origin` is not this vault's binding; sent right after the handshake, before any approval prompt; session is over |
 
 ### Error codes
 
@@ -223,6 +268,8 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
 | Message | 32 MiB, 600 chunks |
 | relay_url | 512 bytes (no `\\`, controls or non-ASCII; port 1-65535) |
 | device_name | 64 bytes UTF-8, no control characters |
+| app_id | 64 bytes, `^[a-z0-9][a-z0-9.-]{0,63}$` |
+| origin | 300 bytes, canonical form (see "App binding") |
 | key / prefix | 1 KiB |
 | Single value | 16 MiB |
 | Entries response | 32 MiB total of keys + values |
@@ -235,8 +282,8 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
 - The relay sees connection timing, frame sizes and counts only; all content is
   inside Noise. It can drop or delay traffic (denial of service) but not read or
   alter it undetected.
-- QR tampering (swapped mailbox or `browser_eph_pub`) breaks the prologue and
-  fails the handshake; an attacker who instead substitutes the whole offer with
+- QR tampering (swapped mailbox, `browser_eph_pub`, `app_id` or `origin`)
+  breaks the prologue and fails the handshake; an attacker who instead substitutes the whole offer with
   their own is caught by the SAS comparison, which the user must perform.
 - The pairing text is a short-lived bearer secret: anyone who reads it within
   its 60 s life (screen share, camera, an untrusted QR app or clipboard sync) can
@@ -249,6 +296,17 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
   honest vault that got 409 shows no code and warns that the pairing code was
   already used. Read the QR only with the phone's own camera or a trusted
   scanner and never share the text.
+- **The origin is a declared, pinned label, not an authenticated claim.** The
+  page supplies it (`location.origin` in the browser; native and test clients
+  pass any origin they like) and the vault cannot verify it: a malicious page
+  can declare another site's origin. Pinning it at container creation and
+  refusing mismatches (`WrongApp`) keeps apps apart and catches mistakes (the
+  wrong app or a stale deployment pairing with the vault). Protection against
+  a malicious page still rests on the user checking the origin, the relay host
+  and the SAS on the phone before approving. The same holds for `app_id`.
+- The app binding is plaintext in the container header (an observer of a
+  replica learns which app and origin the vault serves); the authenticated
+  manifest carries the same values, so a changed header is refused on open.
 - The SAS is 6 digits (about 20 bits): it protects against an online
   man-in-the-middle in a single pairing attempt, not against offline guessing,
   because each attempt needs a fresh session and a user confirmation.
@@ -278,7 +336,9 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
   | Manifest `auth_tag` domain (HMAC input prefix) | `vault/v1/manifest-auth-tag` |
 
   Containers and pairings made with the labels used before the split do not
-  work with these; there is no compatibility path.
+  work with these; there is no compatibility path. Opening a container created
+  before the split fails with `unsupported container format (created before
+  vault v1)` (its header has no `vault` marker), not with a decryption error.
 
 ## Known answers
 

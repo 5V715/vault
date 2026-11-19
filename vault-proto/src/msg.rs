@@ -51,13 +51,25 @@ pub struct PairOffer {
     pub relay_url: String,
     pub mailbox_id: [u8; 16],
     pub browser_eph_pub: [u8; 32],
+    /// The app the browser runs ([`crate::binding::validate_app_id`]).
+    pub app_id: String,
+    /// The page's web origin, canonical form ([`crate::binding::validate_origin`]).
+    /// A declared label: the vault pins it but cannot verify it.
+    pub origin: String,
 }
 
 impl PairOffer {
-    /// Validate and encode as `vault-pair:v1:<base64url(postcard)>`.
-    pub fn to_qr(&self) -> Result<String, ProtoError> {
+    /// Version, relay URL, app id and origin (canonical) all valid.
+    fn validate(&self) -> Result<(), ProtoError> {
         check_version(self.version)?;
         validate_relay_url(&self.relay_url)?;
+        crate::binding::validate_app_id(&self.app_id)?;
+        crate::binding::validate_origin(&self.origin)
+    }
+
+    /// Validate and encode as `vault-pair:v1:<base64url(postcard)>`.
+    pub fn to_qr(&self) -> Result<String, ProtoError> {
+        self.validate()?;
         let bytes = postcard::to_allocvec(self).map_err(|_| ProtoError::Malformed)?;
         let mut s = String::from(QR_PREFIX);
         s.push_str(&URL_SAFE_NO_PAD.encode(bytes));
@@ -73,7 +85,7 @@ impl PairOffer {
         // postcard writes a u8 as one raw byte: the first byte is the version.
         check_version(*bytes.first().ok_or(ProtoError::Malformed)?)?;
         let offer: PairOffer = decode_exact(&bytes)?;
-        validate_relay_url(&offer.relay_url)?;
+        offer.validate()?;
         Ok(offer)
     }
 }
@@ -220,8 +232,14 @@ pub enum ResponseBody {
 /// Unsolicited vault to browser messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Notice {
-    SessionTerminated { reason: String },
+    SessionTerminated {
+        reason: String,
+    },
     Locked,
+    /// The offer's `app_id` or `origin` is not the one this vault is bound to.
+    /// Sent right after the handshake, before any approval prompt; the session
+    /// then ends. Appended last so earlier variant tags stay stable.
+    WrongApp,
 }
 
 /// Top-level frame content, vault to browser.
@@ -319,6 +337,103 @@ mod tests {
             relay_url: url.into(),
             mailbox_id: [7; 16],
             browser_eph_pub: [9; 32],
+            app_id: "test-app".into(),
+            origin: "https://app.example".into(),
+        }
+    }
+
+    /// Encode `o` without validation, as a hostile or buggy sender could.
+    fn raw_qr(o: &PairOffer) -> alloc_prelude::String {
+        alloc_prelude::String::from(QR_PREFIX)
+            + &URL_SAFE_NO_PAD.encode(postcard::to_allocvec(o).unwrap())
+    }
+
+    #[test]
+    fn offer_roundtrip_with_app_binding() {
+        let o = PairOffer {
+            app_id: "org.example.notes".into(),
+            origin: "https://notes.example:8443".into(),
+            ..offer("wss://relay.example/mailbox")
+        };
+        let back = PairOffer::from_qr(&o.to_qr().unwrap()).unwrap();
+        assert_eq!(back, o);
+        assert_eq!(back.app_id, "org.example.notes");
+        assert_eq!(back.origin, "https://notes.example:8443");
+        // Loopback http origins are allowed (development).
+        for origin in [
+            "http://localhost:5173",
+            "http://127.0.0.1",
+            "http://[::1]:8080",
+        ] {
+            let o = PairOffer {
+                origin: origin.into(),
+                ..offer("ws://localhost:8080")
+            };
+            assert_eq!(PairOffer::from_qr(&o.to_qr().unwrap()).unwrap(), o);
+        }
+        // The binding follows the original fields on the wire (old tags unchanged).
+        let raw = postcard::to_allocvec(&o).unwrap();
+        assert_eq!(raw[0], crate::PROTOCOL_VERSION);
+        assert!(raw.ends_with(b"\x1ahttps://notes.example:8443"));
+    }
+
+    #[test]
+    fn offer_rejects_bad_app_id() {
+        for bad in ["", "-x", "Signal", "a b", "a_b", "\u{e9}", &"a".repeat(65)] {
+            let o = PairOffer {
+                app_id: bad.into(),
+                ..offer("wss://r.example")
+            };
+            assert_eq!(o.to_qr(), Err(ProtoError::BadAppId), "{bad:?}");
+            assert_eq!(
+                PairOffer::from_qr(&raw_qr(&o)),
+                Err(ProtoError::BadAppId),
+                "{bad:?}"
+            );
+        }
+        let o = PairOffer {
+            app_id: "a".repeat(64),
+            ..offer("wss://r.example")
+        };
+        assert!(o.to_qr().is_ok());
+    }
+
+    #[test]
+    fn offer_rejects_non_https_origin() {
+        for bad in [
+            "http://app.example",
+            "http://192.168.1.2:8080",
+            "ws://app.example",
+            "wss://app.example",
+            "ftp://app.example",
+            "app.example",
+            "",
+            // https, but not an origin: path, query, fragment, userinfo, non-ASCII
+            "https://app.example/",
+            "https://app.example/x",
+            "https://app.example?x",
+            "https://app.example#x",
+            "https://u@app.example",
+            "https://b\u{fc}cher.example",
+            // not canonical: the sender must normalize
+            "https://App.example",
+            "https://app.example:443",
+        ] {
+            let o = PairOffer {
+                origin: bad.into(),
+                ..offer("wss://r.example")
+            };
+            assert!(
+                matches!(o.to_qr(), Err(ProtoError::BadOrigin(_))),
+                "{bad:?} encoded"
+            );
+            assert!(
+                matches!(
+                    PairOffer::from_qr(&raw_qr(&o)),
+                    Err(ProtoError::BadOrigin(_))
+                ),
+                "{bad:?} decoded"
+            );
         }
     }
 
@@ -456,6 +571,7 @@ mod tests {
         }
         for n in [
             Notice::Locked,
+            Notice::WrongApp,
             Notice::SessionTerminated {
                 reason: "replaced".into(),
             },
@@ -482,6 +598,9 @@ mod tests {
         }
         .encode();
         assert_eq!(c, [5, 8]);
+        // WrongApp is appended after Locked (tag 1).
+        assert_eq!(Notice::Locked.encode(), [1]);
+        assert_eq!(Notice::WrongApp.encode(), [2]);
     }
 
     #[test]

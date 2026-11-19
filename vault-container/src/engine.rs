@@ -14,9 +14,12 @@
 //! when opening; a manifest with a lower `seq`, or the same `seq` with a different
 //! hash, is refused with [`Error::Rollback`].
 //!
-//! Objects: `header` = `"vault" || format_version(1) || postcard(HeaderBody)` holding only the
-//! recovery-wrapped CRK (the same bytes are inside every manifest; no plaintext
-//! identifiers); written once with `put_if_absent`. A header without a manifest is
+//! Objects: `header` = `"vault" || format_version(1) || postcard(HeaderBody)` holding the
+//! recovery-wrapped CRK and the [`Binding`] (app id and origin, the only plaintext
+//! identifiers); written once with `put_if_absent`. Every manifest carries a copy
+//! of both under its authentication tag, and opening refuses a header that does not
+//! match (so a tampered header fails to open). A header without the `vault` marker
+//! whose first byte is 1 was written before the split: [`Error::PreV1Container`]. A header without a manifest is
 //! an interrupted `create` ([`Error::IncompleteCreate`]) unless the caller holds a
 //! high-water mark, in which case the manifest was removed ([`Error::Rollback`]).
 //!
@@ -36,7 +39,8 @@ use crate::backend::{ContainerBackend, Etag, PutOutcome};
 use crate::manifest::{self, MAX_WRAPPED_CRK, Manifest};
 use crate::segment::{Record, SegmentReader, SegmentWriter, random_segment_id};
 use crate::{
-    CONTAINER_FORMAT_VERSION, Crk, Error, RecoveryKey, Result, Subkeys, unwrap_crk, wrap_crk,
+    Binding, CONTAINER_FORMAT_VERSION, Crk, Error, RecoveryKey, Result, Subkeys, unwrap_crk,
+    wrap_crk,
 };
 
 const HEADER: &str = "header";
@@ -44,6 +48,8 @@ const MANIFEST: &str = "manifest";
 const SEG_PREFIX: &str = "seg/";
 /// Fixed marker that starts every v1 header (containers from before the split have none).
 const HEADER_MAGIC: &[u8] = b"vault";
+/// First byte of a header from before the split (`version(1) || postcard(body)`).
+const PRE_V1_HEADER_VERSION: u8 = 1;
 const MAX_HEADER: usize = 4096;
 /// Record stream budget per segment so that each segment object stays <= 32 MiB.
 const SEGMENT_TARGET: usize = 32 * 1024 * 1024 - 64 * 1024;
@@ -61,9 +67,17 @@ pub struct HighWater {
     pub hash: [u8; 32],
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeaderBody {
     pub(crate) recovery_wrapped_crk: Vec<u8>,
+    pub(crate) binding: Binding,
+}
+
+impl HeaderBody {
+    /// The manifest carries the same wrapped CRK and binding (the header belongs to it).
+    pub(crate) fn matches(&self, m: &Manifest) -> bool {
+        self.recovery_wrapped_crk == m.recovery_wrapped_crk && self.binding == m.binding
+    }
 }
 
 fn encode_header(h: &HeaderBody) -> Result<Vec<u8>> {
@@ -81,7 +95,9 @@ pub(crate) fn decode_header(bytes: &[u8]) -> Result<HeaderBody> {
         return Err(Error::Format("empty header".into()));
     }
     let Some(rest) = bytes.strip_prefix(HEADER_MAGIC) else {
-        // Not a v1 header; headers from before the split also land here.
+        if bytes[0] == PRE_V1_HEADER_VERSION {
+            return Err(Error::PreV1Container);
+        }
         return Err(Error::Format("not a vault container header".into()));
     };
     // The format version comes first and is checked before the body is decoded.
@@ -98,6 +114,7 @@ pub(crate) fn decode_header(bytes: &[u8]) -> Result<HeaderBody> {
     if h.recovery_wrapped_crk.len() > MAX_WRAPPED_CRK {
         return Err(Error::Format("wrapped CRK too large".into()));
     }
+    h.binding.check()?;
     Ok(h)
 }
 
@@ -244,7 +261,8 @@ pub struct Container<B> {
     backend: B,
     crk: Crk,
     subkeys: Subkeys,
-    recovery_wrapped_crk: Vec<u8>,
+    /// The header's contents (wrapped CRK and binding), copied into every manifest.
+    header: HeaderBody,
     etag: Etag,
     hash: [u8; 32],
     seq: u64,
@@ -273,34 +291,39 @@ fn wipe_pending(p: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
 }
 
 impl<B: ContainerBackend> Container<B> {
-    /// Creates a new container on an empty backend: writes the header and the genesis
-    /// manifest (seq 0). Returns the recovery key to show to the user once.
+    /// Creates a new container on an empty backend, bound to `app_id` and `origin`
+    /// (see [`Binding::new`]; the origin is stored in canonical form): writes the
+    /// header and the genesis manifest (seq 0). Returns the recovery key to show to
+    /// the user once.
     ///
-    /// Fails with [`Error::Conflict`] if the backend already holds any object.
+    /// Fails with [`Error::InvalidBinding`] for a bad app id or origin and with
+    /// [`Error::Conflict`] if the backend already holds any object.
     ///
     /// Key material comes from the operating system RNG; callers cannot inject one:
     ///
     /// ```
     /// # async fn f() {
     /// use vault_container::{backend::MemoryBackend, engine::Container};
-    /// let _ = Container::create(MemoryBackend::new()).await;
+    /// let _ = Container::create(MemoryBackend::new(), "notes", "https://notes.example").await;
     /// # }
     /// ```
     ///
     /// ```compile_fail
     /// # async fn f() {
     /// use vault_container::{backend::MemoryBackend, engine::Container};
-    /// let _ = Container::create(MemoryBackend::new(), &mut rand::rng()).await;
+    /// let _ = Container::create(MemoryBackend::new(), "notes", "https://notes.example", &mut rand::rng()).await;
     /// # }
     /// ```
-    pub async fn create(backend: B) -> Result<(Self, RecoveryKey)> {
-        Self::create_with(backend, &mut OsRng.unwrap_err()).await
+    pub async fn create(backend: B, app_id: &str, origin: &str) -> Result<(Self, RecoveryKey)> {
+        let binding = Binding::new(app_id, origin)?;
+        Self::create_with(backend, binding, &mut OsRng.unwrap_err()).await
     }
 
     /// As [`Container::create`] with a caller-supplied RNG; crate-private so production
     /// cannot inject a weak RNG.
     pub(crate) async fn create_with(
         backend: B,
+        binding: Binding,
         rng: &mut (impl CryptoRng + Send),
     ) -> Result<(Self, RecoveryKey)> {
         if backend.get(HEADER).await?.is_some()
@@ -312,16 +335,18 @@ impl<B: ContainerBackend> Container<B> {
         let crk = Crk::generate_with(rng);
         let rk = RecoveryKey::generate_with(rng);
         let wrapped = wrap_crk(&crk, &rk, rng);
-        let header = encode_header(&HeaderBody {
+        let body = HeaderBody {
             recovery_wrapped_crk: wrapped.clone(),
-        })?;
+            binding: binding.clone(),
+        };
+        let header = encode_header(&body)?;
         // The header is the creation lock; a crash before the manifest below leaves an
         // incomplete container that `open_*` reports as `Error::IncompleteCreate`.
         if backend.put_if_absent(HEADER, &header).await? == PutOutcome::Conflict {
             return Err(Error::Conflict);
         }
         let subkeys = crk.subkeys();
-        let mut genesis = Manifest::genesis(wrapped.clone());
+        let mut genesis = Manifest::genesis(wrapped, binding);
         genesis.authenticate(&subkeys.manifest_auth)?;
         let sealed = manifest::seal(&genesis, &subkeys.manifest)?;
         let PutOutcome::Written(etag) = backend.put_if_absent(MANIFEST, &sealed).await? else {
@@ -331,7 +356,7 @@ impl<B: ContainerBackend> Container<B> {
             backend,
             crk,
             subkeys,
-            recovery_wrapped_crk: wrapped,
+            header: body,
             etag,
             hash: manifest::hash(&sealed),
             seq: 0,
@@ -376,12 +401,12 @@ impl<B: ContainerBackend> Container<B> {
         high_water: Option<HighWater>,
     ) -> Result<Self> {
         let subkeys = crk.subkeys();
-        let l = load(&backend, &subkeys, &header.recovery_wrapped_crk, high_water).await?;
+        let l = load(&backend, &subkeys, &header, high_water).await?;
         Ok(Self {
             backend,
             crk,
             subkeys,
-            recovery_wrapped_crk: header.recovery_wrapped_crk,
+            header,
             etag: l.etag,
             hash: l.hash,
             seq: l.seq,
@@ -563,7 +588,7 @@ impl<B: ContainerBackend> Container<B> {
         let l = load(
             &self.backend,
             &self.subkeys,
-            &self.recovery_wrapped_crk,
+            &self.header,
             Some(self.high_water()),
         )
         .await?;
@@ -606,6 +631,12 @@ impl<B: ContainerBackend> Container<B> {
     /// Ids of the live segments, in replay order.
     pub fn segment_ids(&self) -> &[[u8; 16]] {
         &self.segments
+    }
+
+    /// The app id and (canonical) origin this container is bound to, as
+    /// `(app_id, origin)`. Authenticated: opening checked them against the manifest.
+    pub fn binding(&self) -> (&str, &str) {
+        (&self.header.binding.app_id, &self.header.binding.origin)
     }
 
     /// The container root key.
@@ -761,7 +792,8 @@ impl<B: ContainerBackend> Container<B> {
             seq,
             prev: self.hash,
             segments,
-            recovery_wrapped_crk: self.recovery_wrapped_crk.clone(),
+            recovery_wrapped_crk: self.header.recovery_wrapped_crk.clone(),
+            binding: self.header.binding.clone(),
             auth_tag: [0u8; 32],
         };
         m.authenticate(&self.subkeys.manifest_auth)?;
@@ -800,7 +832,7 @@ async fn read_header<B: ContainerBackend>(backend: &B) -> Result<HeaderBody> {
 async fn load<B: ContainerBackend>(
     backend: &B,
     subkeys: &Subkeys,
-    recovery_wrapped_crk: &[u8],
+    header: &HeaderBody,
     high_water: Option<HighWater>,
 ) -> Result<Loaded> {
     'attempt: for attempt in 0..LOAD_ATTEMPTS {
@@ -816,7 +848,9 @@ async fn load<B: ContainerBackend>(
         let m = manifest::open_verified(&bytes, &subkeys.manifest, &subkeys.manifest_auth)?;
         let hash = manifest::hash(&bytes);
         check_high_water(&m, &hash, high_water)?;
-        if m.recovery_wrapped_crk != recovery_wrapped_crk {
+        // The header is plaintext and unauthenticated on its own: its contents
+        // count only because the authenticated manifest carries the same.
+        if !header.matches(&m) {
             return Err(Error::Format("manifest does not match header".into()));
         }
         let mut index = Index::default();
@@ -858,11 +892,15 @@ mod tests {
     use crate::backend::MemoryBackend;
     use rand::SeedableRng;
 
+    fn bind() -> Binding {
+        Binding::new("test-app", "https://app.example").unwrap()
+    }
+
     #[tokio::test]
     async fn large_batches_split_into_bounded_segments() {
         let backend = MemoryBackend::new();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(1);
-        let (mut c, rk) = Container::create_with(backend.clone(), &mut rng)
+        let (mut c, rk) = Container::create_with(backend.clone(), bind(), &mut rng)
             .await
             .unwrap();
         c.segment_target = 4096;
@@ -896,12 +934,32 @@ mod tests {
     fn header_roundtrip_and_hostile_input() {
         let h = HeaderBody {
             recovery_wrapped_crk: vec![1, 2, 3],
+            binding: Binding::new("ab", "https://c.d").unwrap(),
         };
         let bytes = encode_header(&h).unwrap();
-        // marker, then the format version, then postcard(body)
-        assert_eq!(bytes, b"vault\x01\x03\x01\x02\x03");
+        // marker, then the format version, then postcard(body): wrapped CRK, app id, origin
+        assert_eq!(bytes, b"vault\x01\x03\x01\x02\x03\x02ab\x0bhttps://c.d");
         let back = decode_header(&bytes).unwrap();
-        assert_eq!(back.recovery_wrapped_crk, vec![1, 2, 3]);
+        assert_eq!(back, h);
+        // An invalid or non-canonical stored binding is refused.
+        for (app, origin) in [
+            ("AB", "https://c.d"),
+            ("ab", "https://C.d"),
+            ("ab", "http://c.d"),
+        ] {
+            let bad = encode_header(&HeaderBody {
+                recovery_wrapped_crk: vec![1],
+                binding: Binding {
+                    app_id: app.into(),
+                    origin: origin.into(),
+                },
+            })
+            .unwrap();
+            assert!(
+                matches!(decode_header(&bad), Err(Error::Format(_))),
+                "{app} {origin}"
+            );
+        }
         assert!(matches!(decode_header(&[]), Err(Error::Format(_))));
         assert!(matches!(decode_header(b"vault"), Err(Error::Format(_))));
         let mut trailing = bytes.clone();
@@ -913,6 +971,7 @@ mod tests {
         ));
         let big = encode_header(&HeaderBody {
             recovery_wrapped_crk: vec![0; MAX_WRAPPED_CRK + 1],
+            binding: bind(),
         })
         .unwrap();
         assert!(matches!(decode_header(&big), Err(Error::Format(_))));
@@ -942,9 +1001,17 @@ mod tests {
             Error::UnsupportedFormatVersion(2).to_string(),
             "unsupported container format version 2"
         );
-        // No marker: not a v1 header (a distinct error from an unknown version).
+        // No marker: a header from before the split (first byte 1), or not a header.
         assert!(matches!(
             decode_header(&[1, 3, 1, 2, 3]),
+            Err(Error::PreV1Container)
+        ));
+        assert_eq!(
+            Error::PreV1Container.to_string(),
+            "unsupported container format (created before vault v1)"
+        );
+        assert!(matches!(
+            decode_header(&[2, 3, 1, 2, 3]),
             Err(Error::Format(_))
         ));
     }
@@ -957,6 +1024,7 @@ mod tests {
             prev,
             segments: Vec::new(),
             recovery_wrapped_crk: Vec::new(),
+            binding: bind(),
             auth_tag: [0; 32],
         };
         let hw = |seq, hash| Some(HighWater { seq, hash });

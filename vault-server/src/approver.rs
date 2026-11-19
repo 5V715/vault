@@ -7,22 +7,42 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot;
 
+/// What an approval prompt shows. All of it except `sas` comes from the browser
+/// or the pairing text: display it as untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalRequest<'a> {
+    /// Browser-supplied name (at most 64 bytes, no control characters, but
+    /// possibly bidi or look-alike characters).
+    pub device_name: &'a str,
+    /// The 6-digit code the browser also shows.
+    pub sas: &'a str,
+    /// The app id of the offer (equal to the vault's binding: a mismatch never
+    /// reaches the approver).
+    pub app_id: &'a str,
+    /// The web origin the page declared (equal to the vault's binding). Not
+    /// authenticated: the user should still check that it is the page they opened.
+    pub origin: &'a str,
+    /// Host (and port) of the relay named in the pairing text.
+    pub relay_host: &'a str,
+}
+
 /// Asks the user whether a browser may open a session.
 ///
-/// Implementations show `device_name` and the 6-digit `sas`, which the user must
-/// compare with the code the browser shows, and return `true` only on an explicit
-/// confirmation (biometric prompt on Android, a terminal prompt in development).
+/// Implementations show the [`ApprovalRequest`]: the app id, origin, relay host,
+/// device name and the 6-digit SAS, which the user must compare with the code the
+/// browser shows, and return `true` only on an explicit confirmation (biometric
+/// prompt on Android, a terminal prompt in development).
 /// The server calls `approve` for one session at a time and cancels the call
 /// (drops the future) after its approval timeout or when the session ends;
 /// implementations must treat that as a denial and must not let an answer given
 /// for a cancelled prompt apply to a later one.
 ///
-/// `device_name` is browser-supplied text (at most 64 bytes, no control
-/// characters, but possibly bidi or look-alike characters): display it as
-/// untrusted.
+/// The server checks the offer's app id and origin against the vault's binding
+/// before it calls `approve`; a mismatch ends the session with
+/// `Notice::WrongApp` and never prompts.
 #[async_trait::async_trait]
 pub trait Approver: Send + Sync {
-    async fn approve(&self, device_name: &str, sas: &str) -> bool;
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool;
 }
 
 /// Development approver: prompts on a terminal and reads answers from one
@@ -34,8 +54,6 @@ pub trait Approver: Send + Sync {
 /// dropped. At end of input every prompt is denied.
 pub struct TerminalApprover {
     shared: Arc<Shared>,
-    /// Shown in every prompt: the relay the pairing text named.
-    relay_host: Option<String>,
 }
 
 struct Shared {
@@ -157,23 +175,13 @@ impl TerminalApprover {
         if spawned.is_err() {
             shared.close();
         }
-        Self {
-            shared,
-            relay_host: None,
-        }
-    }
-
-    /// Show `host` (the relay named in the pairing text) in every prompt, so
-    /// the user can check it is the relay of the page they opened.
-    pub fn with_relay_host(mut self, host: impl Into<String>) -> Self {
-        self.relay_host = Some(host.into());
-        self
+        Self { shared }
     }
 }
 
 #[async_trait::async_trait]
 impl Approver for TerminalApprover {
-    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
         let s = &*self.shared;
         let id = s.next.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = oneshot::channel();
@@ -188,19 +196,18 @@ impl Approver for TerminalApprover {
             }
         }
         let _clear = ClearOnDrop(s, id);
-        let relay = self
-            .relay_host
-            .as_ref()
-            .map(|h| {
-                format!(
-                    "[#{id}] Relay: {}  (must be the address of the web app page you opened)\n",
-                    h.escape_debug()
-                )
-            })
-            .unwrap_or_default();
         s.say(&format!(
-            "\n[#{id}] Allow \"{}\" to open a vault session?\n{relay}[#{id}] Code: {sas}  (must match the browser)\n[#{id}] Type 'y {id}' to allow, 'n' to deny: ",
-            device_name.escape_debug()
+            "\n[#{id}] Allow \"{device}\" to open a vault session?\n\
+             [#{id}] App: {app}\n\
+             [#{id}] Origin: {origin}  (must be the web app page you opened)\n\
+             [#{id}] Relay: {relay}  (must be the relay of that page)\n\
+             [#{id}] Code: {sas}  (must match the browser)\n\
+             [#{id}] Type 'y {id}' to allow, 'n' to deny: ",
+            device = req.device_name.escape_debug(),
+            app = req.app_id.escape_debug(),
+            origin = req.origin.escape_debug(),
+            relay = req.relay_host.escape_debug(),
+            sas = req.sas.escape_debug(),
         ));
         rx.await.unwrap_or(false)
     }
@@ -244,6 +251,16 @@ mod tests {
         (Arc::new(a), w, out)
     }
 
+    fn req<'a>(device_name: &'a str, sas: &'a str) -> ApprovalRequest<'a> {
+        ApprovalRequest {
+            device_name,
+            sas,
+            app_id: "test-app",
+            origin: "https://app.example",
+            relay_host: "relay.example",
+        }
+    }
+
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -268,7 +285,7 @@ mod tests {
         settle().await;
         let t = tokio::spawn({
             let a = a.clone();
-            async move { a.approve("Fire\u{202e}fox", "123456").await }
+            async move { a.approve(&req("Fire\u{202e}fox", "123456")).await }
         });
         out.wait_for("Type 'y 1'").await;
         assert!(out.text().contains("123456"));
@@ -284,11 +301,12 @@ mod tests {
     #[tokio::test]
     async fn late_answer_does_not_approve_next_prompt() {
         let (a, mut w, out) = setup();
-        let r = tokio::time::timeout(Duration::from_millis(50), a.approve("A", "111111")).await;
+        let r =
+            tokio::time::timeout(Duration::from_millis(50), a.approve(&req("A", "111111"))).await;
         assert!(r.is_err()); // cancelled, like a server approval timeout
         let t = tokio::spawn({
             let a = a.clone();
-            async move { a.approve("B", "222222").await }
+            async move { a.approve(&req("B", "222222")).await }
         });
         out.wait_for("Type 'y 2'").await;
         writeln!(w, "y 1").unwrap(); // late answer to the cancelled prompt
@@ -300,22 +318,31 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_shows_relay_host() {
-        let (r, mut w) = std::io::pipe().unwrap();
-        let out = Buf::default();
-        let a = Arc::new(
-            TerminalApprover::with_io(BufReader::new(r), out.clone())
-                .with_relay_host("relay.example\u{202e}"),
-        );
+        let (a, mut w, out) = setup();
         let t = tokio::spawn({
             let a = a.clone();
-            async move { a.approve("A", "111111").await }
+            async move {
+                a.approve(&ApprovalRequest {
+                    device_name: "Firefox",
+                    sas: "123456",
+                    app_id: "org.example.notes",
+                    origin: "https://notes.example:8443",
+                    relay_host: "relay.example\u{202e}",
+                })
+                .await
+            }
         });
         out.wait_for("Type 'y 1'").await;
-        assert!(
-            out.text().contains("Relay: relay.example\\u{202e}"),
-            "{}",
-            out.text()
-        );
+        let text = out.text();
+        for want in [
+            "Allow \"Firefox\"",
+            "App: org.example.notes",
+            "Origin: https://notes.example:8443",
+            "Relay: relay.example\\u{202e}",
+            "Code: 123456",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
         writeln!(w, "n").unwrap();
         assert!(!t.await.unwrap());
     }
@@ -325,11 +352,11 @@ mod tests {
         let (a, w, out) = setup();
         let t = tokio::spawn({
             let a = a.clone();
-            async move { a.approve("A", "111111").await }
+            async move { a.approve(&req("A", "111111")).await }
         });
         out.wait_for("Type 'y 1'").await;
         drop(w);
         assert!(!t.await.unwrap());
-        assert!(!a.approve("B", "222222").await);
+        assert!(!a.approve(&req("B", "222222")).await);
     }
 }

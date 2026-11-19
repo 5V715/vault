@@ -14,7 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::transport::{Channel, ChannelError};
 use crate::{
-    EndReason, Inner, MAX_AWAITING_APPROVAL, SessionRecord, Terminate, VaultContainer, now_ms,
+    ApprovalRequest, EndReason, Inner, MAX_AWAITING_APPROVAL, Offered, SessionRecord, Terminate,
+    VaultContainer, now_ms,
 };
 
 /// How long a newly approved session waits for the replaced one to send its notice.
@@ -119,6 +120,7 @@ pub(crate) async fn run(
     id: u64,
     mut ch: Channel,
     sas: String,
+    offered: Offered,
     mut ctl: mpsc::UnboundedReceiver<Terminate>,
 ) -> EndReason {
     let mut cleanup = Cleanup {
@@ -134,6 +136,7 @@ pub(crate) async fn run(
         id,
         &mut ch,
         &sas,
+        &offered,
         &mut ctl,
         &mut cleanup.device_name,
         &mut ack,
@@ -151,7 +154,12 @@ pub(crate) async fn run(
         "vault session ended"
     );
     // Between sessions: compact if the policy says so (skipped if another
-    // session is already active). A failure leaves the container as it was.
+    // session is already active, and after a refused wrong-app offer, which
+    // must not make the vault do work on its data). A failure leaves the
+    // container as it was.
+    if reason == EndReason::WrongApp {
+        return reason;
+    }
     if let Err(e) = crate::compact_if_needed(&inner).await {
         tracing::warn!(error = %e, "vault compaction failed");
     }
@@ -221,11 +229,23 @@ async fn drive(
     id: u64,
     ch: &mut Channel,
     sas: &str,
+    offered: &Offered,
     ctl: &mut mpsc::UnboundedReceiver<Terminate>,
     device_name: &mut String,
     ack: &mut Option<oneshot::Sender<()>>,
 ) -> EndReason {
     let cfg = &inner.config;
+
+    // Another app or origin than the container's binding: say so and end, before
+    // reading any request, asking the user or touching the container.
+    if !offered.bound {
+        tracing::warn!(
+            session = id,
+            "vault session: offer for another app or origin"
+        );
+        let _ = send_notice(ch, Notice::WrongApp).await;
+        return EndReason::WrongApp;
+    }
 
     // AwaitApproval 1: wait for OpenSession (Pings are answered).
     let deadline = Instant::now() + cfg.approval_timeout;
@@ -289,10 +309,14 @@ async fn drive(
 
     // AwaitApproval 3: the prompt is shown; its timeout starts now.
     tracing::info!(session = id, "vault session: awaiting user approval");
-    let approve = timeout(
-        cfg.approval_timeout,
-        inner.approver.approve(device_name, sas),
-    );
+    let req = ApprovalRequest {
+        device_name,
+        sas,
+        app_id: &offered.app_id,
+        origin: &offered.origin,
+        relay_host: &offered.relay_host,
+    };
+    let approve = timeout(cfg.approval_timeout, inner.approver.approve(&req));
     tokio::pin!(approve);
     let approved = loop {
         let ev = tokio::select! {

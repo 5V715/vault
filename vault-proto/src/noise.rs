@@ -199,12 +199,26 @@ impl Cipher for ZChaChaPoly {
     }
 }
 
-fn prologue(offer: &PairOffer) -> Vec<u8> {
-    let mut p = Vec::with_capacity(PROLOGUE_LABEL.len() + 16 + 32);
+/// `PROLOGUE_LABEL ‖ [version] ‖ u16be(len) app_id ‖ u16be(len) origin ‖
+/// mailbox_id ‖ browser_eph_pub`. Both sides build it from the offer they hold,
+/// so a vault and a browser that disagree on any of these fields fail the
+/// handshake. Refuses an offer whose app id or origin is invalid.
+fn prologue(offer: &PairOffer) -> Result<Vec<u8>> {
+    crate::binding::validate_app_id(&offer.app_id).map_err(|_| NoiseError::Handshake)?;
+    crate::binding::validate_origin(&offer.origin).map_err(|_| NoiseError::Handshake)?;
+    let mut p = Vec::with_capacity(
+        PROLOGUE_LABEL.len() + 1 + 4 + offer.app_id.len() + offer.origin.len() + 16 + 32,
+    );
     p.extend_from_slice(PROLOGUE_LABEL);
+    p.push(offer.version);
+    for field in [&offer.app_id, &offer.origin] {
+        let len = u16::try_from(field.len()).map_err(|_| NoiseError::Handshake)?;
+        p.extend_from_slice(&len.to_be_bytes());
+        p.extend_from_slice(field.as_bytes());
+    }
     p.extend_from_slice(&offer.mailbox_id);
     p.extend_from_slice(&offer.browser_eph_pub);
-    p
+    Ok(p)
 }
 
 fn state(secret: &[u8; 32], offer: &PairOffer, initiator: bool) -> Result<HandshakeState> {
@@ -218,7 +232,7 @@ fn state_with(
     initiator: bool,
 ) -> Result<HandshakeState> {
     let params = NOISE_PATTERN.parse().map_err(|_| NoiseError::Handshake)?;
-    let prologue = prologue(offer);
+    let prologue = prologue(offer)?;
     let b = Builder::with_resolver(params, resolver)
         .prologue(&prologue)
         .local_private_key(secret);
@@ -295,8 +309,14 @@ impl core::fmt::Debug for PairKeys {
 }
 
 impl PairKeys {
-    /// Generate a fresh X25519 keypair from the OS RNG and build the offer for it.
-    pub fn generate(relay_url: String, mailbox_id: [u8; 16]) -> Result<Self> {
+    /// Generate a fresh X25519 keypair from the OS RNG and build the offer for it,
+    /// declaring `app_id` and `origin` (canonical form, see [`crate::binding`]).
+    pub fn generate(
+        relay_url: String,
+        mailbox_id: [u8; 16],
+        app_id: String,
+        origin: String,
+    ) -> Result<Self> {
         let mut rng = DefaultResolver.resolve_rng().ok_or(NoiseError::Handshake)?;
         let mut secret = Zeroizing::new([0u8; 32]);
         rng.fill_bytes(&mut *secret);
@@ -305,6 +325,8 @@ impl PairKeys {
             relay_url,
             mailbox_id,
             browser_eph_pub: public_of(&secret),
+            app_id,
+            origin,
         };
         Ok(Self { offer, secret })
     }
@@ -511,6 +533,8 @@ mod tests {
             relay_url: "wss://relay.example/".into(),
             mailbox_id: [mailbox; 16],
             browser_eph_pub: public_of(secret),
+            app_id: "test-app".into(),
+            origin: "https://app.example".into(),
         }
     }
 
@@ -610,8 +634,16 @@ mod tests {
 
     #[test]
     fn pair_keys_are_fresh_and_consistent() {
-        let a = PairKeys::generate("wss://relay.example/".into(), [3; 16]).unwrap();
-        let b = PairKeys::generate("wss://relay.example/".into(), [3; 16]).unwrap();
+        let fresh = || {
+            PairKeys::generate(
+                "wss://relay.example/".into(),
+                [3; 16],
+                "test-app".into(),
+                "https://app.example".into(),
+            )
+            .unwrap()
+        };
+        let (a, b) = (fresh(), fresh());
         assert_ne!(a.offer().browser_eph_pub, b.offer().browser_eph_pub);
         let offer = a.offer().clone();
         let (i, m1) = a.into_initiator().unwrap();
@@ -676,6 +708,72 @@ mod tests {
         let (browser_side, _) = handshake(a, relay_static, &offer_a).unwrap();
         let (_, vault_side) = handshake(relay_static, vault, &offer_r).unwrap();
         assert_ne!(browser_side.sas(), vault_side.sas());
+    }
+
+    #[test]
+    fn prologue_binds_app_and_origin() {
+        let (b, vault) = (secret(1), secret(2));
+        let offer = offer_for(&b, 7);
+        // Layout: label, version, u16be-length-prefixed app_id and origin, mailbox, key.
+        let mut want = b"vault/v1\x01\x00\x08test-app\x00\x13https://app.example".to_vec();
+        want.extend_from_slice(&[7; 16]);
+        want.extend_from_slice(&public_of(&b));
+        assert_eq!(prologue(&offer).unwrap(), want);
+        assert!(handshake_two_offers(b, vault, &offer, &offer).is_ok());
+
+        // The vault holds an offer that differs only in origin, app id or version:
+        // the handshake fails (in either direction of the mismatch).
+        let mut changed = Vec::new();
+        for origin in [
+            "https://evil.example",
+            "https://app.example:8443",
+            "http://localhost",
+        ] {
+            changed.push(PairOffer {
+                origin: origin.into(),
+                ..offer.clone()
+            });
+        }
+        changed.push(PairOffer {
+            app_id: "other-app".into(),
+            ..offer.clone()
+        });
+        changed.push(PairOffer {
+            version: 2,
+            ..offer.clone()
+        });
+        for other in &changed {
+            assert_ne!(prologue(other).unwrap(), want);
+            assert!(
+                handshake_two_offers(b, vault, &offer, other).is_err(),
+                "{other:?}"
+            );
+            assert!(
+                handshake_two_offers(b, vault, other, &offer).is_err(),
+                "{other:?}"
+            );
+        }
+        // Length prefixes keep field boundaries: moving bytes between app_id and
+        // origin cannot produce the same prologue.
+        let a = PairOffer {
+            app_id: "ab".into(),
+            ..offer.clone()
+        };
+        let c = PairOffer {
+            app_id: "a".into(),
+            ..offer.clone()
+        };
+        assert_ne!(prologue(&a).unwrap(), prologue(&c).unwrap());
+        // An invalid binding never reaches the handshake.
+        let bad = PairOffer {
+            origin: "https://app.example/".into(),
+            ..offer.clone()
+        };
+        assert_eq!(
+            Responder::new(vault, &bad).unwrap_err(),
+            NoiseError::Handshake
+        );
+        assert_eq!(Initiator::new(&bad, b).unwrap_err(), NoiseError::Handshake);
     }
 
     /// Browser uses `browser_offer`, vault uses `vault_offer`.

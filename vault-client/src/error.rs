@@ -110,6 +110,9 @@ pub enum CloseReason {
     KeepaliveTimedOut,
     /// The host's activation hook failed with this text (it is the whole reason).
     Failed(String),
+    /// The vault is bound to another app or origin than the one this page
+    /// declared (`Notice::WrongApp`); it refused before asking the user.
+    WrongApp,
 }
 
 impl std::fmt::Display for CloseReason {
@@ -129,6 +132,7 @@ impl std::fmt::Display for CloseReason {
             Self::KeepaliveFailed(e) => write!(f, "keepalive failed: {e}"),
             Self::KeepaliveTimedOut => f.write_str("keepalive timed out"),
             Self::Failed(r) => f.write_str(r),
+            Self::WrongApp => f.write_str("wrong app"),
         }
     }
 }
@@ -186,5 +190,6 @@ mod tests {
             "terminated: replaced"
         );
         assert_eq!(CloseReason::Failed("x: y".into()).to_string(), "x: y");
+        assert_eq!(CloseReason::WrongApp.to_string(), "wrong app");
     }
 }

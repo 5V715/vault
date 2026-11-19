@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! `vaultctl`: command-line tool to create an encrypted container, add S3 / WebDAV
-//! replicas, replicate and restore with the recovery key.
+//! `vaultctl`: command-line tool to create an encrypted container bound to one app
+//! and web origin (`init --app <id> --origin <url>`), add S3 / WebDAV replicas,
+//! replicate and restore with the recovery key.
 //!
 //! The local container lives in `--dir D`. The CLI keeps its secrets (recovery key,
 //! replication state, replica credentials) in `D/.vaultctl`, encrypted under a
@@ -56,8 +57,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new container; prints the recovery key and a QR code exactly once.
-    Create,
+    /// Create a new container bound to one app and web origin; prints the recovery
+    /// key and a QR code exactly once. (`create` is an alias.)
+    #[command(alias = "create")]
+    Init {
+        /// App id the vault serves, e.g. `signal-web` (`^[a-z0-9][a-z0-9.-]{0,63}$`).
+        #[arg(long = "app", value_name = "ID")]
+        app: String,
+        /// Web origin of the app, e.g. `https://app.example` (https; http only for
+        /// localhost, 127.0.0.1 and [::1]; no path). Stored in canonical form.
+        #[arg(long, value_name = "URL")]
+        origin: String,
+    },
+    /// Print the container's app binding (app id and origin) and manifest seq.
+    Info,
     /// Manage replicas.
     #[command(subcommand)]
     Replica(ReplicaCmd),
@@ -446,12 +459,14 @@ impl Opened {
 // Commands
 // ---------------------------------------------------------------------------------
 
-async fn cmd_create(dir: &Path) -> R<u8> {
+async fn cmd_init(dir: &Path, app: &str, origin: &str) -> R<u8> {
+    // Checked before anything is prompted for or written.
+    vault_container::Binding::new(app, origin)?;
     ensure_empty_dir(dir)?;
     let pass = passphrase(true)?;
     let existed = dir.exists();
     let backend = LocalBackend::open(dir).await?;
-    let (c, rk) = match Container::create(backend).await {
+    let (c, rk) = match Container::create(backend, app, origin).await {
         Ok(v) => v,
         Err(e) => {
             cleanup_dir(dir, existed);
@@ -477,6 +492,8 @@ async fn cmd_create(dir: &Path) -> R<u8> {
     let out = std::io::stdout();
     let mut out = out.lock();
     writeln!(out, "Container created in {}", dir.display())?;
+    let (app_id, origin) = c.binding();
+    writeln!(out, "Bound to app {app_id} at origin {origin}")?;
     writeln!(out)?;
     writeln!(out, "Recovery key: {}", *rk.to_display())?;
     writeln!(out)?;
@@ -840,6 +857,12 @@ async fn cmd_data(dir: &Path, cmd: Cmd) -> R<u8> {
             o.save()?;
             println!("committed seq {seq}");
         }
+        Cmd::Info => {
+            let (app_id, origin) = o.c.binding();
+            println!("app: {app_id}");
+            println!("origin: {origin}");
+            println!("seq: {}", o.c.seq());
+        }
         _ => unreachable!("handled by caller"),
     }
     Ok(0)
@@ -850,7 +873,7 @@ async fn dispatch(cli: Cli) -> R<u8> {
         return fail("--dir <DIR> is required");
     };
     match cli.cmd {
-        Cmd::Create => cmd_create(&dir).await,
+        Cmd::Init { app, origin } => cmd_init(&dir, &app, &origin).await,
         Cmd::Replica(r) => cmd_replica(&dir, r).await,
         Cmd::Replicate => cmd_replicate(&dir).await,
         Cmd::Restore { recovery_key, from } => cmd_restore(&dir, recovery_key, from).await,

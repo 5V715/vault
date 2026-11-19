@@ -21,7 +21,13 @@ use vault_proto::{RequestBody, ResponseBody};
 async fn connect(st: &Stack, sp: &LocalSpawner) -> Result<Rc<Rpc>, ClientError> {
     let mut id = [0u8; 16];
     SystemRng.fill(&mut id);
-    let keys = PairKeys::generate(st.origin(), id).unwrap();
+    let keys = PairKeys::generate(
+        st.origin(),
+        id,
+        common::APP_ID.into(),
+        common::ORIGIN.into(),
+    )
+    .unwrap();
     let qr = keys.offer().to_qr().unwrap();
     let t = TokioMailbox::open(&mailbox_url(&st.origin(), &id).unwrap()).await?;
     st.scan(&qr);

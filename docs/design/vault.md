@@ -74,15 +74,17 @@ nothing; sessions are approved and revoked on the phone.
 
 ### Container format (V1)
 
-- `header`: format version and the recovery-wrapped CRK, nothing else (the
-  Keystore-wrapped CRK is device-local, kept outside the container and never
-  replicated). No plaintext identifiers.
+- `header`: the fixed marker `"vault"`, the format version, the recovery-wrapped
+  CRK and the app binding (`app_id`, `origin`), nothing else (the Keystore-wrapped
+  CRK is device-local, kept outside the container and never replicated). The
+  binding is the only plaintext identifier; every manifest carries the same
+  wrapped CRK and binding under its `auth_tag`, so a changed header fails to open.
 - `seg/<random 128-bit id>`: immutable, AES-256-GCM framed chunks
   (64 KiB) of record changes (put/delete with HMAC'd keys); padded to size buckets to blur record sizes.
 - `manifest`: list of live segment ids (no duplicates) + monotonically
-  increasing `seq` + previous manifest hash + recovery-wrapped CRK, plus
+  increasing `seq` + previous manifest hash + recovery-wrapped CRK + app binding, plus
   `auth_tag` = HMAC-SHA256(`manifest-auth` key, canonical bytes of
-  `{seq, prev, segments, recovery_wrapped_crk}`), the whole AEAD-sealed with the
+  `{seq, prev, segments, recovery_wrapped_crk, binding}`), the whole AEAD-sealed with the
   `manifest` key. The `manifest-auth` key is derived from the CRK and is not
   kept with the `manifest` key: whoever holds only the `manifest` key (the
   vault's background replication) can read `seq`/segment ids and copy sealed

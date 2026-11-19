@@ -59,6 +59,9 @@ struct V {
     pool: LocalPool,
     st: Stack,
     net: Counting,
+    /// What the client declares (the vault is bound to `common::APP_ID`/`ORIGIN`).
+    app_id: String,
+    page_origin: String,
 }
 
 fn venv() -> V {
@@ -66,6 +69,8 @@ fn venv() -> V {
         pool: LocalPool::new(),
         st: Stack::new(),
         net: Counting::default(),
+        app_id: common::APP_ID.into(),
+        page_origin: common::ORIGIN.into(),
     }
 }
 
@@ -116,6 +121,8 @@ impl V {
             TokioClock,
             &SystemRng,
             &self.st.origin(),
+            &self.app_id,
+            &self.page_origin,
             "My Browser",
             cb,
             SessionOptions {
@@ -360,6 +367,8 @@ fn ping_keeps_session_alive() {
         pool: LocalPool::new(),
         st: Stack::with_idle(std::time::Duration::from_secs(1)),
         net: Counting::default(),
+        app_id: common::APP_ID.into(),
+        page_origin: common::ORIGIN.into(),
     };
     let (c, seen) = v.new_client(300);
     v.confirm_and_wait_active(&c, &seen);
@@ -496,6 +505,8 @@ fn pair_rejects_bad_device_names_and_relay_urls() {
             TokioClock,
             &SystemRng,
             origin,
+            common::APP_ID,
+            common::ORIGIN,
             name,
             SessionCallbacks::new(Rc::new(|_| {}), Rc::new(|_| {}), Rc::new(|_| {})),
         )
@@ -517,6 +528,8 @@ fn pair_with_ping(ping_interval_ms: u64) -> Result<VaultSession, ClientError> {
         TokioClock,
         &SystemRng,
         "http://127.0.0.1:1",
+        common::APP_ID,
+        common::ORIGIN,
         "ok",
         SessionCallbacks::new(Rc::new(|_| {}), Rc::new(|_| {}), Rc::new(|_| {})),
         SessionOptions { ping_interval_ms },
@@ -541,4 +554,96 @@ fn ping_interval_above_protocol_max_rejected() {
 fn ping_interval_zero_rejected() {
     assert!(matches!(pair_with_ping(0), Err(ClientError::Protocol(_))));
     assert!(pair_with_ping(1).is_ok());
+}
+
+/// The client declares `app_id`/`page_origin`; the vault is bound to
+/// `common::APP_ID`/`common::ORIGIN`: the session must close with `WrongApp`
+/// without an approval prompt.
+fn refused_before_approval(app_id: &str, page_origin: &str) {
+    let mut v = venv();
+    v.app_id = app_id.into();
+    v.page_origin = page_origin.into();
+    let writes_before = v.st.knobs.writes_started.load(Ordering::SeqCst);
+    let (c, seen) = v.new_client(PING_INTERVAL_MS);
+    let s = seen.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("closed", move || s.closed().is_some()),
+    );
+    // The browser is told why (no hang), and the user was never asked.
+    assert_eq!(seen.closed(), Some(CloseReason::WrongApp));
+    assert_eq!(seen.closed_text().as_deref(), Some("wrong app"));
+    assert!(v.st.approver.calls.lock().unwrap().is_empty());
+    assert!(!seen.has(&SessionState::Active));
+    assert!(c.backend().is_none());
+    // The vault logged it as such and touched no data.
+    let server = v.st.server.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("logged", move || !server.session_log().is_empty()),
+    );
+    let log = v.st.server.session_log();
+    assert_eq!(log[0].reason, vault_server::EndReason::WrongApp);
+    assert_eq!(log[0].device_name, "", "OpenSession was never read");
+    assert_eq!(
+        v.st.knobs.writes_started.load(Ordering::SeqCst),
+        writes_before
+    );
+    // The same vault still serves the right app.
+    let mut v2 = V {
+        app_id: common::APP_ID.into(),
+        page_origin: common::ORIGIN.into(),
+        ..v
+    };
+    let (c, seen) = v2.new_client(PING_INTERVAL_MS);
+    v2.confirm_and_wait_active(&c, &seen);
+    assert!(store_works(&mut v2, &c));
+}
+
+#[test]
+fn wrong_app_refused_before_approval() {
+    refused_before_approval("other-app", common::ORIGIN);
+}
+
+#[test]
+fn wrong_origin_refused_before_approval() {
+    refused_before_approval(common::APP_ID, "https://evil.example");
+    // Normalization happens before the comparison: these are the bound origin.
+    let mut v = venv();
+    v.page_origin = "HTTPS://App.Example:443".into();
+    let (c, seen) = v.new_client(PING_INTERVAL_MS);
+    v.confirm_and_wait_active(&c, &seen);
+}
+
+#[test]
+fn pair_rejects_bad_app_id_and_origin() {
+    let bad = |app: &str, origin: &str| {
+        VaultSession::pair(
+            TokioFactory,
+            TokioClock,
+            &SystemRng,
+            "http://127.0.0.1:1",
+            app,
+            origin,
+            "ok",
+            SessionCallbacks::new(Rc::new(|_| {}), Rc::new(|_| {}), Rc::new(|_| {})),
+        )
+        .err()
+        .map(|e| e.to_string())
+    };
+    assert!(bad("Bad", common::ORIGIN).is_some());
+    assert!(bad("", common::ORIGIN).is_some());
+    for origin in [
+        "http://app.example",
+        "https://app.example/",
+        "https://app.example/path",
+        "https://u@app.example",
+        "https://b\u{fc}cher.example",
+    ] {
+        assert!(bad(common::APP_ID, origin).is_some(), "{origin}");
+    }
+    assert!(bad(common::APP_ID, "http://localhost:5173").is_none());
+    assert!(bad(common::APP_ID, common::ORIGIN).is_none());
 }

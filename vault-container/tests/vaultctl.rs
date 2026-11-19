@@ -11,6 +11,14 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const PASS: &str = "correct horse battery staple";
+/// `init` with the binding every test container uses.
+const INIT: &[&str] = &[
+    "init",
+    "--app",
+    "test-app",
+    "--origin",
+    "https://app.example",
+];
 
 struct Out {
     code: i32,
@@ -72,8 +80,14 @@ async fn cli_create_put_replicate_restore_roundtrip() {
             ("VAULTCTL_WEBDAV_PASSWORD", mock_webdav::PASSWORD),
         ];
 
-        let o = run(&d, &[], &["create"]);
+        let o = run(&d, &[], INIT);
         assert_eq!(o.code, 0, "{}", o.stderr);
+        assert!(
+            o.stdout
+                .contains("Bound to app test-app at origin https://app.example"),
+            "{}",
+            o.stdout
+        );
         let rk = recovery_key(&o.stdout);
         assert_eq!(rk.split('-').count(), 16);
 
@@ -167,6 +181,15 @@ async fn cli_create_put_replicate_restore_roundtrip() {
         assert_eq!((o.code, o.stdout.trim()), (0, "AAEC/w=="));
         let o = run(&r, &[], &["scan", "g"]);
         assert_eq!(o.stdout, "greeting\thello\n");
+        // The binding travels with the header: the restored vault keeps it.
+        let o = run(&r, &[], &["info"]);
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        assert!(
+            o.stdout
+                .contains("app: test-app\norigin: https://app.example\n"),
+            "{}",
+            o.stdout
+        );
 
         // The restored vault keeps replicating to the restored-from replica.
         let o = run(&r, &[], &["put", "more", "data"]);
@@ -179,10 +202,65 @@ async fn cli_create_put_replicate_restore_roundtrip() {
 }
 
 #[test]
+fn vaultctl_init_requires_app_and_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("v");
+    let origin = "https://app.example";
+    // Both flags are required (also through the `create` alias); nothing is created.
+    for args in [
+        vec!["init"],
+        vec!["init", "--app", "test-app"],
+        vec!["init", "--origin", origin],
+        vec!["create"],
+    ] {
+        let o = run(&d, &[], &args);
+        assert_ne!(o.code, 0, "{args:?}");
+        assert!(o.stderr.contains("required"), "{args:?}: {}", o.stderr);
+        assert!(!d.exists(), "{args:?}");
+    }
+    // Invalid values are refused before anything is written.
+    for (app, origin) in [
+        ("Test", "https://app.example"),
+        ("", "https://app.example"),
+        ("test-app", "http://app.example"),
+        ("test-app", "https://app.example/path"),
+        ("test-app", "https://user@app.example"),
+    ] {
+        let o = run(&d, &[], &["init", "--app", app, "--origin", origin]);
+        assert_eq!(o.code, 1, "{app} {origin}");
+        assert!(o.stderr.contains("invalid app binding"), "{}", o.stderr);
+        assert!(!d.exists(), "{app} {origin}");
+    }
+    // The origin is stored in canonical form; `info` prints the binding.
+    let o = run(
+        &d,
+        &[],
+        &[
+            "init",
+            "--app",
+            "test-app",
+            "--origin",
+            "HTTPS://App.Example:443",
+        ],
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let o = run(&d, &[], &["info"]);
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stdout,
+        "app: test-app\norigin: https://app.example\nseq: 0\n"
+    );
+    // Other commands are unchanged.
+    assert_eq!(run(&d, &[], &["put", "k", "v"]).code, 0);
+    let o = run(&d, &[], &["info"]);
+    assert!(o.stdout.ends_with("seq: 1\n"), "{}", o.stdout);
+}
+
+#[test]
 fn wrong_passphrase_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path().join("v");
-    assert_eq!(run(&d, &[], &["create"]).code, 0);
+    assert_eq!(run(&d, &[], INIT).code, 0);
     let o = ctl(
         "not it",
         &[],
@@ -221,7 +299,7 @@ fn restore_refuses_nonempty_dir() {
 fn create_refuses_nonempty_dir() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("x"), b"x").unwrap();
-    let o = run(tmp.path(), &[], &["create"]);
+    let o = run(tmp.path(), &[], INIT);
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("not empty"), "{}", o.stderr);
 }
@@ -234,7 +312,7 @@ async fn diverged_replica_exits_2_and_adopt_needs_confirmation() {
         let tmp = tempfile::tempdir().unwrap();
         let envs = [("VAULTCTL_WEBDAV_PASSWORD", mock_webdav::PASSWORD)];
         let add = |d: &Path| {
-            assert_eq!(run(d, &[], &["create"]).code, 0);
+            assert_eq!(run(d, &[], INIT).code, 0);
             let o = run(
                 d,
                 &envs,
@@ -292,7 +370,7 @@ async fn secrets_file_is_private_encrypted_and_corruption_is_reported() {
     tokio::task::spawn_blocking(move || {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("v");
-        let o = run(&d, &[], &["create"]);
+        let o = run(&d, &[], INIT);
         assert_eq!(o.code, 0);
         let rk = recovery_key(&o.stdout);
         let o = run(
@@ -349,7 +427,7 @@ async fn secrets_file_is_private_encrypted_and_corruption_is_reported() {
 fn webdav_url_with_credentials_and_empty_passphrase_are_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path().join("v");
-    assert_eq!(run(&d, &[], &["create"]).code, 0);
+    assert_eq!(run(&d, &[], INIT).code, 0);
     let o = run(
         &d,
         &[("VAULTCTL_WEBDAV_PASSWORD", "x")],
@@ -410,7 +488,9 @@ async fn restore_probes_source_conditional_writes() {
         extra_root_ca_pem: None,
     })
     .unwrap();
-    let (_c, rk) = Container::create(b).await.unwrap();
+    let (_c, rk) = Container::create(b, "test-app", "https://app.example")
+        .await
+        .unwrap();
     let rk = rk.to_display().to_string();
     let url = dav.base_url();
     tokio::task::spawn_blocking(move || {

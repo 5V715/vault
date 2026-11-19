@@ -119,7 +119,9 @@ impl<B: ContainerBackend> ContainerBackend for Flaky<B> {
 /// A primary container with a few committed records.
 async fn primary() -> (MemoryBackend, Container<MemoryBackend>, RecoveryKey) {
     let b = MemoryBackend::new();
-    let (mut c, rk) = Container::create(b.clone()).await.unwrap();
+    let (mut c, rk) = Container::create(b.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     c.put(b"alpha", b"1").unwrap();
     c.put(b"beta", b"2").unwrap();
     c.commit().await.unwrap();
@@ -403,7 +405,9 @@ async fn diverged_replica_not_overwritten() {
     c.commit().await.unwrap(); // primary seq 2, different hash
 
     let foreign = MemoryBackend::new();
-    let (_other, _) = Container::create(foreign.clone()).await.unwrap();
+    let (_other, _) = Container::create(foreign.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
 
     let snaps = [
         snapshot(&ahead).await,
@@ -901,7 +905,9 @@ async fn adopt_diverged_overwrites_after_confirmation() {
     f.put(b"fork", b"x").unwrap();
     f.commit().await.unwrap();
     let foreign = MemoryBackend::new();
-    Container::create(foreign.clone()).await.unwrap();
+    Container::create(foreign.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let mut state = ReplicaState::default();
     state.replicas.insert(id("gone"), Default::default());
     let mut set = ReplicaSet::new(
@@ -1235,7 +1241,9 @@ async fn restore_with_max_seq_mark_does_not_overflow() {
 async fn primary_header_must_match_manifest() {
     let (pb, c, _) = primary().await;
     let foreign = MemoryBackend::new();
-    Container::create(foreign.clone()).await.unwrap();
+    Container::create(foreign.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let fh = foreign.get("header").await.unwrap().unwrap().0;
     overwrite(&pb, "header", &fh).await;
     let rep = MemoryBackend::new();
@@ -1258,7 +1266,9 @@ async fn primary_header_must_match_manifest() {
 async fn diverged_replica_without_header_gets_no_header() {
     let (pb, c, _) = primary().await;
     let foreign = MemoryBackend::new();
-    Container::create(foreign.clone()).await.unwrap();
+    Container::create(foreign.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     let rep = MemoryBackend::new();
     let fm = foreign.get("manifest").await.unwrap().unwrap().0;
     rep.put_if_absent("manifest", &fm).await.unwrap();
@@ -1294,7 +1304,9 @@ async fn restore_resumes_after_header_written_without_manifest() {
 
     // Header of another container, no manifest: not ours to wipe.
     let foreign = MemoryBackend::new();
-    Container::create(foreign.clone()).await.unwrap();
+    Container::create(foreign.clone(), "test-app", "https://app.example")
+        .await
+        .unwrap();
     foreign.delete("manifest").await.unwrap();
     let before = snapshot(&foreign).await;
     assert!(matches!(
@@ -1337,4 +1349,81 @@ async fn replica_set_keeps_state_of_absent_replicas() {
     assert!(!set.state().replicas.contains_key(&id("gone")));
     assert!(!set.forget_replica(&id("gone")));
     assert!(set.state().replicas.contains_key(&id("r")));
+}
+
+/// The binding lives in the header, which replication copies verbatim: a replica,
+/// and a vault restored from it, keep the primary's app id and origin. A replica
+/// header whose binding was changed (same wrapped CRK) is not ours: replication
+/// reports it diverged and restore treats it as broken.
+#[tokio::test]
+async fn restored_replica_keeps_binding() {
+    let pb = MemoryBackend::new();
+    let (mut c, rk) = Container::create(
+        pb.clone(),
+        "org.example.notes",
+        "https://notes.example:8443",
+    )
+    .await
+    .unwrap();
+    c.put(b"alpha", b"1").unwrap();
+    c.commit().await.unwrap();
+    let rep = MemoryBackend::new();
+    let mut set = ReplicaSet::new(
+        Arc::new(pb.clone()),
+        vec![(id("r"), Arc::new(rep.clone()))],
+        ReplicaState::default(),
+    );
+    assert_synced(&set.replicate_once(&mkey(&c), ok).await, "r", 1);
+    let (replica, _) = Container::open_with_recovery(rep.clone(), &rk, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        replica.binding(),
+        ("org.example.notes", "https://notes.example:8443")
+    );
+
+    let target = MemoryBackend::new();
+    let replicas: Vec<(ReplicaId, Dyn)> = vec![(id("r"), Arc::new(rep.clone()))];
+    let report = restore(&replicas, &rk, &tid(), &target, None)
+        .await
+        .unwrap();
+    assert_eq!(report.seq, 1);
+    let (restored, _) = Container::open_with_recovery(target, &rk, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.binding(),
+        ("org.example.notes", "https://notes.example:8443")
+    );
+    assert_eq!(restored.get(b"alpha").as_deref(), Some(&b"1"[..]));
+
+    // Rebind the replica's header (same wrapped CRK, another app).
+    let (h, _) = rep.get("header").await.unwrap().unwrap();
+    let at = h
+        .windows(18)
+        .position(|w| w == b"\x11org.example.notes")
+        .unwrap();
+    let mut other = h[..at].to_vec();
+    for s in ["org.example.evil", "https://notes.example:8443"] {
+        other.push(s.len() as u8);
+        other.extend_from_slice(s.as_bytes());
+    }
+    overwrite(&rep, "header", &other).await;
+    let st = set.replicate_once(&mkey(&c), ok).await;
+    assert!(
+        matches!(outcome(&st, "r"), ReplicaOutcome::Diverged { .. }),
+        "{st:?}"
+    );
+    assert_eq!(rep.get("header").await.unwrap().unwrap().0, other);
+    assert!(
+        Container::open_with_recovery(rep.clone(), &rk, None)
+            .await
+            .is_err()
+    );
+    let t2 = MemoryBackend::new();
+    let replicas: Vec<(ReplicaId, Dyn)> = vec![(id("r"), Arc::new(rep))];
+    match restore(&replicas, &rk, &tid(), &t2, None).await {
+        Err(_) => {}
+        Ok(r) => panic!("restored from a rebound header: {:?}", r.seq),
+    }
 }
