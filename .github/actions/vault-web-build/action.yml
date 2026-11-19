@@ -1,0 +1,33 @@
+name: vault-web build
+description: >-
+  The pinned Rust toolchain with wasm32, wasm-bindgen-cli at the Cargo.lock version,
+  the e2e binaries (vault-relay, vault-dev, vaultctl in target/debug), and
+  vault-web/js built (npm ci, dist, pkg/node and pkg/web). Run after checkout and
+  setup-node; shared by the vault-web and todo-example jobs.
+runs:
+  using: composite
+  steps:
+    - name: toolchain (exact version from rust-toolchain.toml)
+      shell: bash
+      run: scripts/setup-rust.sh wasm32-unknown-unknown
+    - name: wasm-bindgen-cli (the version in Cargo.lock)
+      shell: bash
+      run: |
+        set -euo pipefail
+        v="$(awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
+        [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "wasm-bindgen version not found in Cargo.lock: '$v'" >&2; exit 1; }
+        cargo install --locked wasm-bindgen-cli --version "$v"
+        wasm-bindgen --version
+        node --version
+    - name: build the binaries for the e2e suites
+      shell: bash
+      run: cargo build --locked --bin vault-relay --bin vault-dev --bin vaultctl
+    - name: build vault-web (dist, and the wasm package for --target nodejs and web)
+      shell: bash
+      working-directory: vault-web/js
+      run: |
+        set -euxo pipefail
+        npm ci
+        npm run build
+        npm run build:wasm
+        ls -l dist pkg/node pkg/web

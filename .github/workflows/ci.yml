@@ -151,27 +151,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
-      - name: toolchain (exact version from rust-toolchain.toml)
-        run: scripts/setup-rust.sh wasm32-unknown-unknown
-      - name: wasm-bindgen-cli (the version in Cargo.lock)
-        shell: bash
-        run: |
-          set -euo pipefail
-          v="$(awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
-          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "wasm-bindgen version not found in Cargo.lock: '$v'" >&2; exit 1; }
-          cargo install --locked wasm-bindgen-cli --version "$v"
-          wasm-bindgen --version
-          node --version
-      - name: build the binaries for the e2e suite
-        run: cargo build --locked --bin vault-relay --bin vault-dev --bin vaultctl
-      - name: build the wasm package (--target nodejs and web)
-        working-directory: vault-web/js
-        shell: bash
-        run: |
-          set -euxo pipefail
-          npm ci
-          npm run build:wasm
-          ls -l pkg/node pkg/web
+      - uses: ./.github/actions/vault-web-build
       - name: unit and e2e tests
         working-directory: vault-web/js
         env:
@@ -182,6 +162,40 @@ jobs:
       - name: web build and esbuild consumer bundle
         working-directory: vault-web/js
         run: npm run test:web && npm run test:bundle
+
+  # The example app (examples/todo) on the real vault-web wasm: unit tests, the
+  # release/dev build check, and the e2e suite against the real binaries. Also
+  # checks that no innerHTML is used in vault-web's or the example's sources.
+  todo-example:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: no innerHTML in vault-web/js or examples/todo/src
+        shell: bash
+        run: |
+          set -uo pipefail
+          if git grep -n 'innerHTML' -- vault-web/js examples/todo/src; then
+            echo "innerHTML found (use textContent/createElement)" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - uses: ./.github/actions/vault-web-build
+      - name: npm ci, typecheck, unit tests
+        working-directory: examples/todo
+        run: npm ci && npm run typecheck && npm run test:unit
+      - name: build check (release and --dev)
+        working-directory: examples/todo
+        run: npm run test:build
+      - name: e2e
+        working-directory: examples/todo
+        env:
+          VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: npm run test:e2e
 
   # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
   # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN
