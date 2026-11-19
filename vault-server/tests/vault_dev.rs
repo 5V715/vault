@@ -467,6 +467,8 @@ async fn many_commits_are_compacted_at_exit_and_high_water_saved() {
     );
 }
 
+// Sends SIGINT with `kill`; a console Ctrl-C cannot be delivered to one child on Windows.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn ctrl_c_saves_high_water() {
     let relay = relay().await;
@@ -554,4 +556,36 @@ async fn vault_dev_pre_v1_dir_reports_unsupported_format() {
         assert!(!err.contains("Connecting"), "relay not dialled: {err}");
     }
     assert!(!d.join(".vault-dev-identity").exists());
+}
+
+fn serve_help() -> String {
+    let o = Command::new(BIN)
+        .args(["serve", "--help"])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    String::from_utf8(o.stdout).unwrap()
+}
+
+/// `--passphrase-fd` reads `/dev/fd/N`, which only exists on Unix; the flag must not be
+/// offered (or accepted) on Windows. `--passphrase-file` stays available everywhere.
+#[cfg(windows)]
+#[test]
+fn passphrase_fd_flag_absent_on_windows() {
+    let help = serve_help();
+    assert!(!help.contains("passphrase-fd"), "{help}");
+    assert!(help.contains("--passphrase-file"), "{help}");
+    let o = Command::new(BIN)
+        .args(["serve", "--dir", "x", "--pair", "x", "--passphrase-fd", "3"])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn passphrase_fd_flag_present_on_unix() {
+    let help = serve_help();
+    assert!(help.contains("--passphrase-fd"), "{help}");
+    assert!(help.contains("--passphrase-file"), "{help}");
 }

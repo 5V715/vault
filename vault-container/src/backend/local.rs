@@ -33,8 +33,17 @@ fn etag_of(data: &[u8]) -> Etag {
     Etag(data_encoding::HEXLOWER.encode(&Sha256::digest(data)))
 }
 
+/// Directory fsync; a no-op on Windows (a directory cannot be opened there).
 fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Removes leftover temp files from interrupted writes in `dir`.

@@ -136,8 +136,26 @@ pub fn unseal(magic: &[u8], blob: &[u8], pass: &str) -> Result<Zeroizing<Vec<u8>
         .map_err(|_| Error::BadSecrets)
 }
 
-/// Seal `plain` and write it atomically (temp file, fsync, rename) to `dir/name`
-/// with mode 0600.
+/// Makes a rename or create inside `dir` durable. Windows cannot open a directory as a
+/// file, so there this is a no-op: NTFS journals the rename's metadata itself.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Seal `plain` and write it atomically (temp file, fsync, rename) to `dir/name`.
+///
+/// On Unix the file is created with mode 0600. On Windows there is no mode: the file
+/// is created with the ACL it inherits from `dir`, so it is as private as that
+/// directory (a vault directory under the user profile is readable only by that
+/// user, SYSTEM and administrators by default). It is encrypted either way.
 pub fn save_sealed(dir: &Path, name: &str, magic: &[u8], plain: &[u8], pass: &str) -> Result<()> {
     let blob = seal(magic, plain, pass)?;
     let tmp = dir.join(format!("{name}.tmp"));
@@ -157,7 +175,7 @@ pub fn save_sealed(dir: &Path, name: &str, magic: &[u8], plain: &[u8], pass: &st
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, dir.join(name))?;
-        std::fs::File::open(dir)?.sync_all()
+        sync_dir(dir)
     };
     write().map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

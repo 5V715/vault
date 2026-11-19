@@ -13,8 +13,8 @@
 //! session; run the command again for the next.
 //!
 //! The passphrase (the one given to `vaultctl init`) is prompted for without echo.
-//! For automation, `--passphrase-file PATH` or `--passphrase-fd N` read it instead;
-//! it is never accepted on the command line or in the environment. The vault's
+//! For automation, `--passphrase-file PATH` (or, on Unix only, `--passphrase-fd N`)
+//! read it instead; it is never accepted on the command line or in the environment. The vault's
 //! long-term Noise key is kept in `D/.vault-dev-identity`, sealed under the same
 //! passphrase. Development only; see `docs/vault/README.md`.
 //!
@@ -69,9 +69,12 @@ struct ServeArgs {
     #[arg(long)]
     pair: String,
     /// Read the passphrase from this file (one line) instead of prompting.
-    #[arg(long, conflicts_with = "passphrase_fd")]
+    #[cfg_attr(unix, arg(long, conflicts_with = "passphrase_fd"))]
+    #[cfg_attr(not(unix), arg(long))]
     passphrase_file: Option<PathBuf>,
-    /// Read the passphrase from this open file descriptor instead of prompting.
+    /// Read the passphrase from this open file descriptor instead of prompting
+    /// (Unix only: it re-opens `/dev/fd/N`).
+    #[cfg(unix)]
     #[arg(long, value_name = "FD")]
     passphrase_fd: Option<u32>,
 }
@@ -85,9 +88,8 @@ fn err<T>(msg: impl Display) -> R<T> {
 fn read_passphrase(a: &ServeArgs) -> R<Zeroizing<String>> {
     let raw = if let Some(p) = &a.passphrase_file {
         read_secret_file(p)?
-    } else if let Some(fd) = a.passphrase_fd {
-        // `/dev/fd/N` re-opens the inherited descriptor without unsafe code.
-        read_secret_file(Path::new(&format!("/dev/fd/{fd}")))?
+    } else if let Some(raw) = read_passphrase_fd(a) {
+        raw?
     } else {
         Zeroizing::new(
             rpassword::prompt_password("Passphrase: ").map_err(|e| format!("prompt: {e}"))?,
@@ -99,6 +101,19 @@ fn read_passphrase(a: &ServeArgs) -> R<Zeroizing<String>> {
         return err("empty passphrase");
     }
     Ok(Zeroizing::new(line.to_owned()))
+}
+
+/// `--passphrase-fd N`: `/dev/fd/N` re-opens the inherited descriptor without unsafe code.
+#[cfg(unix)]
+fn read_passphrase_fd(a: &ServeArgs) -> Option<R<Zeroizing<String>>> {
+    a.passphrase_fd
+        .map(|fd| read_secret_file(Path::new(&format!("/dev/fd/{fd}"))))
+}
+
+/// The flag does not exist on Windows.
+#[cfg(not(unix))]
+fn read_passphrase_fd(_: &ServeArgs) -> Option<R<Zeroizing<String>>> {
+    None
 }
 
 fn read_secret_file(p: &Path) -> R<Zeroizing<String>> {

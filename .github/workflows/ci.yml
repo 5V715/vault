@@ -26,6 +26,26 @@ jobs:
           cargo clippy -p vault-client --all-targets --features wasm,native --locked -- -D warnings
           cargo test --workspace --locked
 
+  # The three shipped binaries (vaultctl, vault-dev, vault-relay) on the other
+  # desktop platforms. Linux is covered by the `rust` job above.
+  desktop:
+    name: build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build and test the binaries' crates
+        shell: bash
+        run: |
+          set -eo pipefail
+          set -x
+          cargo build --locked -p vault-container -p vault-server -p vault-mailbox
+          cargo test --locked -p vault-container -p vault-server -p vault-mailbox
+
   wasm:
     runs-on: ubuntu-latest
     steps:

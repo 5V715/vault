@@ -787,7 +787,7 @@ async fn cmd_restore(dir: &Path, recovery_key: Option<String>, from: Kind) -> R<
         });
     }
     // Make the rename itself durable (DIR now holds the restored vault either way).
-    if let Err(e) = std::fs::File::open(parent).and_then(|f| f.sync_all()) {
+    if let Err(e) = vault_container::secrets::sync_dir(parent) {
         return fail(format!(
             "restored into {}, but syncing its parent directory failed: {e}",
             dir.display()

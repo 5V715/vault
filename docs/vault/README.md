@@ -189,8 +189,8 @@ web app page you pair from (for a local development server, for example
 
 Options and behaviour:
 
-- `--passphrase-file PATH` or `--passphrase-fd N` read the passphrase for scripts and
-  tests (first line, no echo needed). It is never accepted on the command line or in an
+- `--passphrase-file PATH` or (Unix only; it is not offered on Windows) `--passphrase-fd N`
+  read the passphrase for scripts and tests (first line, no echo needed). It is never accepted on the command line or in an
   environment variable. Without either, it is prompted for.
 - Errors (wrong passphrase, malformed pairing text, unreachable relay, not a
   `vaultctl` directory) print one `vault-dev: ...` line and exit 1.
@@ -201,8 +201,9 @@ Options and behaviour:
   produced or parsed. To test against a relay with a private CA, that CA support exists in
   `ServerConfig::extra_ca_pem` but is not yet exposed on this command line.
 - The vault's long-term Noise key is created on first use in `D/.vault-dev-identity`,
-  sealed under the same passphrase (Argon2id, AES-256-GCM, mode 0600). The
-  high-water mark is saved back into `D/.vaultctl` when a session ends.
+  sealed under the same passphrase (Argon2id, AES-256-GCM, mode 0600 on Unix; on Windows
+  the file keeps the ACL inherited from its directory, so keep the vault directory under
+  your user profile). The high-water mark is saved back into `D/.vaultctl` when a session ends.
 - Growth and compaction: every commit adds at least one segment file of 64 KiB or
   more under `D/seg/` (the browser commits once per received batch and up to three
   times per sent message), and every session start decrypts all of them. The vault

@@ -1,0 +1,144 @@
+name: release
+
+# A tag `vX.Y.Z` builds vaultctl, vault-dev and vault-relay for every target and
+# creates a DRAFT release holding the archives and SHA256SUMS. A draft is never
+# installable: the owner reviews SHA256SUMS, signs it offline (scripts/sign-release.sh)
+# and only then publishes. This workflow never signs and never publishes.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  # Strip symbols from the release binaries (cheap size win, no effect on behaviour).
+  CARGO_PROFILE_RELEASE_STRIP: 'true'
+  # Same pins as Dockerfile.relay.
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+  ZIGLANG_VERSION: 0.16.0
+
+jobs:
+  # Refuses to build until the owner has committed a real release key.
+  check-key:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag looks like a version
+        id: version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH[-suffix]"; exit 1; }
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: release key is not the placeholder
+        run: scripts/check-key.sh
+
+  build:
+    needs: check-key
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          # macos-13 (the Intel runner the design named) is retired; macos-15-intel is its successor.
+          - { target: x86_64-apple-darwin, os: macos-15-intel, zig: false }
+          - { target: aarch64-apple-darwin, os: macos-14, zig: false }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, zig: false }
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.target }}"
+          rustc --version
+          cargo --version
+      - name: cargo-zigbuild (pinned, as in Dockerfile.relay)
+        if: matrix.zig
+        shell: bash
+        run: python3 -m pip install --user "cargo-zigbuild==${CARGO_ZIGBUILD_VERSION}" "ziglang==${ZIGLANG_VERSION}"
+      - name: build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_ZIG: ${{ matrix.zig }}
+        run: |
+          set -euxo pipefail
+          sub=build
+          if [ "$USE_ZIG" = true ]; then sub=zigbuild; fi
+          cargo "$sub" --locked --release --target "$TARGET" \
+            -p vault-container -p vault-server -p vault-mailbox \
+            --features vault-container/cli,vault-server/dev,vault-mailbox/bin \
+            --bin vaultctl --bin vault-dev --bin vault-relay
+      - name: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check-key.outputs.version }}
+        run: |
+          set -euxo pipefail
+          # Archive timestamps come from the tagged commit, so reruns agree.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          python3 -I scripts/package.py --version "$VERSION" --target "$TARGET" \
+            --bin-dir "target/$TARGET/release" --out dist
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-draft:
+    needs: [check-key, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        shell: bash
+        env:
+          VERSION: ${{ needs.check-key.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          expected=(
+            "vault-${VERSION}-aarch64-apple-darwin.tar.gz"
+            "vault-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+            "vault-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "vault-${VERSION}-x86_64-pc-windows-msvc.zip"
+            "vault-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          )
+          # Exactly the five archives, nothing else.
+          [ "$(LC_ALL=C ls | tr '\n' ' ')" = "${expected[*]} " ] || { echo "::error::unexpected files:"; ls -l; exit 1; }
+          LC_ALL=C sha256sum "${expected[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - name: create the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Fails if a release for this tag already exists. Always a draft: the owner
+          # reviews SHA256SUMS, signs it offline and publishes with scripts/sign-release.sh.
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+            --notes "Draft. Not installable until SHA256SUMS is signed and the release is published (scripts/sign-release.sh)." \
+            dist/*
