@@ -62,13 +62,17 @@ and no clipboard access; you pair it by scanning the QR with your vault.
     loopback only. It is compiled in.
   - The wasm is bundled into `main.js` as bytes, so the page never fetches it.
 - `node serve.mjs [--port 8080] [--dir dist]` serves `dist` on 127.0.0.1 with:
-  - `Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src <relay origin>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+  - `Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src <relay WebSocket origin>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
+  - `connect-src` is the relay's WebSocket origin: `http://127.0.0.1:8787` becomes
+    `ws://127.0.0.1:8787`, and `https://relay.example` becomes `wss://relay.example`.
+    Browsers check the `ws:`/`wss:` URL itself, so listing the `http(s)` origin
+    would block the dial (Chrome does).
   - `X-Content-Type-Options: nosniff`
   - It serves regular files of known types only. There are no directory
     listings, no dot-files, no symlinks, and no paths outside `dist`.
   - Any other host should send the same CSP header. `index.html` also carries it
-    as a `<meta>` (filled in by build.mjs), but a meta policy cannot enforce
-    `frame-ancestors`.
+    as a `<meta>` (filled in by build.mjs) without `frame-ancestors`, because a
+    meta policy cannot carry that directive.
 
 All DOM writes use `createElement` and `textContent`, never `innerHTML`.
 `test/sinks.test.mjs` and a CI grep enforce this.
@@ -96,4 +100,10 @@ See `docs/integration.md`, "Traffic and commit batching".
   real `vault-relay`, `vault-dev` and `vaultctl`. It covers persistence across
   sessions, edits dropped on close, wrong app, and cancel. It needs vault-web
   built, and uses `VAULT_BIN_DIR` or builds the binaries with cargo.
+- `npm run test:browser` is a smoke test in headless Chrome. It serves the
+  built page with `serve.mjs`, starts the real relay, clicks "Connect to vault",
+  and fails on any CSP violation or console error. It also fails unless the relay
+  saw the page's WebSocket upgrade on `/mailbox`. It needs Chrome (`CHROME_BIN`,
+  or `google-chrome`/`chrome`/`chromium` on PATH), vault-web built, and the relay
+  binary.
 - `npm test` runs all of them. CI runs them in the `todo-example` job.

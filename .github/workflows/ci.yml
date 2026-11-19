@@ -202,6 +202,15 @@ jobs:
         env:
           VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
         run: npm run test:e2e
+      # The page in a real browser (Chrome preinstalled on ubuntu-latest): CSP and the
+      # relay WebSocket upgrade from the page's origin.
+      - name: browser smoke (headless Chrome)
+        working-directory: examples/todo
+        env:
+          VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          command -v google-chrome || command -v chrome || command -v chromium
+          npm run test:browser
 
   # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
   # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN
