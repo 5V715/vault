@@ -59,8 +59,8 @@ signal-web becomes one consumer among others.
   commit records the signal-web commit it was copied from.
 - Product name: "vault".
 - Private repository. signal-web CI and its OCI image build fetch the vault through
-  a read-only deploy key or a fine-grained token stored as a repository secret, with
-  `CARGO_NET_GIT_FETCH_WITH_CLI=true`. The owner creates the key or token; the
+  a read-only deploy key (secret `VAULT_DEPLOY_KEY`), with
+  `CARGO_NET_GIT_FETCH_WITH_CLI=true`. The owner creates the key; the
   workflows read it from a secret and never log it.
 - Toolchain and policy as in signal-web: Rust edition 2024, rust-version 1.93,
   `cargo fmt`, `clippy -D warnings`, wasm32 build in CI for the client crates.
@@ -174,7 +174,7 @@ UI, signer and image.
   mistakes. Protection against a malicious page still rests on the user checking the
   origin and the SAS on the phone. The protocol doc's threat notes say so explicitly.
 - **Private repo in the image build (my call):** CI runs `cargo vendor` on the
-  runner, using the deploy key or token secret, before `docker build`. The
+  runner, using the deploy key, before `docker build`. The
   Dockerfile builds offline from the vendored sources, so no secret enters the build
   context or any image layer. Local developer builds use the developer's own git
   credentials.

@@ -21,7 +21,7 @@ Repos: `VAULT` = `/home/claude/vault` (branch `main`), `SW` = `/home/claude/sign
 - Phase 3 labels (exact): QR prefix `vault-pair:v1:`; recovery prefix `vault-recovery:v1:`; HKDF infos `vault/v1/enc`, `vault/v1/mac`, `vault/v1/manifest`, `vault/v1/manifest-auth`, `vault/v1/manifest-auth-tag`, `vault/v1/replica-id`, `vault/v1/recovery`, `vault/v1/recovery-check`, `vault/v1/crk-wrap`; Noise prologue label `vault/v1`; SAS info `vault/v1/sas`.
 - Versions start at 1: protocol version byte in `PairOffer`, container format version in the header. Unknown version → reject. Container without a version (pre-split) → error text `unsupported container format (created before vault v1)`.
 - App binding: `app_id` matches `^[a-z0-9][a-z0-9.-]{0,63}$`; `origin` is `https://host[:port]` or `http://` only for `127.0.0.1`, `[::1]`, `localhost`; no path, query or fragment; lower-case host. Mismatch → `Notice::WrongApp` before any approval prompt.
-- CI secret in signal-web: `VAULT_GIT_TOKEN` (read-only, fine-grained, owner-created). It is only ever used in a `cargo vendor` step on the runner; never passed to `docker build`, never echoed.
+- CI secret in signal-web: `VAULT_DEPLOY_KEY` — private half of an ed25519 read-only deploy key on `5V715/vault` (owner-created). Loaded into an ssh-agent on the runner only for cargo fetch/vendor steps; never written into the repo, never passed to `docker build`, never echoed.
 - Never force-push, never amend pushed commits, never commit `*.key` or secrets. Commit trailers:
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_019sALvTRSTdS4PZJbSXGRqj`.
 - Gates per repo: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `cargo test --workspace`, `cargo build --target wasm32-unknown-unknown` for `vault-proto` and `vault-client` (CI only where the target is unavailable locally). In SW additionally `npm run --prefix ui build` and `node --test 'ui/test/*.test.mjs'`.
@@ -32,7 +32,7 @@ Repos: `VAULT` = `/home/claude/vault` (branch `main`), `SW` = `/home/claude/sign
 - **A user opens an old container after Task 5/6.** They get the clear pre-v1 error, not a decrypt or MAC failure. Test: `pre_v1_container_is_rejected_with_clear_error` (Task 6).
 - **The wrong app or origin reaches a vault.** It is refused before the approver is asked, and the browser sees `WrongApp`, not a hang. Tests: `wrong_app_refused_before_approval`, `wrong_origin_refused_before_approval` (Task 6), `wrong_app_maps_to_closed_reason` (Task 8).
 - **Cancel after "Codes match" but before Approved.** The session must close as denied, never go Active. Test: `cancel_after_confirm_before_approval_wins` (Task 7).
-- **The private dependency leaks into the image.** No token in the image layers or build logs. Test: Task 4's workflow step greps `docker history --no-trunc` and the vendored tree for the token value and fails if found (`image_has_no_vault_token` CI step).
+- **The private dependency leaks into the image.** No deploy key in the image layers or build logs. Test: Task 4's workflow step greps `docker history --no-trunc`, the image filesystem and the vendored tree for key material and fails if found (`image_has_no_vault_key` CI step).
 
 ---
 
@@ -113,11 +113,11 @@ Repos: `VAULT` = `/home/claude/vault` (branch `main`), `SW` = `/home/claude/sign
 - [ ] **Step 2:** Delete the copies and wire the adapter and `VaultSession`. Run `cargo test --workspace`. Expected: all remaining SW tests pass, including the Signal-dependent vault tests listed in Review Focus, now built on the VAULT crates.
 - [ ] **Step 3:** Check `git diff --stat ui/src/core/signal_web_core.d.ts` is empty and that the UI build and tests pass.
 - [ ] **Step 4:** CI and image build:
-  - Before any cargo step, add `git config --global url."https://x-access-token:${VAULT_GIT_TOKEN}@github.com/5V715/vault".insteadOf "https://github.com/5V715/vault"` in a step whose env has the secret, plus `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
+  - Before any cargo step: start `ssh-agent`, `ssh-add` the key from `VAULT_DEPLOY_KEY` (stdin, no file left behind), pin GitHub's published SSH host keys in `~/.ssh/known_hosts` (no `StrictHostKeyChecking=no`), `git config --global url."ssh://git@github.com/5V715/vault".insteadOf "https://github.com/5V715/vault"`, and `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
   - Image job: `cargo vendor --locked vendor/ > .cargo/config.vendor.toml` on the runner. The Dockerfile copies `vendor/` and builds with `--offline --config .cargo/config.vendor.toml`.
-  - Step `image_has_no_vault_token`: `docker history --no-trunc` plus `grep -r` over `vendor/` for the token must find nothing. Remove the `insteadOf` config before `docker build`.
-- [ ] **Step 5:** Update `docs/RELEASE.md` (owner: create the fine-grained read-only token for `5V715/vault`, store it as `VAULT_GIT_TOKEN`; how to bump the rev). Commit in steps (`deps:`, `core:`, `relay:`, `ci:`).
-- [ ] **Step 6:** Push `vault-design`. Expected: CI green incl. wasm and image-smoke (needs the owner's secret; if absent, report BLOCKED with that reason).
+  - Step `image_has_no_vault_key`: `docker history --no-trunc`, the image filesystem and `vendor/` must contain no `BEGIN OPENSSH PRIVATE KEY` and no line of the key. Kill the agent and remove the `insteadOf` config before `docker build`.
+- [ ] **Step 5:** Update `docs/RELEASE.md` (owner: create the read-only deploy key on `5V715/vault`, store the private half as `VAULT_DEPLOY_KEY` in signal-web; rotating it; how to bump the rev). Commit in steps (`deps:`, `core:`, `relay:`, `ci:`).
+- [ ] **Step 6:** Push `vault-design`. Expected: CI green incl. wasm and image-smoke (needs the owner's `VAULT_DEPLOY_KEY`; if absent, report BLOCKED with that reason).
 
 ## Phase 3 — generalize (VAULT, then one SW bump)
 
