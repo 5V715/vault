@@ -31,6 +31,9 @@ cargo build -p vault-container --release --bin vaultctl
 # binary: target/release/vaultctl
 ```
 
+Prebuilt `vaultctl`, `vault-dev` and `vault-relay` for Linux, macOS and Windows come
+from signed releases; `docs/install.md` has the verifying install scripts.
+
 ## Quick start
 
 Every command takes `--dir D`, the local container directory (must be empty or new for

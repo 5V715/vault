@@ -21,7 +21,9 @@ Crates:
   WebSocket, `native` for a tokio-tungstenite client. Compiles for `wasm32-unknown-unknown`.
 
 Docs: `docs/integration.md` (how an app pairs with a vault and what its UI must do),
-`docs/protocol/vault.md` (wire protocol), `docs/vault/README.md` (container and CLI), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from).
+`docs/protocol/vault.md` (wire protocol), `docs/vault/README.md` (container and CLI), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from),
+`docs/install.md` (prebuilt binaries: signed releases, verifying install scripts, the
+owner's signing procedure).
 
 ```sh
 cargo test --workspace
