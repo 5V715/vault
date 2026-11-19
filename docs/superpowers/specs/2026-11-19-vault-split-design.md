@@ -197,8 +197,12 @@ thresholds (carried over unless a reason appears), the CI matrix details, and ho
 `vault-client` exposes its callbacks (keep the current `PairCallbacks` shape unless
 a cleaner Rust API falls out of the extraction).
 
-## Open for the owner
+## Owner decisions
 
-- The unlink semantics question from V2a still stands, now scoped to one app's
-  vault: should a Signal unlink erase that vault (current behaviour), or keep the
-  history?
+- 2026-11-19: approach A; MIT; fresh history; name "vault"; one vault per app and
+  origin for now.
+- 2026-11-19: **unlink erases the app's vault** (current behaviour kept). A removed
+  linked device cannot be recovered; relinking creates a new device, and Signal's
+  link-time history transfer from the phone restores history. Receiving that
+  transfer in signal-web belongs to its history milestone. Older replica snapshots
+  keep old data until they expire; this is documented, not fixed.
