@@ -1,0 +1,29 @@
+[package]
+name = "vault-web"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Browser package over vault-client: wasm-bindgen exports (pair, Session) and a QR matrix of the pairing text"
+publish = false
+
+[lib]
+# cdylib: the wasm module for wasm-bindgen; rlib: host unit tests of the pure parts.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The browser WebSocket transport and setTimeout clock. The bindings also compile on
+# the host (they panic if called there), so clippy and the unit tests run natively.
+vault-client = { path = "../vault-client", features = ["wasm"] }
+vault-proto = { path = "../vault-proto" }
+# Equal to the wasm-bindgen-cli version used to build the package (CI checks it).
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3.107"
+# Exact version: the QR test vector in tests/qr-vector.txt depends on its encoder.
+qrcode = { version = "=0.14.1", default-features = false }
+zeroize = "1"
+
+[dev-dependencies]
+# Independent decoder for the QR round-trip test.
+rqrr = { version = "0.11", default-features = false }
