@@ -1,0 +1,513 @@
+// SPDX-License-Identifier: MIT
+
+//! Key hierarchy: container root key, HKDF subkeys, recovery key and CRK wrapping.
+//!
+//! All secret material lives in [`Zeroizing`] buffers and no type here prints
+//! key bytes through `Debug`.
+
+use crate::{Error, Result};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use data_encoding::BASE32_NOPAD;
+use hkdf::Hkdf;
+use rand::{CryptoRng, TryRngCore, rngs::OsRng};
+use sha2::{Digest, Sha256};
+use std::fmt;
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
+
+const INFO_ENC: &[u8] = b"signal-web/vault/v1/enc";
+const INFO_MAC: &[u8] = b"signal-web/vault/v1/mac";
+const INFO_MANIFEST: &[u8] = b"signal-web/vault/v1/manifest";
+const INFO_MANIFEST_AUTH: &[u8] = b"signal-web/vault/v1/manifest-auth";
+const INFO_REPLICA_ID: &[u8] = b"signal-web/vault/v1/replica-id";
+const INFO_RECOVERY: &[u8] = b"signal-web/vault/v1/recovery";
+const RECOVERY_CHECK_DOMAIN: &[u8] = b"signal-web/vault/v1/recovery-check";
+const CRK_WRAP_AAD: &[u8] = b"signal-web/vault/v1/crk-wrap";
+
+/// AAD = label || version byte.
+fn wrap_aad() -> Vec<u8> {
+    let mut aad = CRK_WRAP_AAD.to_vec();
+    aad.push(WRAP_VERSION);
+    aad
+}
+const QR_PREFIX: &str = "signal-web-recovery:v1:";
+const WRAP_VERSION: u8 = 1;
+const NONCE_LEN: usize = 12;
+const KEY_LEN: usize = 32;
+const CHECK_LEN: usize = 8;
+
+fn hkdf_expand(ikm: &[u8], info: &[u8]) -> Zeroizing<[u8; KEY_LEN]> {
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    Hkdf::<Sha256>::new(None, ikm)
+        .expand(info, &mut *out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
+fn random_key(rng: &mut impl CryptoRng) -> Zeroizing<[u8; KEY_LEN]> {
+    let mut k = Zeroizing::new([0u8; KEY_LEN]);
+    rng.fill_bytes(&mut *k);
+    k
+}
+
+fn os_rng() -> impl CryptoRng {
+    OsRng.unwrap_err()
+}
+
+/// Container root key: 32 random bytes from which all subkeys are derived.
+pub struct Crk(Zeroizing<[u8; KEY_LEN]>);
+
+/// Keys derived from the [`Crk`].
+pub struct Subkeys {
+    pub enc: Zeroizing<[u8; KEY_LEN]>,
+    pub mac: Zeroizing<[u8; KEY_LEN]>,
+    /// Seals manifests (AEAD). The vault may keep it without user authentication so
+    /// replication runs in the background: with it alone a holder can read `seq` and
+    /// segment ids and copy sealed manifests, but not forge one (see `manifest_auth`).
+    pub manifest: Zeroizing<[u8; KEY_LEN]>,
+    /// HMAC key of the manifest's inner `auth_tag`; only held with the CRK, never
+    /// stored alongside `manifest`.
+    pub manifest_auth: Zeroizing<[u8; KEY_LEN]>,
+    pub replica_id: Zeroizing<[u8; KEY_LEN]>,
+}
+
+impl Crk {
+    /// Generates a CRK from the operating system RNG.
+    pub fn generate() -> Self {
+        Self::generate_with(&mut os_rng())
+    }
+
+    /// Generates a CRK from the given RNG (tests may pass a seeded one).
+    pub fn generate_with(rng: &mut impl CryptoRng) -> Self {
+        Self(random_key(rng))
+    }
+
+    /// Derives the subkeys via HKDF-SHA256.
+    pub fn subkeys(&self) -> Subkeys {
+        Subkeys {
+            enc: hkdf_expand(&*self.0, INFO_ENC),
+            mac: hkdf_expand(&*self.0, INFO_MAC),
+            manifest: hkdf_expand(&*self.0, INFO_MANIFEST),
+            manifest_auth: hkdf_expand(&*self.0, INFO_MANIFEST_AUTH),
+            replica_id: hkdf_expand(&*self.0, INFO_REPLICA_ID),
+        }
+    }
+}
+
+impl fmt::Debug for Crk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Crk(<redacted>)")
+    }
+}
+
+impl fmt::Debug for Subkeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Subkeys(<redacted>)")
+    }
+}
+
+/// User-facing recovery key: 32 random bytes shown as 64 base32 characters
+/// (32 key bytes plus an 8-byte checksum).
+pub struct RecoveryKey(Zeroizing<[u8; KEY_LEN]>);
+
+impl RecoveryKey {
+    /// Generates a recovery key from the operating system RNG.
+    pub fn generate() -> Self {
+        Self::generate_with(&mut os_rng())
+    }
+
+    /// Generates a recovery key from the given RNG.
+    pub fn generate_with(rng: &mut impl CryptoRng) -> Self {
+        Self(random_key(rng))
+    }
+
+    fn checksum(key: &[u8]) -> [u8; CHECK_LEN] {
+        let mut h = Sha256::new();
+        h.update(RECOVERY_CHECK_DOMAIN);
+        h.update(key);
+        let digest = h.finalize();
+        let mut out = [0u8; CHECK_LEN];
+        out.copy_from_slice(&digest[..CHECK_LEN]);
+        out
+    }
+
+    fn encoded(&self) -> Zeroizing<String> {
+        let mut buf = Zeroizing::new(Vec::with_capacity(KEY_LEN + CHECK_LEN));
+        buf.extend_from_slice(&*self.0);
+        buf.extend_from_slice(&Self::checksum(&*self.0));
+        Zeroizing::new(BASE32_NOPAD.encode(&buf))
+    }
+
+    /// 64 base32 characters in 16 groups of 4 separated by `-`.
+    pub fn to_display(&self) -> Zeroizing<String> {
+        let enc = self.encoded();
+        let groups: Vec<&str> = enc
+            .as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).expect("base32 is ASCII"))
+            .collect();
+        Zeroizing::new(groups.join("-"))
+    }
+
+    /// Payload for a QR code: `signal-web-recovery:v1:<64 chars>`.
+    pub fn qr_payload(&self) -> Zeroizing<String> {
+        Zeroizing::new(format!("{QR_PREFIX}{}", &**self.encoded()))
+    }
+
+    /// Parses a QR payload produced by [`RecoveryKey::qr_payload`].
+    pub fn parse_qr(payload: &str) -> Result<Self> {
+        let rest = payload
+            .trim()
+            .strip_prefix(QR_PREFIX)
+            .ok_or_else(|| Error::Format("not a recovery key QR payload".into()))?;
+        Self::parse(rest)
+    }
+
+    /// Parses user-typed text: case-insensitive, ignores spaces and dashes and
+    /// maps `0`, `1`, `8` to `O`, `I`, `B`.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut clean = Zeroizing::new(String::with_capacity(64));
+        for c in text.chars() {
+            match c {
+                '-' => {}
+                c if c.is_whitespace() => {}
+                '0' => clean.push('O'),
+                '1' => clean.push('I'),
+                '8' => clean.push('B'),
+                c if c.is_ascii_alphanumeric() => clean.push(c.to_ascii_uppercase()),
+                _ => return Err(Error::Format("invalid character in recovery key".into())),
+            }
+        }
+        if clean.len() != 64 {
+            return Err(Error::Format("recovery key must be 64 characters".into()));
+        }
+        let bytes = Zeroizing::new(
+            BASE32_NOPAD
+                .decode(clean.as_bytes())
+                .map_err(|_| Error::Format("invalid character in recovery key".into()))?,
+        );
+        if bytes.len() != KEY_LEN + CHECK_LEN {
+            return Err(Error::Format("recovery key has wrong length".into()));
+        }
+        let (key, check) = bytes.split_at(KEY_LEN);
+        if !bool::from(Self::checksum(key).ct_eq(check)) {
+            return Err(Error::RecoveryKeyTypo);
+        }
+        let mut k = Zeroizing::new([0u8; KEY_LEN]);
+        k.copy_from_slice(key);
+        Ok(Self(k))
+    }
+
+    fn wrap_key(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        hkdf_expand(&*self.0, INFO_RECOVERY)
+    }
+}
+
+impl fmt::Debug for RecoveryKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecoveryKey(<redacted>)")
+    }
+}
+
+/// Wraps the CRK: `version(1) || nonce(12) || GCM(ct || tag)`, AAD `signal-web/vault/v1/crk-wrap || version`.
+pub fn wrap_crk(crk: &Crk, rk: &RecoveryKey, rng: &mut impl CryptoRng) -> Vec<u8> {
+    let aad = wrap_aad();
+    let key = rk.wrap_key();
+    let cipher = Aes256Gcm::new_from_slice(&*key).expect("32-byte key");
+    let mut nonce = [0u8; NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+    let ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &*crk.0,
+                aad: &aad,
+            },
+        )
+        .expect("AES-GCM encryption of a short message cannot fail");
+    let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
+    out.push(WRAP_VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Unwraps a CRK produced by [`wrap_crk`].
+pub fn unwrap_crk(blob: &[u8], rk: &RecoveryKey) -> Result<Crk> {
+    if blob.len() < 1 + NONCE_LEN + 16 {
+        return Err(Error::Format("wrapped CRK too short".into()));
+    }
+    if blob[0] != WRAP_VERSION {
+        return Err(Error::Unsupported(format!(
+            "wrapped CRK version {}",
+            blob[0]
+        )));
+    }
+    let aad = wrap_aad();
+    let key = rk.wrap_key();
+    let cipher = Aes256Gcm::new_from_slice(&*key).expect("32-byte key");
+    let pt = Zeroizing::new(
+        cipher
+            .decrypt(
+                Nonce::from_slice(&blob[1..1 + NONCE_LEN]),
+                Payload {
+                    msg: &blob[1 + NONCE_LEN..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| Error::Crypto)?,
+    );
+    if pt.len() != KEY_LEN {
+        return Err(Error::Crypto);
+    }
+    let mut k = Zeroizing::new([0u8; KEY_LEN]);
+    k.copy_from_slice(&pt);
+    Ok(Crk(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    fn rng(seed: u64) -> ChaCha20Rng {
+        ChaCha20Rng::seed_from_u64(seed)
+    }
+
+    #[test]
+    fn subkeys_are_distinct_and_deterministic() {
+        let crk = Crk::generate_with(&mut rng(1));
+        let a = crk.subkeys();
+        let b = crk.subkeys();
+        assert_eq!(a.enc[..], b.enc[..]);
+        assert_eq!(a.mac[..], b.mac[..]);
+        assert_eq!(a.manifest[..], b.manifest[..]);
+        assert_eq!(a.manifest_auth[..], b.manifest_auth[..]);
+        assert_eq!(a.replica_id[..], b.replica_id[..]);
+        let all = [
+            &a.enc[..],
+            &a.mac[..],
+            &a.manifest[..],
+            &a.manifest_auth[..],
+            &a.replica_id[..],
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+        let other = Crk::generate_with(&mut rng(2)).subkeys();
+        assert_ne!(a.enc[..], other.enc[..]);
+    }
+
+    #[test]
+    fn recovery_roundtrip_display_and_qr() {
+        let rk = RecoveryKey::generate_with(&mut rng(3));
+        let shown = rk.to_display();
+        assert_eq!(shown.len(), 16 * 4 + 15);
+        let groups: Vec<&str> = shown.split('-').collect();
+        assert_eq!(groups.len(), 16);
+        assert!(groups.iter().all(|g| g.len() == 4));
+        assert!(
+            shown
+                .chars()
+                .all(|c| c == '-' || c.is_ascii_uppercase() || ('2'..='7').contains(&c))
+        );
+        assert_eq!(RecoveryKey::parse(&shown).unwrap().to_display(), shown);
+        // case-insensitive, spaces instead of dashes
+        let loose = shown.to_lowercase().replace('-', " ");
+        assert_eq!(RecoveryKey::parse(&loose).unwrap().to_display(), shown);
+        let qr = rk.qr_payload();
+        let rest = qr.strip_prefix("signal-web-recovery:v1:").unwrap();
+        assert_eq!(rest.len(), 64);
+        assert_eq!(RecoveryKey::parse(rest).unwrap().to_display(), shown);
+    }
+
+    #[test]
+    fn digit_aliases_map_to_letters() {
+        for (digit, letter) in [('0', 'O'), ('1', 'I'), ('8', 'B')] {
+            let mut found = false;
+            for seed in 0..200 {
+                let rk = RecoveryKey::generate_with(&mut rng(seed));
+                let shown = rk.to_display();
+                if !shown.contains(letter) {
+                    continue;
+                }
+                let aliased = shown.replace(letter, &digit.to_string());
+                assert_eq!(RecoveryKey::parse(&aliased).unwrap().to_display(), shown);
+                found = true;
+                break;
+            }
+            assert!(found, "no sample contained {letter}");
+        }
+    }
+
+    #[test]
+    fn parse_ignores_any_whitespace() {
+        let rk = RecoveryKey::generate_with(&mut rng(20));
+        let shown = rk.to_display();
+        let messy = format!("\t{}\n", shown.replace('-', "\u{a0}"));
+        assert_eq!(RecoveryKey::parse(&messy).unwrap().to_display(), shown);
+    }
+
+    fn kat_crk() -> Crk {
+        Crk(Zeroizing::new(std::array::from_fn(|i| i as u8 + 1)))
+    }
+
+    fn kat_rk() -> RecoveryKey {
+        RecoveryKey(Zeroizing::new(std::array::from_fn(|i| 0xA0 + i as u8)))
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn known_answers() {
+        let s = kat_crk().subkeys();
+        assert_eq!(
+            hex(&*s.enc),
+            "9a83852dfded7de416ca3d5ffd268dead59fe694792b266d038ecf37def1ec3a"
+        );
+        assert_eq!(
+            hex(&*s.mac),
+            "276f22570088ce7dbc0d65099bae770f1d7066dc37c64532d5b2142a0b2c484a"
+        );
+        assert_eq!(
+            hex(&*s.manifest),
+            "bf232dd83c1bf20004dd4ee86be46609292609353240e071e302e49b07c68d35"
+        );
+        assert_eq!(
+            hex(&*s.manifest_auth),
+            "d3bb9b841c6126f379ba72683a99fcac2e887c4e7642605e993146fa63942491"
+        );
+        assert_eq!(
+            hex(&*s.replica_id),
+            "442db32b203b8826d1ef2509844475cec84f1951246deb1a363a1a76a560eda8"
+        );
+        let rk = kat_rk();
+        let display =
+            "UCQ2-FI5E-UWTK-PKFJ-VKV2-ZLNO-V6YL-DMVT-WS23-NN5Y-XG5L-XPF5-X277-7SOE-ZZVD-L262";
+        assert_eq!(&*rk.to_display(), display);
+        assert_eq!(
+            &*rk.qr_payload(),
+            &format!("signal-web-recovery:v1:{}", display.replace('-', ""))
+        );
+        assert_eq!(
+            hex(&*rk.wrap_key()),
+            "a39b2fa65f6f1d8f36021c31db71c625308f6f1959b8b514d17d1d4674407871"
+        );
+    }
+
+    #[test]
+    fn known_answer_wrap_blob_and_aad() {
+        let blob = (0..61)
+            .map(|i| {
+                let h = "01a0ce4a8df256558162747d72f92bedf9d54d5be26354ee6fad887e8bb62407f976ece06cc6bf7ae127d80c5db6d9938c468ad27cc69dfc46be4a8c98";
+                u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()
+            })
+            .collect::<Vec<u8>>();
+        let crk = unwrap_crk(&blob, &kat_rk()).unwrap();
+        assert_eq!(crk.0[..], kat_crk().0[..]);
+        // Pinned wrap output for a seeded RNG.
+        assert_eq!(wrap_crk(&kat_crk(), &kat_rk(), &mut rng(99)), blob);
+        // AAD is exactly label || version byte.
+        let key = kat_rk().wrap_key();
+        let cipher = Aes256Gcm::new_from_slice(&*key).unwrap();
+        let nonce = Nonce::from_slice(&blob[1..13]);
+        let ok = |aad: &[u8]| {
+            cipher
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: &blob[13..],
+                        aad,
+                    },
+                )
+                .is_ok()
+        };
+        assert!(ok(b"signal-web/vault/v1/crk-wrap\x01"));
+        assert!(!ok(b"signal-web/vault/v1/crk-wrap"));
+        assert!(!ok(b"signal-web/vault/v1/crk-wrap\x02"));
+    }
+
+    #[test]
+    fn recovery_key_typo_detected() {
+        let rk = RecoveryKey::generate_with(&mut rng(4));
+        let shown = rk.to_display();
+        let mut chars: Vec<char> = shown.chars().collect();
+        let i = chars.iter().position(|c| *c != '-').unwrap();
+        chars[i] = if chars[i] == 'A' { 'C' } else { 'A' };
+        let typo: String = chars.into_iter().collect();
+        assert!(matches!(
+            RecoveryKey::parse(&typo),
+            Err(Error::RecoveryKeyTypo)
+        ));
+        assert!(matches!(
+            RecoveryKey::parse("ABCD-EFGH"),
+            Err(Error::Format(_))
+        ));
+        assert!(matches!(
+            RecoveryKey::parse(&format!("{}!", *shown)),
+            Err(Error::Format(_))
+        ));
+    }
+
+    #[test]
+    fn wrap_unwrap_roundtrip_and_format() {
+        let crk = Crk::generate_with(&mut rng(5));
+        let rk = RecoveryKey::generate_with(&mut rng(6));
+        let blob = wrap_crk(&crk, &rk, &mut rng(7));
+        assert_eq!(blob[0], 1);
+        assert_eq!(blob.len(), 1 + 12 + 32 + 16);
+        let back = unwrap_crk(&blob, &rk).unwrap();
+        assert_eq!(back.subkeys().enc[..], crk.subkeys().enc[..]);
+        // fresh nonce each call
+        let blob2 = wrap_crk(&crk, &rk, &mut rng(8));
+        assert_ne!(blob[1..13], blob2[1..13]);
+    }
+
+    #[test]
+    fn wrong_recovery_key_fails_unwrap() {
+        let crk = Crk::generate_with(&mut rng(9));
+        let rk = RecoveryKey::generate_with(&mut rng(10));
+        let wrong = RecoveryKey::generate_with(&mut rng(11));
+        let blob = wrap_crk(&crk, &rk, &mut rng(12));
+        assert!(matches!(unwrap_crk(&blob, &wrong), Err(Error::Crypto)));
+        let mut tampered = blob.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(matches!(unwrap_crk(&tampered, &rk), Err(Error::Crypto)));
+        let mut badver = blob.clone();
+        badver[0] = 2;
+        assert!(matches!(
+            unwrap_crk(&badver, &rk),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(matches!(
+            unwrap_crk(&blob[..10], &rk),
+            Err(Error::Format(_))
+        ));
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let crk = Crk::generate_with(&mut rng(13));
+        let rk = RecoveryKey::generate_with(&mut rng(14));
+        let sub = crk.subkeys();
+        let shown = rk.to_display();
+        let first_group = &shown[..4];
+        for dbg in [format!("{crk:?}"), format!("{rk:?}"), format!("{sub:?}")] {
+            assert!(dbg.contains("redacted"), "{dbg}");
+            assert!(!dbg.contains(first_group), "{dbg}");
+        }
+        let hex: String = crk
+            .subkeys()
+            .enc
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(!format!("{sub:?}").contains(&hex));
+    }
+}

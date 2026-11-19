@@ -1,0 +1,335 @@
+// SPDX-License-Identifier: MIT
+//! User approval of a new browser session.
+
+use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio::sync::oneshot;
+
+/// Asks the user whether a browser may open a session.
+///
+/// Implementations show `device_name` and the 6-digit `sas`, which the user must
+/// compare with the code the browser shows, and return `true` only on an explicit
+/// confirmation (biometric prompt on Android, a terminal prompt in development).
+/// The server calls `approve` for one session at a time and cancels the call
+/// (drops the future) after its approval timeout or when the session ends;
+/// implementations must treat that as a denial and must not let an answer given
+/// for a cancelled prompt apply to a later one.
+///
+/// `device_name` is browser-supplied text (at most 64 bytes, no control
+/// characters, but possibly bidi or look-alike characters): display it as
+/// untrusted.
+#[async_trait::async_trait]
+pub trait Approver: Send + Sync {
+    async fn approve(&self, device_name: &str, sas: &str) -> bool;
+}
+
+/// Development approver: prompts on a terminal and reads answers from one
+/// long-lived reader thread.
+///
+/// Every prompt carries a number; approving requires typing `y <number>`, so a
+/// late answer to an earlier (timed-out) prompt cannot approve a later one.
+/// `n` denies the current prompt. Lines typed while no prompt is open are
+/// dropped. At end of input every prompt is denied.
+pub struct TerminalApprover {
+    shared: Arc<Shared>,
+    /// Shown in every prompt: the relay the pairing text named.
+    relay_host: Option<String>,
+}
+
+struct Shared {
+    next: AtomicU64,
+    closed: AtomicBool,
+    current: Mutex<Option<(u64, oneshot::Sender<bool>)>>,
+    out: Mutex<Box<dyn Write + Send>>,
+}
+
+impl Shared {
+    fn current(&self) -> MutexGuard<'_, Option<(u64, oneshot::Sender<bool>)>> {
+        self.current.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn say(&self, s: &str) {
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = out.write_all(s.as_bytes());
+        let _ = out.flush();
+    }
+
+    fn deliver(&self, line: &str) {
+        let mut cur = self.current();
+        let Some((id, _)) = cur.as_ref() else {
+            return; // stale: no prompt open
+        };
+        let id = *id;
+        let answer = match parse(line) {
+            Some((true, Some(n))) if n == id => Some(true),
+            Some((false, None)) => Some(false),
+            Some((false, Some(n))) if n == id => Some(false),
+            _ => None,
+        };
+        match answer {
+            Some(a) => {
+                if let Some((_, tx)) = cur.take() {
+                    let _ = tx.send(a);
+                }
+            }
+            None => {
+                drop(cur);
+                self.say(&format!("Type 'y {id}' to allow or 'n' to deny.\n"));
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        if let Some((_, tx)) = self.current().take() {
+            let _ = tx.send(false);
+        }
+    }
+}
+
+/// `y <n>` / `yes <n>` / `n` / `no` (optionally followed by the prompt number).
+fn parse(line: &str) -> Option<(bool, Option<u64>)> {
+    let mut it = line.split_whitespace();
+    let yes = match it.next()?.to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => return None,
+    };
+    let n = match it.next() {
+        Some(t) => Some(t.trim_start_matches('#').parse().ok()?),
+        None => None,
+    };
+    if it.next().is_some() {
+        return None;
+    }
+    Some((yes, n))
+}
+
+/// Clears the open prompt if it is still ours (cancelled or answered).
+struct ClearOnDrop<'a>(&'a Shared, u64);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        let mut cur = self.0.current();
+        if cur.as_ref().is_some_and(|(id, _)| *id == self.1) {
+            *cur = None;
+        }
+    }
+}
+
+impl Default for TerminalApprover {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TerminalApprover {
+    /// Prompts on stderr, reads stdin.
+    pub fn new() -> Self {
+        Self::with_io(BufReader::new(std::io::stdin()), std::io::stderr())
+    }
+
+    /// Prompts on `output`, reads answers from `input` on a dedicated thread.
+    pub fn with_io(
+        input: impl BufRead + Send + 'static,
+        output: impl Write + Send + 'static,
+    ) -> Self {
+        let shared = Arc::new(Shared {
+            next: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            current: Mutex::new(None),
+            out: Mutex::new(Box::new(output)),
+        });
+        let reader = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("vault-approver-input".into())
+            .spawn(move || {
+                for line in input.lines() {
+                    match line {
+                        Ok(l) => reader.deliver(&l),
+                        Err(_) => break,
+                    }
+                }
+                reader.close();
+            });
+        if spawned.is_err() {
+            shared.close();
+        }
+        Self {
+            shared,
+            relay_host: None,
+        }
+    }
+
+    /// Show `host` (the relay named in the pairing text) in every prompt, so
+    /// the user can check it is the relay of the page they opened.
+    pub fn with_relay_host(mut self, host: impl Into<String>) -> Self {
+        self.relay_host = Some(host.into());
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for TerminalApprover {
+    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+        let s = &*self.shared;
+        let id = s.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut cur = s.current();
+            if s.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            // Approvals are serialized by the server; a leftover prompt is denied.
+            if let Some((_, old)) = cur.replace((id, tx)) {
+                let _ = old.send(false);
+            }
+        }
+        let _clear = ClearOnDrop(s, id);
+        let relay = self
+            .relay_host
+            .as_ref()
+            .map(|h| {
+                format!(
+                    "[#{id}] Relay: {}  (must be the address of the web app page you opened)\n",
+                    h.escape_debug()
+                )
+            })
+            .unwrap_or_default();
+        s.say(&format!(
+            "\n[#{id}] Allow \"{}\" to open a vault session?\n{relay}[#{id}] Code: {sas}  (must match the browser)\n[#{id}] Type 'y {id}' to allow, 'n' to deny: ",
+            device_name.escape_debug()
+        ));
+        rx.await.unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Buf {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+        async fn wait_for(&self, s: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !self.text().contains(s) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("prompt not shown");
+        }
+    }
+
+    fn setup() -> (Arc<TerminalApprover>, std::io::PipeWriter, Buf) {
+        let (r, w) = std::io::pipe().unwrap();
+        let out = Buf::default();
+        let a = TerminalApprover::with_io(BufReader::new(r), out.clone());
+        (Arc::new(a), w, out)
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[test]
+    fn parses_answers() {
+        assert_eq!(parse("y 3"), Some((true, Some(3))));
+        assert_eq!(parse(" YES #3 "), Some((true, Some(3))));
+        assert_eq!(parse("y"), Some((true, None)));
+        assert_eq!(parse("n"), Some((false, None)));
+        assert_eq!(parse("no 2"), Some((false, Some(2))));
+        assert_eq!(parse("y x"), None);
+        assert_eq!(parse("y 1 2"), None);
+        assert_eq!(parse("maybe"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    #[tokio::test]
+    async fn stale_and_mismatched_lines_are_ignored() {
+        let (a, mut w, out) = setup();
+        writeln!(w, "y 1").unwrap(); // before any prompt: dropped
+        settle().await;
+        let t = tokio::spawn({
+            let a = a.clone();
+            async move { a.approve("Fire\u{202e}fox", "123456").await }
+        });
+        out.wait_for("Type 'y 1'").await;
+        assert!(out.text().contains("123456"));
+        assert!(out.text().contains("\\u{202e}"), "{}", out.text());
+        writeln!(w, "y").unwrap(); // no number: not an approval
+        writeln!(w, "y 7").unwrap(); // other prompt
+        settle().await;
+        assert!(!t.is_finished());
+        writeln!(w, "y 1").unwrap();
+        assert!(t.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn late_answer_does_not_approve_next_prompt() {
+        let (a, mut w, out) = setup();
+        let r = tokio::time::timeout(Duration::from_millis(50), a.approve("A", "111111")).await;
+        assert!(r.is_err()); // cancelled, like a server approval timeout
+        let t = tokio::spawn({
+            let a = a.clone();
+            async move { a.approve("B", "222222").await }
+        });
+        out.wait_for("Type 'y 2'").await;
+        writeln!(w, "y 1").unwrap(); // late answer to the cancelled prompt
+        settle().await;
+        assert!(!t.is_finished());
+        writeln!(w, "n").unwrap();
+        assert!(!t.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prompt_shows_relay_host() {
+        let (r, mut w) = std::io::pipe().unwrap();
+        let out = Buf::default();
+        let a = Arc::new(
+            TerminalApprover::with_io(BufReader::new(r), out.clone())
+                .with_relay_host("relay.example\u{202e}"),
+        );
+        let t = tokio::spawn({
+            let a = a.clone();
+            async move { a.approve("A", "111111").await }
+        });
+        out.wait_for("Type 'y 1'").await;
+        assert!(
+            out.text().contains("Relay: relay.example\\u{202e}"),
+            "{}",
+            out.text()
+        );
+        writeln!(w, "n").unwrap();
+        assert!(!t.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn end_of_input_denies() {
+        let (a, w, out) = setup();
+        let t = tokio::spawn({
+            let a = a.clone();
+            async move { a.approve("A", "111111").await }
+        });
+        out.wait_for("Type 'y 1'").await;
+        drop(w);
+        assert!(!t.await.unwrap());
+        assert!(!a.approve("B", "222222").await);
+    }
+}

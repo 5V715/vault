@@ -1,0 +1,1143 @@
+// SPDX-License-Identifier: MIT
+//! End-to-end tests: an in-process relay, a vault server on an in-memory container,
+//! and a browser-side test client built from `vault-proto`.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use vault_container::Result as CResult;
+use vault_container::backend::{ContainerBackend, Etag, MemoryBackend, PutOutcome};
+use vault_container::engine::Container;
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::Message;
+use vault_proto::msg::VaultMessage;
+use vault_proto::noise::{PairKeys, Session};
+use vault_proto::{
+    Chunk, Chunker, ErrorCode, Notice, PairOffer, Reassembler, Request, RequestBody, ResponseBody,
+};
+use vault_server::{
+    Approver, CompactionPolicy, EndReason, ServerConfig, ServerError, SessionHandle, SharedBackend,
+    VaultServer,
+};
+use zeroize::Zeroizing;
+
+const T: Duration = Duration::from_secs(10);
+
+// ---------- relay ----------
+
+struct Relay {
+    addr: SocketAddr,
+    _stop: oneshot::Sender<()>,
+}
+
+async fn relay() -> Relay {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let cfg = relay::Config {
+        static_dir: std::env::temp_dir(),
+        ..relay::Config::default()
+    };
+    tokio::spawn(relay::serve(l, Arc::new(cfg), async move {
+        let _ = rx.await;
+    }));
+    Relay { addr, _stop: tx }
+}
+
+impl Relay {
+    fn url(&self) -> String {
+        format!("ws://{}/", self.addr)
+    }
+}
+
+// ---------- approvers ----------
+
+#[derive(Default)]
+struct Auto {
+    answer: bool,
+    calls: Mutex<Vec<(String, String)>>,
+}
+
+impl Auto {
+    fn new(answer: bool) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            calls: Mutex::default(),
+        })
+    }
+    fn calls(&self) -> Vec<(String, String)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for Auto {
+    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((device_name.into(), sas.into()));
+        self.answer
+    }
+}
+
+/// Records prompts and their concurrency; each prompt waits for one answer from `tx`.
+struct Gate {
+    prompts: Mutex<Vec<(String, String)>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    answers: tokio::sync::Mutex<mpsc::UnboundedReceiver<bool>>,
+    tx: mpsc::UnboundedSender<bool>,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            prompts: Mutex::default(),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            answers: tokio::sync::Mutex::new(rx),
+            tx,
+        })
+    }
+    fn prompts(&self) -> Vec<(String, String)> {
+        self.prompts.lock().unwrap().clone()
+    }
+    async fn wait_prompts(&self, n: usize) -> Vec<(String, String)> {
+        tokio::time::timeout(T, async {
+            loop {
+                let p = self.prompts();
+                if p.len() >= n {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prompt did not appear")
+    }
+    fn answer(&self, yes: bool) {
+        self.tx.send(yes).unwrap();
+    }
+}
+
+struct InFlight<'a>(&'a AtomicUsize);
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for Gate {
+    async fn approve(&self, device_name: &str, sas: &str) -> bool {
+        let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let _g = InFlight(&self.in_flight);
+        self.max_in_flight.fetch_max(n, Ordering::SeqCst);
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((device_name.into(), sas.into()));
+        let mut rx = self.answers.lock().await;
+        rx.recv().await.unwrap_or(false)
+    }
+}
+
+/// Never answers.
+struct Never;
+
+#[async_trait::async_trait]
+impl Approver for Never {
+    async fn approve(&self, _: &str, _: &str) -> bool {
+        std::future::pending().await
+    }
+}
+
+// ---------- backends ----------
+
+/// Memory backend whose writes can be made to fail (1 = I/O error), conflict (2),
+/// report a rollback (3) or panic (4).
+#[derive(Default)]
+struct Failing {
+    inner: MemoryBackend,
+    mode: AtomicU8,
+}
+
+#[async_trait::async_trait]
+impl ContainerBackend for Failing {
+    async fn get(&self, name: &str) -> CResult<Option<(Vec<u8>, Etag)>> {
+        self.inner.get(name).await
+    }
+    async fn put_if_absent(&self, name: &str, data: &[u8]) -> CResult<PutOutcome> {
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(vault_container::Error::Io("injected".into())),
+            4 => panic!("injected backend panic"),
+            _ => self.inner.put_if_absent(name, data).await,
+        }
+    }
+    async fn put_if_match(&self, name: &str, data: &[u8], etag: &Etag) -> CResult<PutOutcome> {
+        match self.mode.load(Ordering::SeqCst) {
+            1 => Err(vault_container::Error::Io("injected".into())),
+            2 => Ok(PutOutcome::Conflict),
+            3 => Err(vault_container::Error::Rollback),
+            _ => self.inner.put_if_match(name, data, etag).await,
+        }
+    }
+    async fn delete(&self, name: &str) -> CResult<()> {
+        self.inner.delete(name).await
+    }
+    async fn list(&self, prefix: &str) -> CResult<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+// ---------- server ----------
+
+fn vault_secret() -> Zeroizing<[u8; 32]> {
+    Zeroizing::new([42u8; 32])
+}
+
+async fn server_on(
+    backend: SharedBackend,
+    approver: Arc<dyn Approver>,
+    config: ServerConfig,
+) -> (VaultServer, vault_container::RecoveryKey) {
+    let (c, rk) = Container::create(backend).await.unwrap();
+    let s = VaultServer::new(c, vault_secret(), approver, config).unwrap();
+    (s, rk)
+}
+
+async fn server(approver: Arc<dyn Approver>, config: ServerConfig) -> VaultServer {
+    server_on(Arc::new(MemoryBackend::new()), approver, config)
+        .await
+        .0
+}
+
+// ---------- browser test client ----------
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+struct Browser {
+    ws: Ws,
+    noise: Session,
+    chunker: Chunker,
+    reasm: Reassembler,
+    next_id: u64,
+}
+
+fn mailbox_id() -> [u8; 16] {
+    static N: AtomicU64 = AtomicU64::new(1);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&N.fetch_add(1, Ordering::SeqCst).to_be_bytes());
+    id[8..12].copy_from_slice(&std::process::id().to_be_bytes());
+    id
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+impl Browser {
+    async fn send_message(&mut self, bytes: &[u8]) {
+        for c in self.chunker.split(bytes).unwrap() {
+            let f = self.noise.encrypt(&c.encode()).unwrap();
+            self.ws.send(Message::Binary(f.into())).await.unwrap();
+        }
+    }
+
+    async fn send(&mut self, body: RequestBody) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send_message(&Request { id, body }.encode()).await;
+        id
+    }
+
+    /// Next vault message, or `None` once the connection ends.
+    async fn recv(&mut self) -> Option<VaultMessage> {
+        tokio::time::timeout(T, async {
+            loop {
+                match self.ws.next().await {
+                    Some(Ok(Message::Binary(b))) => {
+                        let pt = self.noise.decrypt(&b).unwrap();
+                        let chunk = Chunk::decode(&pt).unwrap();
+                        if let Some(m) = self.reasm.push(chunk).unwrap() {
+                            return Some(VaultMessage::decode(&m).unwrap());
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("vault did not answer in time")
+    }
+
+    async fn call(&mut self, body: RequestBody) -> ResponseBody {
+        let id = self.send(body).await;
+        match self.recv().await {
+            Some(VaultMessage::Response(r)) => {
+                assert_eq!(r.id, id);
+                r.body
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    /// Send a request and return whatever arrives next.
+    async fn call_any(&mut self, body: RequestBody) -> Option<VaultMessage> {
+        self.send(body).await;
+        self.recv().await
+    }
+
+    async fn expect_closed(&mut self) {
+        assert!(self.recv().await.is_none(), "expected the session to close");
+    }
+}
+
+/// Handshake only (no `OpenSession`).
+async fn pair(server: &VaultServer, relay: &Relay) -> (Browser, SessionHandle) {
+    let keys = PairKeys::generate(relay.url(), mailbox_id()).unwrap();
+    let offer: PairOffer = keys.offer().clone();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/mailbox/{}",
+        relay.addr,
+        hex(&offer.mailbox_id)
+    ))
+    .await
+    .unwrap();
+    let (init, m1) = keys.into_initiator().unwrap();
+    ws.send(Message::Binary(m1.into())).await.unwrap();
+    let srv = tokio::spawn({
+        let server = server.clone();
+        async move { server.serve_offer(offer).await }
+    });
+    let m2 = match tokio::time::timeout(T, ws.next()).await.unwrap() {
+        Some(Ok(Message::Binary(b))) => b.to_vec(),
+        other => panic!("expected msg2, got {other:?}"),
+    };
+    let (m3, noise) = init.handle_msg2(&m2).unwrap();
+    ws.send(Message::Binary(m3.into())).await.unwrap();
+    let handle = srv.await.unwrap().unwrap();
+    assert_eq!(handle.sas(), noise.sas());
+    (
+        Browser {
+            ws,
+            noise,
+            chunker: Chunker::new(),
+            reasm: Reassembler::new(),
+            next_id: 1,
+        },
+        handle,
+    )
+}
+
+/// Handshake plus approved `OpenSession`.
+async fn open(server: &VaultServer, relay: &Relay, device: &str) -> (Browser, SessionHandle) {
+    let (mut b, h) = pair(server, relay).await;
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: device.into(),
+        })
+        .await;
+    assert_eq!(r, ResponseBody::Approved);
+    (b, h)
+}
+
+async fn ended(h: SessionHandle) -> EndReason {
+    tokio::time::timeout(T, h.finished()).await.unwrap()
+}
+
+fn put(k: &[u8], v: &[u8]) -> RequestBody {
+    RequestBody::Put {
+        key: k.to_vec(),
+        value: v.to_vec(),
+    }
+}
+
+fn get(k: &[u8]) -> RequestBody {
+    RequestBody::Get { key: k.to_vec() }
+}
+
+async fn expect_error0(b: &mut Browser, want: ErrorCode) {
+    match b.recv().await {
+        Some(VaultMessage::Response(r)) => {
+            assert_eq!(r.id, 0);
+            assert!(is_error(&r.body, want), "{r:?}");
+        }
+        other => panic!("expected error response, got {other:?}"),
+    }
+}
+
+fn is_error(r: &ResponseBody, want: ErrorCode) -> bool {
+    matches!(r, ResponseBody::Error { code, .. } if *code == want)
+}
+
+// ---------- tests ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_before_approval_refused() {
+    let relay = relay().await;
+    let approver = Auto::new(true);
+    let s = server(approver.clone(), ServerConfig::default()).await;
+
+    // A store request instead of OpenSession.
+    let (mut b, h) = pair(&s, &relay).await;
+    let r = b.call(get(b"k")).await;
+    assert!(is_error(&r, ErrorCode::NotApproved), "{r:?}");
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::NotApproved);
+    assert!(approver.calls().is_empty());
+
+    // A store request while approval is still pending.
+    let s = server(Arc::new(Never), ServerConfig::default()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    b.send(RequestBody::OpenSession {
+        device_name: "Firefox".into(),
+    })
+    .await;
+    let id = b.send(put(b"k", b"v")).await;
+    match b.recv().await {
+        Some(VaultMessage::Response(r)) => {
+            assert_eq!(r.id, id);
+            assert!(is_error(&r.body, ErrorCode::NotApproved), "{r:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::NotApproved);
+    assert_eq!(s.active_session(), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denied_approval_closes() {
+    let relay = relay().await;
+    let approver = Auto::new(false);
+    let s = server(approver.clone(), ServerConfig::default()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    let sas = h.sas().to_string();
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: "Laptop".into(),
+        })
+        .await;
+    assert_eq!(r, ResponseBody::Denied);
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::Denied);
+    assert_eq!(approver.calls(), vec![("Laptop".to_string(), sas)]);
+    let log = s.session_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].device_name, "Laptop");
+    assert_eq!(log[0].reason, EndReason::Denied);
+    assert!(log[0].ended_at_ms >= log[0].started_at_ms);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_timeout_closes() {
+    let relay = relay().await;
+    let cfg = ServerConfig {
+        approval_timeout: Duration::from_millis(300),
+        ..ServerConfig::default()
+    };
+    let s = server(Arc::new(Never), cfg).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: "Laptop".into(),
+        })
+        .await;
+    assert_eq!(r, ResponseBody::Denied);
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::ApprovalTimeout);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crud_commit_roundtrip() {
+    let relay = relay().await;
+    let approver = Auto::new(true);
+    let s = server(approver.clone(), ServerConfig::default()).await;
+    let (mut b, h) = open(&s, &relay, "Firefox on Linux").await;
+    assert_eq!(approver.calls()[0].1, h.sas());
+    assert_eq!(s.active_session(), Some(h.id()));
+
+    assert_eq!(b.call(put(b"a/1", b"one")).await, ResponseBody::Ok);
+    assert_eq!(b.call(put(b"a/2", b"two")).await, ResponseBody::Ok);
+    assert_eq!(b.call(put(b"b/1", b"bee")).await, ResponseBody::Ok);
+    let pia = |k: &[u8], v: &[u8]| RequestBody::PutIfAbsent {
+        key: k.to_vec(),
+        value: v.to_vec(),
+    };
+    assert_eq!(b.call(pia(b"a/1", b"x")).await, ResponseBody::Bool(false));
+    assert_eq!(
+        b.call(pia(b"a/3", b"three")).await,
+        ResponseBody::Bool(true)
+    );
+    assert_eq!(
+        b.call(get(b"a/1")).await,
+        ResponseBody::Value(Some(b"one".to_vec()))
+    );
+    assert_eq!(b.call(get(b"zz")).await, ResponseBody::Value(None));
+    assert_eq!(
+        b.call(RequestBody::Delete {
+            key: b"a/2".to_vec()
+        })
+        .await,
+        ResponseBody::Ok
+    );
+    assert_eq!(
+        b.call(RequestBody::ScanPrefix {
+            prefix: b"a/".to_vec()
+        })
+        .await,
+        ResponseBody::Entries(vec![
+            (b"a/1".to_vec(), b"one".to_vec()),
+            (b"a/3".to_vec(), b"three".to_vec()),
+        ])
+    );
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+    assert_eq!(b.call(RequestBody::Clear).await, ResponseBody::Ok);
+    assert_eq!(
+        b.call(RequestBody::ScanPrefix { prefix: vec![] }).await,
+        ResponseBody::Entries(vec![])
+    );
+    assert_eq!(b.call(put(b"c", b"sea")).await, ResponseBody::Ok);
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 2 }
+    );
+    // A second OpenSession inside an active session is unexpected but not fatal.
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: "again".into(),
+        })
+        .await;
+    assert!(is_error(&r, ErrorCode::BadRequest), "{r:?}");
+    assert_eq!(b.call(RequestBody::Close).await, ResponseBody::Ok);
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::Closed);
+    assert_eq!(s.active_session(), None);
+
+    // Committed state is visible to the next session.
+    let (mut b, _h) = open(&s, &relay, "Firefox on Linux").await;
+    assert_eq!(
+        b.call(RequestBody::ScanPrefix { prefix: vec![] }).await,
+        ResponseBody::Entries(vec![(b"c".to_vec(), b"sea".to_vec())])
+    );
+    let log = s.session_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].device_name, "Firefox on Linux");
+    assert_eq!(log[0].reason, EndReason::Closed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uncommitted_writes_discarded_when_session_ends() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), ServerConfig::default()).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(put(b"k", b"v")).await, ResponseBody::Ok);
+    drop(b); // disconnect without Commit
+    assert_eq!(ended(h).await, EndReason::Disconnected);
+    let (mut b, _h) = open(&s, &relay, "B").await;
+    assert_eq!(b.call(get(b"k")).await, ResponseBody::Value(None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_session_terminates_first() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), ServerConfig::default()).await;
+    let (mut a, ha) = open(&s, &relay, "A").await;
+    assert_eq!(a.call(put(b"kept", b"1")).await, ResponseBody::Ok);
+    assert_eq!(
+        a.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+    assert_eq!(a.call(put(b"lost", b"2")).await, ResponseBody::Ok);
+
+    let (mut b, hb) = open(&s, &relay, "B").await;
+    assert_eq!(
+        a.recv().await,
+        Some(VaultMessage::Notice(Notice::SessionTerminated {
+            reason: "replaced".into()
+        }))
+    );
+    a.expect_closed().await;
+    assert_eq!(ended(ha).await, EndReason::Replaced);
+    assert_eq!(s.active_session(), Some(hb.id()));
+
+    assert_eq!(b.call(get(b"lost")).await, ResponseBody::Value(None));
+    assert_eq!(
+        b.call(get(b"kept")).await,
+        ResponseBody::Value(Some(b"1".to_vec()))
+    );
+    // B commits cleanly: A's discarded write does not resurface.
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+    let log = s.session_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        (log[0].device_name.as_str(), log[0].reason),
+        ("A", EndReason::Replaced)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_ends_session() {
+    let relay = relay().await;
+    let backend: SharedBackend = Arc::new(MemoryBackend::new());
+    let (s, rk) = server_on(backend.clone(), Auto::new(true), ServerConfig::default()).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(put(b"kept", b"1")).await, ResponseBody::Ok);
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+    assert_eq!(b.call(put(b"lost", b"2")).await, ResponseBody::Ok);
+
+    s.lock().await;
+    assert!(s.is_locked());
+    assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::Locked)));
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::Locked);
+    assert_eq!(s.active_session(), None);
+
+    // No new sessions while locked.
+    let keys = PairKeys::generate(relay.url(), mailbox_id()).unwrap();
+    assert!(matches!(
+        s.serve_offer(keys.offer().clone()).await,
+        Err(ServerError::Locked)
+    ));
+
+    // Unlock with a re-opened container: committed data survives, pending did not.
+    let (c, _) = Container::open_with_recovery(backend, &rk, None)
+        .await
+        .unwrap();
+    s.unlock(c, vault_secret()).await;
+    let (mut b, _h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(get(b"lost")).await, ResponseBody::Value(None));
+    assert_eq!(
+        b.call(get(b"kept")).await,
+        ResponseBody::Value(Some(b"1".to_vec()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_ends_session_awaiting_approval() {
+    let relay = relay().await;
+    let s = server(Arc::new(Never), ServerConfig::default()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    b.send(RequestBody::OpenSession {
+        device_name: "A".into(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    s.lock().await;
+    assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::Locked)));
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::Locked);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_ends_session() {
+    let relay = relay().await;
+    let cfg = ServerConfig {
+        session_timeout: Duration::from_millis(400),
+        ..ServerConfig::default()
+    };
+    let s = server(Auto::new(true), cfg).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(put(b"k", b"v")).await, ResponseBody::Ok);
+    assert_eq!(
+        b.recv().await,
+        Some(VaultMessage::Notice(Notice::SessionTerminated {
+            reason: "timeout".into()
+        }))
+    );
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::Timeout);
+    let (mut b, _h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(get(b"k")).await, ResponseBody::Value(None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_timeout_ends_session() {
+    let relay = relay().await;
+    let cfg = ServerConfig {
+        idle_timeout: Some(Duration::from_millis(500)),
+        ..ServerConfig::default()
+    };
+    let s = server(Auto::new(true), cfg).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    // Activity keeps the session alive past the idle limit.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(b.call(get(b"k")).await, ResponseBody::Value(None));
+    }
+    assert_eq!(
+        b.recv().await,
+        Some(VaultMessage::Notice(Notice::SessionTerminated {
+            reason: "idle".into()
+        }))
+    );
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::IdleTimeout);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_failure_reported_as_error() {
+    let relay = relay().await;
+    let backend = Arc::new(Failing::default());
+    let (s, _) = server_on(backend.clone(), Auto::new(true), ServerConfig::default()).await;
+    let (mut b, _h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(put(b"k", b"v")).await, ResponseBody::Ok);
+
+    backend.mode.store(1, Ordering::SeqCst);
+    let r = b.call(RequestBody::Commit).await;
+    assert!(is_error(&r, ErrorCode::Storage), "{r:?}");
+
+    backend.mode.store(2, Ordering::SeqCst);
+    let r = b.call(RequestBody::Commit).await;
+    assert!(is_error(&r, ErrorCode::Conflict), "{r:?}");
+
+    // Rollback / diverged replicas are storage integrity failures, not conflicts.
+    backend.mode.store(3, Ordering::SeqCst);
+    let r = b.call(RequestBody::Commit).await;
+    assert!(is_error(&r, ErrorCode::Storage), "{r:?}");
+
+    // The batch was kept; the session is still usable and a retry succeeds.
+    backend.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        b.call(get(b"k")).await,
+        ResponseBody::Value(Some(b"v".to_vec()))
+    );
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn large_value_chunked_roundtrip() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), ServerConfig::default()).await;
+    let (mut b, _h) = open(&s, &relay, "A").await;
+    let big: Vec<u8> = (0..8 * 1024 * 1024)
+        .map(|i: usize| (i % 251) as u8)
+        .collect();
+    assert_eq!(b.call(put(b"big", &big)).await, ResponseBody::Ok);
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+    assert_eq!(
+        b.call(get(b"big")).await,
+        ResponseBody::Value(Some(big.clone()))
+    );
+    assert_eq!(
+        b.call(RequestBody::ScanPrefix {
+            prefix: b"b".to_vec()
+        })
+        .await,
+        ResponseBody::Entries(vec![(b"big".to_vec(), big)])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_message_closes_session() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), ServerConfig::default()).await;
+
+    // Well-encrypted but undecodable application message.
+    let (mut b, h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(put(b"k", b"v")).await, ResponseBody::Ok);
+    b.send_message(&[0xff; 10]).await;
+    expect_error0(&mut b, ErrorCode::BadRequest).await;
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::ProtocolError);
+
+    // A frame that is not valid Noise ciphertext.
+    let (mut b, h) = open(&s, &relay, "A").await;
+    b.ws.send(Message::Binary(vec![1u8; 40].into()))
+        .await
+        .unwrap();
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::ProtocolError);
+
+    // Chunks out of sequence (first chunk with index 1).
+    let (mut b, h) = open(&s, &relay, "A").await;
+    let c = Chunk {
+        msg_id: 99,
+        index: 1,
+        last: true,
+        payload: Request {
+            id: 1,
+            body: get(b"k"),
+        }
+        .encode(),
+    };
+    let f = b.noise.encrypt(&c.encode()).unwrap();
+    b.ws.send(Message::Binary(f.into())).await.unwrap();
+    expect_error0(&mut b, ErrorCode::BadRequest).await;
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::ProtocolError);
+
+    // Undecodable before approval too; an oversize field is reported as TooLarge.
+    let (mut b, h) = pair(&s, &relay).await;
+    b.send(RequestBody::OpenSession {
+        device_name: "x".repeat(65),
+    })
+    .await;
+    expect_error0(&mut b, ErrorCode::TooLarge).await;
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::ProtocolError);
+
+    // The uncommitted write of the first session was discarded.
+    let (mut b, _h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(get(b"k")).await, ResponseBody::Value(None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handshake_with_wrong_browser_key_fails() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), ServerConfig::default()).await;
+    // The vault scans offer A but the browser handshakes with key B (same mailbox).
+    let a = PairKeys::generate(relay.url(), mailbox_id()).unwrap();
+    let b = PairKeys::generate(relay.url(), a.offer().mailbox_id).unwrap();
+    let offer_a = a.offer().clone();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/mailbox/{}",
+        relay.addr,
+        hex(&offer_a.mailbox_id)
+    ))
+    .await
+    .unwrap();
+    let (init, m1) = b.into_initiator().unwrap();
+    ws.send(Message::Binary(m1.into())).await.unwrap();
+    let srv = tokio::spawn({
+        let s = s.clone();
+        async move { s.serve_offer(offer_a).await }
+    });
+    // The prologues differ (offer B vs. scanned offer A), so msg2 does not decrypt
+    // and the browser gives up; the vault must not produce a session.
+    let m2 = match tokio::time::timeout(T, ws.next()).await.unwrap() {
+        Some(Ok(Message::Binary(b))) => b.to_vec(),
+        other => panic!("expected msg2, got {other:?}"),
+    };
+    assert!(init.handle_msg2(&m2).is_err());
+    ws.close(None).await.unwrap();
+    let r = tokio::time::timeout(T, srv).await.unwrap().unwrap();
+    assert!(matches!(r, Err(ServerError::Handshake)), "{r:?}");
+    assert!(s.session_log().is_empty());
+}
+
+async fn open_request(b: &mut Browser, device: &str) -> u64 {
+    b.send(RequestBody::OpenSession {
+        device_name: device.into(),
+    })
+    .await
+}
+
+async fn expect_response(b: &mut Browser, id: u64) -> ResponseBody {
+    match b.recv().await {
+        Some(VaultMessage::Response(r)) => {
+            assert_eq!(r.id, id);
+            r.body
+        }
+        other => panic!("expected response {id}, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approvals_are_serialized_and_bound_to_the_shown_sas() {
+    let relay = relay().await;
+    let gate = Gate::new();
+    let s = server(gate.clone(), ServerConfig::default()).await;
+    let (mut a, ha) = pair(&s, &relay).await;
+    let (mut b, hb) = pair(&s, &relay).await;
+    let ia = open_request(&mut a, "A").await;
+    let ib = open_request(&mut b, "B").await;
+
+    // Only one prompt is shown while it is unanswered.
+    let first = gate.wait_prompts(1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(gate.prompts().len(), 1);
+    assert_eq!(gate.max_in_flight.load(Ordering::SeqCst), 1);
+
+    // The answer applies to the session whose SAS was shown.
+    let (yes, yes_id, no, no_id, no_h) = if first[0].1 == ha.sas() {
+        assert_eq!(first[0].0, "A");
+        (&mut a, ia, &mut b, ib, hb)
+    } else {
+        assert_eq!(first[0], ("B".to_string(), hb.sas().to_string()));
+        (&mut b, ib, &mut a, ia, ha)
+    };
+    gate.answer(true);
+    assert_eq!(expect_response(yes, yes_id).await, ResponseBody::Approved);
+
+    // Then the other session is prompted, with its own SAS.
+    let second = gate.wait_prompts(2).await;
+    assert_eq!(second[1].1, no_h.sas());
+    assert_ne!(second[1].1, first[0].1);
+    gate.answer(false);
+    assert_eq!(expect_response(no, no_id).await, ResponseBody::Denied);
+    no.expect_closed().await;
+    assert_eq!(ended(no_h).await, EndReason::Denied);
+    assert_eq!(gate.max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_timeout_starts_when_prompt_is_shown() {
+    let relay = relay().await;
+    let gate = Gate::new();
+    let cfg = ServerConfig {
+        approval_timeout: Duration::from_millis(700),
+        ..ServerConfig::default()
+    };
+    let s = server(gate.clone(), cfg).await;
+    let (mut a, _ha) = pair(&s, &relay).await;
+    let (mut b, _hb) = pair(&s, &relay).await;
+    let ia = open_request(&mut a, "A").await;
+    let ib = open_request(&mut b, "B").await;
+    gate.wait_prompts(1).await;
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    gate.answer(true);
+    gate.wait_prompts(2).await;
+    // 900 ms after its OpenSession, but only 450 ms after its prompt.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    gate.answer(true);
+    let ra = expect_response(&mut a, ia).await;
+    let rb = expect_response(&mut b, ib).await;
+    assert_eq!((ra, rb), (ResponseBody::Approved, ResponseBody::Approved));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn at_most_two_sessions_await_approval() {
+    let relay = relay().await;
+    let gate = Gate::new();
+    let s = server(gate.clone(), ServerConfig::default()).await;
+    let (mut a, _ha) = pair(&s, &relay).await;
+    let (mut b, _hb) = pair(&s, &relay).await;
+    let (mut c, hc) = pair(&s, &relay).await;
+    open_request(&mut a, "A").await;
+    gate.wait_prompts(1).await;
+    open_request(&mut b, "B").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ic = open_request(&mut c, "C").await;
+    assert_eq!(expect_response(&mut c, ic).await, ResponseBody::Denied);
+    c.expect_closed().await;
+    assert_eq!(ended(hc).await, EndReason::Busy);
+    assert_eq!(gate.prompts().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ping_is_answered_in_every_state() {
+    let relay = relay().await;
+    let gate = Gate::new();
+    let cfg = ServerConfig {
+        idle_timeout: Some(Duration::from_millis(600)),
+        ..ServerConfig::default()
+    };
+    let s = server(gate.clone(), cfg).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    assert_eq!(b.call(RequestBody::Ping).await, ResponseBody::Ok);
+    let open = open_request(&mut b, "A").await;
+    gate.wait_prompts(1).await;
+    assert_eq!(b.call(RequestBody::Ping).await, ResponseBody::Ok);
+    gate.answer(true);
+    assert_eq!(expect_response(&mut b, open).await, ResponseBody::Approved);
+    assert_eq!(b.call(RequestBody::Ping).await, ResponseBody::Ok);
+    // Pings keep the connection alive but do not count as activity.
+    let ended_idle = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match b.call_any(RequestBody::Ping).await {
+                Some(VaultMessage::Response(r)) => assert_eq!(r.body, ResponseBody::Ok),
+                Some(VaultMessage::Notice(n)) => return n,
+                None => panic!("closed without notice"),
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await
+    .expect("pings must not reset the idle timeout");
+    assert_eq!(
+        ended_idle,
+        Notice::SessionTerminated {
+            reason: "idle".into()
+        }
+    );
+    assert_eq!(ended(h).await, EndReason::IdleTimeout);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_in_request_still_cleans_up() {
+    let relay = relay().await;
+    let backend = Arc::new(Failing::default());
+    let (s, _) = server_on(backend.clone(), Auto::new(true), ServerConfig::default()).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    assert_eq!(b.call(put(b"k", b"v")).await, ResponseBody::Ok);
+    backend.mode.store(4, Ordering::SeqCst);
+    b.send(RequestBody::Commit).await;
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::Internal);
+    assert_eq!(s.active_session(), None);
+    let log = s.session_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        (log[0].device_name.as_str(), log[0].reason),
+        ("A", EndReason::Internal)
+    );
+
+    backend.mode.store(0, Ordering::SeqCst);
+    let (mut b, _h) = open(&s, &relay, "B").await;
+    assert_eq!(b.call(get(b"k")).await, ResponseBody::Value(None));
+    assert_eq!(b.call(put(b"j", b"w")).await, ResponseBody::Ok);
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+}
+
+// ---------- compaction policy ----------
+
+fn policy(max_segments: usize, max_dead_ratio: f64, min_segments_for_ratio: usize) -> ServerConfig {
+    ServerConfig {
+        compaction: CompactionPolicy {
+            max_segments,
+            max_dead_ratio,
+            min_segments_for_ratio,
+        },
+        ..ServerConfig::default()
+    }
+}
+
+async fn commit_keys(b: &mut Browser, keys: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) {
+    for (k, v) in keys {
+        assert_eq!(b.call(put(&k, &v)).await, ResponseBody::Ok);
+        assert!(matches!(
+            b.call(RequestBody::Commit).await,
+            ResponseBody::Committed { .. }
+        ));
+    }
+}
+
+async fn close(b: &mut Browser, h: SessionHandle) {
+    assert_eq!(b.call(RequestBody::Close).await, ResponseBody::Ok);
+    assert_eq!(ended(h).await, EndReason::Closed);
+}
+
+fn distinct(n: u8) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..n).map(|i| (vec![b'k', i], vec![i; 100])).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_runs_after_session_when_threshold_crossed() {
+    let relay = relay().await;
+    let backend: SharedBackend = Arc::new(MemoryBackend::new());
+    let (s, rk) = server_on(backend.clone(), Auto::new(true), policy(4, 1.0, usize::MAX)).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    commit_keys(&mut b, distinct(5)).await;
+    // Still in the session: never compacted on the commit path.
+    assert_eq!(s.container_stats().await.unwrap().segments, 5);
+    let before = s.high_water().await.unwrap();
+    close(&mut b, h).await;
+    let st = s.container_stats().await.unwrap();
+    assert_eq!(st.segments, 1, "compacted at session end");
+    assert_eq!(
+        backend.list("seg/").await.unwrap().len(),
+        1,
+        "old segments deleted"
+    );
+    let hw = s.high_water().await.unwrap();
+    assert_eq!(
+        hw.seq,
+        before.seq + 1,
+        "compaction is a new, later manifest"
+    );
+
+    // Everything is still readable, over the protocol and after a reopen with
+    // the new high-water mark (anti-rollback keeps working).
+    let (mut b, _h) = open(&s, &relay, "B").await;
+    let want: Vec<_> = distinct(5);
+    assert_eq!(
+        b.call(RequestBody::ScanPrefix { prefix: vec![] }).await,
+        ResponseBody::Entries(want.clone())
+    );
+    let (c, _) = Container::open_with_recovery(backend.clone(), &rk, Some(hw))
+        .await
+        .unwrap();
+    assert_eq!(c.scan_prefix(b""), want);
+    // The pre-compaction mark is older: still accepted (a forward move).
+    assert!(
+        Container::open_with_recovery(backend, &rk, Some(before))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_runs_when_dead_bytes_dominate() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), policy(1000, 0.5, 2)).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    commit_keys(&mut b, (0..3u8).map(|i| (b"same".to_vec(), vec![i; 200]))).await;
+    let st = s.container_stats().await.unwrap();
+    assert!(st.dead_ratio() > 0.5, "{st:?}");
+    close(&mut b, h).await;
+    let st = s.container_stats().await.unwrap();
+    assert_eq!(st.segments, 1);
+    assert_eq!(st.dead_ratio(), 0.0);
+    let (mut b, _h) = open(&s, &relay, "B").await;
+    assert_eq!(
+        b.call(get(b"same")).await,
+        ResponseBody::Value(Some(vec![2; 200]))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_compaction_below_threshold() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), ServerConfig::default()).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    commit_keys(&mut b, distinct(3)).await;
+    let before = s.high_water().await.unwrap();
+    close(&mut b, h).await;
+    assert_eq!(s.container_stats().await.unwrap().segments, 3);
+    assert_eq!(s.high_water().await.unwrap(), before, "no new manifest");
+    // Default thresholds as documented.
+    let d = CompactionPolicy::default();
+    assert_eq!(d.max_segments, vault_server::COMPACT_MAX_SEGMENTS);
+    assert_eq!(vault_server::COMPACT_MAX_SEGMENTS, 64);
+    assert_eq!(d.max_dead_ratio, 0.5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_never_folds_another_sessions_pending_writes() {
+    let relay = relay().await;
+    let s = server(Auto::new(true), policy(2, 1.0, usize::MAX)).await;
+    let (mut a, ha) = open(&s, &relay, "A").await;
+    commit_keys(&mut a, distinct(3)).await;
+    // B replaces A and stages a write: A's end must not compact (B is active).
+    let (mut b, hb) = open(&s, &relay, "B").await;
+    assert_eq!(ended(ha).await, EndReason::Replaced);
+    assert_eq!(b.call(put(b"staged", b"x")).await, ResponseBody::Ok);
+    assert_eq!(s.container_stats().await.unwrap().segments, 3);
+    // B goes away without committing: its write is discarded, then compaction runs.
+    drop(b);
+    assert_eq!(ended(hb).await, EndReason::Disconnected);
+    assert_eq!(s.container_stats().await.unwrap().segments, 1);
+    let (mut c, _h) = open(&s, &relay, "C").await;
+    assert_eq!(c.call(get(b"staged")).await, ResponseBody::Value(None));
+    assert_eq!(
+        c.call(get(&[b'k', 2])).await,
+        ResponseBody::Value(Some(vec![2; 100]))
+    );
+}

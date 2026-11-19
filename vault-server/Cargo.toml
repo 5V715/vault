@@ -1,0 +1,42 @@
+[package]
+name = "vault-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Vault side of the vault protocol: relay mailbox, Noise responder, approval and request serving"
+
+[features]
+default = ["dev"]
+# The `vault-dev` laptop test vault (passphrase-sealed container directory, terminal
+# approver). Embedders (Android) build with `default-features = false`.
+dev = ["vault-container/cli", "dep:clap", "dep:rpassword", "dep:rand", "tokio/signal"]
+
+[[bin]]
+name = "vault-dev"
+path = "src/bin/vault-dev.rs"
+required-features = ["dev"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+rpassword = { version = "7", optional = true }
+rand = { version = "0.9", optional = true }
+vault-proto = { path = "../vault-proto" }
+vault-container = { path = "../vault-container", default-features = false }
+thiserror.workspace = true
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+# The public `rustls-tls-webpki-roots` feature enables tungstenite's rustls support; the
+# vault always passes its own `rustls::ClientConfig` (ring provider, webpki roots plus an
+# optional extra CA), so no default crypto provider and no OpenSSL are involved.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "1"
+tracing = "0.1"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }

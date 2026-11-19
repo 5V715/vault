@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fmt, clippy, test
+        shell: bash
+        run: |
+          set -eo pipefail
+          set -x
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build vault-proto for wasm
+        shell: bash
+        run: |
+          set -eo pipefail
+          set -x
+          rustup target add wasm32-unknown-unknown
+          # getrandom 0.2 (via snow's default resolver) gets its `js` feature from
+          # vault-proto's wasm32 target dependency, so no extra flags are needed.
+          cargo build -p vault-proto --target wasm32-unknown-unknown
