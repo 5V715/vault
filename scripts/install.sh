@@ -93,10 +93,26 @@ fi
 archive="vault-${version#v}-$target.tar.gz"
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/vault-install.XXXXXX")" || die "could not create a temporary directory"
-staged=""
+# Install state, for cleanup and rollback. Only the fixed binary names are ever split on
+# whitespace; every path is built from "$install_dir" and quoted.
+install_dir=""   # set once files are staged in the destination
+suffix=".vault-install.$$"
+backed=""        # binaries whose previous version was moved aside to .<b>.vault-old<suffix>
+placed=""        # binaries whose new version was renamed into place
+installed=0
 cleanup() {
   local b
-  for b in $staged; do rm -f "$b"; done
+  if [ -n "$install_dir" ]; then
+    if [ "$installed" != 1 ]; then
+      # Roll back: remove what this run placed, then put the previous versions back.
+      for b in $placed; do rm -f "$install_dir/$b"; done
+      for b in $backed; do
+        mv -f "$install_dir/.$b.vault-old$suffix" "$install_dir/$b" ||
+          echo "install.sh: error: could not restore $install_dir/$b from $install_dir/.$b.vault-old$suffix" >&2
+      done
+    fi
+    for b in $BINARIES; do rm -f "$install_dir/.$b$suffix"; done
+  fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -148,20 +164,37 @@ for b in $BINARIES; do
   [ -f "$tmp/x/$b" ] && [ ! -L "$tmp/x/$b" ] || die "$archive is missing $b; nothing was installed"
 done
 
-# 4. Install: stage every binary next to its destination, then rename each into place.
+# 4. Install, all or nothing: stage every binary next to its destination, move every
+#    previous version aside, rename every new one into place; on any failure the cleanup
+#    trap removes what was placed and restores the previous versions.
 mkdir -p "$dir" || die "could not create $dir"
 dir="$(cd "$dir" && pwd)"
 for b in $BINARIES; do
-  s="$dir/.$b.vault-install.$$"
-  staged="$staged $s"
-  if ! cp "$tmp/x/$b" "$s" || ! chmod 0755 "$s"; then
+  if [ -e "$dir/$b" ] && [ ! -f "$dir/$b" ]; then
+    die "$dir/$b exists and is not a regular file; nothing was installed"
+  fi
+done
+install_dir="$dir"
+for b in $BINARIES; do
+  if ! cp "$tmp/x/$b" "$dir/.$b$suffix" || ! chmod 0755 "$dir/.$b$suffix"; then
     die "could not write to $dir; nothing was installed"
   fi
 done
 for b in $BINARIES; do
-  mv -f "$dir/.$b.vault-install.$$" "$dir/$b" || die "could not install $dir/$b"
+  if [ -e "$dir/$b" ] || [ -L "$dir/$b" ]; then
+    mv -f "$dir/$b" "$dir/.$b.vault-old$suffix" || die "could not move $dir/$b aside; nothing was installed"
+    backed="$backed $b"
+  fi
 done
-staged=""
+for b in $BINARIES; do
+  if [ "${VAULT_INSTALL_TEST:-}" = 1 ] && [ "${VAULT_INSTALL_TEST_FAIL_RENAME:-}" = "$b" ]; then
+    die "could not install $dir/$b (test hook); the previous version was restored"
+  fi
+  mv -f "$dir/.$b$suffix" "$dir/$b" || die "could not install $dir/$b; the previous version was restored"
+  placed="$placed $b"
+done
+installed=1
+for b in $backed; do rm -f "$dir/.$b.vault-old$suffix"; done
 echo "installed $BINARIES ($version) to $dir"
 case ":$PATH:" in
   *":$dir:"*) ;;

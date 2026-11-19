@@ -190,6 +190,9 @@ $Archive = "vault-$($Version.Substring(1))-$Target.zip"
 
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ('vault-install-' + [guid]::NewGuid().ToString('N'))
 $Staged = @()
+$Backups = @()     # (destination, moved-aside previous version) pairs
+$Placed = @()      # destinations this run renamed a new binary into
+$Installed = $false
 New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
     $Dl = Join-Path $Tmp 'dl'
@@ -252,22 +255,61 @@ try {
         }
     }
 
-    # 4. Install: stage every binary next to its destination, then move each into place.
+    # 4. Install, all or nothing: stage every binary next to its destination, move every
+    #    previous version aside (a running .exe can usually be renamed, not overwritten),
+    #    rename every new one into place; on any failure `finally` removes what was placed
+    #    and restores the previous versions.
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-    $suffix = '.vault-install-' + [guid]::NewGuid().ToString('N')
     foreach ($b in $Binaries) {
-        $s = Join-Path $Dir ".$b$suffix"
+        $d = Join-Path $Dir $b
+        if ((Test-Path -LiteralPath $d) -and -not (Test-Path -LiteralPath $d -PathType Leaf)) {
+            Fail "$d exists and is not a regular file; nothing was installed"
+        }
+    }
+    $Suffix = '.vault-install-' + [guid]::NewGuid().ToString('N')
+    foreach ($b in $Binaries) {
+        $s = Join-Path $Dir ".$b$Suffix"
         $Staged += $s
         [IO.File]::Copy((Join-Path $X $b), $s, $false)
     }
     foreach ($b in $Binaries) {
-        $s = Join-Path $Dir ".$b$suffix"
         $d = Join-Path $Dir $b
-        if (Test-Path -LiteralPath $d) { [IO.File]::Replace($s, $d, [NullString]::Value) } else { [IO.File]::Move($s, $d) }
+        if (Test-Path -LiteralPath $d) {
+            $old = Join-Path $Dir ".$b.vault-old$Suffix"
+            try {
+                [IO.File]::Move($d, $old)
+            } catch {
+                Fail "could not move $d aside ($($_.Exception.Message)); if it is running, stop it and retry. Nothing was installed"
+            }
+            $Backups += , @($d, $old)
+        }
     }
+    foreach ($b in $Binaries) {
+        $d = Join-Path $Dir $b
+        if ($env:VAULT_INSTALL_TEST -ceq '1' -and $env:VAULT_INSTALL_TEST_FAIL_RENAME -and "$($env:VAULT_INSTALL_TEST_FAIL_RENAME).exe" -ceq $b) {
+            Fail "could not install $d (test hook); the previous version was restored"
+        }
+        [IO.File]::Move((Join-Path $Dir ".$b$Suffix"), $d)
+        $Placed += $d
+    }
+    $Installed = $true
     $Staged = @()
+    foreach ($pair in $Backups) {
+        try { [IO.File]::Delete($pair[1]) } catch {
+            Write-Host "note: the previous $($pair[0]) is still running; delete $($pair[1]) once it has exited"
+        }
+    }
     Write-Host "installed $($Binaries -join ' ') ($Version) to $Dir"
 } finally {
+    if (-not $Installed) {
+        # Roll back: remove what this run placed, then put the previous versions back.
+        foreach ($p in $Placed) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
+        foreach ($pair in $Backups) {
+            try { [IO.File]::Move($pair[1], $pair[0]) } catch {
+                Write-Host "install.ps1: error: could not restore $($pair[0]) from $($pair[1])"
+            }
+        }
+    }
     foreach ($s in $Staged) { Remove-Item -LiteralPath $s -Force -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

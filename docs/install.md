@@ -72,8 +72,15 @@ nothing installed:
    SHA-256 must match.
 6. Only then do they extract it, still in the temporary directory, and check that the
    three binaries are there.
-7. They copy each binary next to its destination under a temporary name and then rename
-   it into place, so a failed run leaves an earlier install untouched.
+7. They install all three binaries or none. Each new binary is first copied next to its
+   destination under a temporary name. Then every previous version is moved aside, and
+   only then is every new one renamed into place. If any step fails, the binaries that
+   were placed are removed and the previous versions are moved back, so a failed run
+   leaves an earlier install as it was. A destination that exists but is not a regular
+   file is refused. On Windows, a running `.exe` can usually be moved aside. If it
+   cannot, the install stops before replacing anything and asks you to stop the tool
+   and retry. If an old copy is still running after a successful install, it is left
+   next to the new one under a `.vault-old` name for you to delete.
 
 The temporary directory is removed on every exit path.
 
