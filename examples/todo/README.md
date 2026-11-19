@@ -31,18 +31,20 @@ Build vault-web first (it needs the `wasm32-unknown-unknown` target and
 
 ```sh
 (cd vault-web/js && npm ci && npm run build && npm run build:wasm)
-cargo build --bin vault-relay --bin vault-dev --bin vaultctl
+cargo build --release --bin vault-relay --bin vault-dev --bin vaultctl
 (cd examples/todo && npm ci)
 ```
 
-Then:
+The binaries are then in `target/release/`; run the commands below from the
+repository root, or install prebuilt signed binaries instead (`docs/install.md`)
+and drop the `target/release/` prefix. Then:
 
-1. `cd examples/todo && npm run serve` builds a development build (relay
+1. `npm --prefix examples/todo run serve` (in its own terminal) builds a development build (relay
    `http://127.0.0.1:8787`) and serves it at `http://localhost:8080`.
-2. `vault-relay --listen 127.0.0.1:8787 --allow-origin http://localhost:8080`
-3. `vaultctl --dir <d> init --app vault-todo --origin http://localhost:8080`
+2. `target/release/vault-relay --listen 127.0.0.1:8787 --allow-origin http://localhost:8080`
+3. `target/release/vaultctl --dir <d> init --app vault-todo --origin http://localhost:8080`
 4. Open `http://localhost:8080`, click "Connect to vault" and then "Copy pairing
-   text". Run `vault-dev serve --dir <d> --pair "<text>"`, answer `y <n>` if the
+   text". Run `target/release/vault-dev serve --dir <d> --pair "<text>"`, answer `y <n>` if the
    codes match, and click **Codes match**.
 
 Open the page as `localhost`, not `127.0.0.1`. The vault and the relay are bound
@@ -64,7 +66,9 @@ and no clipboard access; you pair it by scanning the QR with your vault.
   - `X-Content-Type-Options: nosniff`
   - It serves regular files of known types only. There are no directory
     listings, no dot-files, no symlinks, and no paths outside `dist`.
-  - Any other host must send the same CSP header.
+  - Any other host should send the same CSP header. `index.html` also carries it
+    as a `<meta>` (filled in by build.mjs), but a meta policy cannot enforce
+    `frame-ancestors`.
 
 All DOM writes use `createElement` and `textContent`, never `innerHTML`.
 `test/sinks.test.mjs` and a CI grep enforce this.

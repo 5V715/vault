@@ -177,8 +177,14 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          if git grep -n 'innerHTML' -- vault-web/js examples/todo/src; then
+          # git grep: 0 = found, 1 = no match (pass), anything else = error (fail).
+          rc=0
+          git grep -n 'innerHTML' -- vault-web/js examples/todo/src || rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "innerHTML found (use textContent/createElement)" >&2
+            exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "git grep failed (exit $rc)" >&2
             exit 1
           fi
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
