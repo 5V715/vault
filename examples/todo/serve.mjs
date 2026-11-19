@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 // A tiny static server for the built page (Node built-ins only), for local runs:
 //   node serve.mjs [--dir dist] [--port 8080] [--host 127.0.0.1] [--relay <origin>]
-// Every response carries the page's CSP (connect-src = the relay origin the
-// build was made for, from dist/.build.json, or --relay) and nosniff. Only
+// Every response carries the page's CSP (connect-src = the ws:/wss: form of the
+// relay origin the build was made for, from dist/.build.json, or --relay) and nosniff. Only
 // regular files with a known type under the directory are served: no listings,
 // no dot-files, no symlinks, nothing outside it.
 
@@ -42,9 +42,23 @@ export function checkRelayOrigin(value) {
   return u.origin;
 }
 
-/** The page's Content-Security-Policy for a relay at `relayOrigin`. */
-export function cspFor(relayOrigin) {
+/**
+ * The WebSocket origin the page dials for a relay at `relayOrigin` (vault-client
+ * maps https to wss and http to ws, same host and port; `mailbox_url`).
+ */
+export function relayWsOrigin(relayOrigin) {
   const relay = checkRelayOrigin(relayOrigin);
+  return relay.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
+}
+
+/**
+ * The page's Content-Security-Policy for a relay at `relayOrigin`. connect-src
+ * lists the relay's ws:/wss: origin: browsers check the WebSocket URL itself, and
+ * an http(s) source does not match it (Chrome blocks the dial). Nothing else is
+ * fetched (the wasm is bundled), so the http(s) form is not listed.
+ */
+export function cspFor(relayOrigin) {
+  const relay = relayWsOrigin(relayOrigin);
   return [
     "default-src 'none'",
     "script-src 'self' 'wasm-unsafe-eval'",
@@ -55,6 +69,18 @@ export function cspFor(relayOrigin) {
     "form-action 'none'",
     "frame-ancestors 'none'",
   ].join("; ");
+}
+
+/**
+ * The same policy for index.html's <meta>, without frame-ancestors: a meta
+ * policy cannot carry it, and Chrome logs an error if it is there. The header
+ * (serve.mjs, or your host) is what enforces frame-ancestors.
+ */
+export function metaCspFor(relayOrigin) {
+  return cspFor(relayOrigin)
+    .split("; ")
+    .filter((d) => !d.startsWith("frame-ancestors "))
+    .join("; ");
 }
 
 const TYPES = {

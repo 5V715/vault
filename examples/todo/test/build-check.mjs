@@ -11,7 +11,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { build, parseArgs } from "../build.mjs";
-import { cspFor } from "../serve.mjs";
+import { cspFor, metaCspFor } from "../serve.mjs";
 
 const pkgWeb = resolve(dirname(fileURLToPath(import.meta.url)), "../node_modules/vault-web/pkg/web/vault_web_bg.wasm");
 
@@ -52,10 +52,16 @@ async function main() {
     const html = readFileSync(join(rel, "index.html"), "utf8");
     const meta = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]*)">/);
     assert.ok(meta, "a CSP meta tag");
-    assert.equal(meta[1], cspFor("https://relay.example"), "the meta CSP matches the served header");
+    assert.equal(meta[1], metaCspFor("https://relay.example"), "the meta CSP is the header's");
+    assert.equal(
+      `${meta[1]}; frame-ancestors 'none'`,
+      cspFor("https://relay.example"),
+      "the meta CSP is the served header minus frame-ancestors",
+    );
+    assert.ok(meta[1].includes("connect-src wss://relay.example;"));
     assert.ok(!html.includes("__CSP__"));
     const devHtml = readFileSync(join(dev, "index.html"), "utf8");
-    assert.ok(devHtml.includes("connect-src http://127.0.0.1:8787;"));
+    assert.ok(devHtml.includes("connect-src ws://127.0.0.1:8787;"));
     assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(html), "no inline script");
     assert.ok(!/<style\b|\sstyle=|\son[a-z]+=/i.test(html), "no inline style or handlers");
     console.log(`build-check: ok (release main.js ${relJs.length} bytes, dev ${devJs.length} bytes)`);

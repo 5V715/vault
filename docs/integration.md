@@ -107,6 +107,12 @@ match the flags above.
 Either way, pass the relay's public `https://` origin to `pair` as
 `relay_origin` (section 3).
 
+If your page has a Content-Security-Policy, its `connect-src` must list the
+relay's WebSocket origin. That is `wss://relay.example` for `https://relay.example`,
+or `ws://127.0.0.1:8787` for a loopback `http://` relay. Browsers check the
+`wss:`/`ws:` URL itself, and an `https:` source does not match it: Chrome blocks
+the dial. `examples/todo` shows a complete policy.
+
 ## 3. Pair
 
 ```rust

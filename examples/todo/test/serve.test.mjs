@@ -14,7 +14,7 @@ import { checkRelayOrigin, cspFor, createStaticServer } from "../serve.mjs";
 const RELAY = "http://127.0.0.1:8787";
 const CSP =
   "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; " +
-  "connect-src http://127.0.0.1:8787; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  "connect-src ws://127.0.0.1:8787; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const SECRET = "TOP SECRET OUTSIDE ROOT";
 
 const ctx = {};
@@ -59,6 +59,16 @@ function get(path, method = "GET") {
 describe("relay origin and CSP", () => {
   test("the CSP is exactly the one in the plan", () => {
     assert.equal(cspFor(RELAY), CSP);
+  });
+
+  test("connect-src is the relay's WebSocket origin (http -> ws, https -> wss)", () => {
+    const connect = (relay) => cspFor(relay).match(/connect-src ([^;]+);/)[1];
+    assert.equal(connect("http://127.0.0.1:8787"), "ws://127.0.0.1:8787");
+    assert.equal(connect("http://localhost:8787/"), "ws://localhost:8787");
+    assert.equal(connect("http://[::1]:9000"), "ws://[::1]:9000");
+    assert.equal(connect("https://relay.example"), "wss://relay.example");
+    assert.equal(connect("https://relay.example:8443"), "wss://relay.example:8443");
+    assert.equal(connect("HTTPS://Relay.Example:443"), "wss://relay.example");
   });
 
   test("checkRelayOrigin accepts origins only", () => {

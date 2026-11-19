@@ -19,7 +19,9 @@
   - `on_activate`-equivalent work is read-only;
   - closing discards pending edits;
   - the origin comes from `location.origin` in browsers.
-- The page CSP is exactly: `default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src <relay origin>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`. All DOM writes use `textContent` or `createElement` only, never `innerHTML`.
+- The page CSP is exactly: `default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src <relay WebSocket origin>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
+  - Correction (final review, 2026-11-20): this line first said `connect-src <relay origin>`, meaning the http(s) origin. That was wrong. vault-client dials `ws://`/`wss://` (http→ws, https→wss, same host and port), and Chrome blocks the WebSocket when connect-src lists only the http(s) form. connect-src is therefore the relay's ws:/wss: origin. The http(s) form is not listed, since nothing fetches over HTTP: the wasm is bundled.
+  - The `<meta>` copy of the policy in index.html omits `frame-ancestors`, which a meta policy cannot carry. All DOM writes use `textContent` or `createElement` only, never `innerHTML`.
 - App id is `vault-todo`. Keys are `todo/<32 hex>` with JSON values `{"text":string≤500 chars,"done":bool,"created":number}`. Commits are debounced by 500 ms.
 - The "copy pairing text" button exists only in `--dev` builds and carries a visible warning.
 - Gates: `cargo fmt --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace --locked`, `cargo build -p vault-web --target wasm32-unknown-unknown` (CI), `npm ci && npm test` in `vault-web/js` and `examples/todo`.

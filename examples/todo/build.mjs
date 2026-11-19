@@ -15,7 +15,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
 
-import { checkRelayOrigin, cspFor } from "./serve.mjs";
+import { checkRelayOrigin, metaCspFor } from "./serve.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -54,11 +54,11 @@ export async function build({ relay, dev, out }) {
     legalComments: "none",
     logLevel: "warning",
   });
-  // The same CSP as a <meta> too, for hosts that do not send the header (a
-  // meta policy cannot enforce frame-ancestors: send the header where you can).
+  // The same CSP as a <meta> too, for hosts that do not send the header, minus
+  // frame-ancestors (a meta policy cannot carry it): send the header where you can.
   const html = readFileSync(join(here, "index.html"), "utf8");
   if (html.split("__CSP__").length !== 2) throw new Error("index.html must have exactly one __CSP__ placeholder");
-  writeFileSync(join(out, "index.html"), html.replace("__CSP__", cspFor(relay)));
+  writeFileSync(join(out, "index.html"), html.replace("__CSP__", metaCspFor(relay)));
   copyFileSync(join(here, "styles.css"), join(out, "styles.css"));
   writeFileSync(join(out, ".build.json"), `${JSON.stringify({ relayOrigin: relay, dev }, null, 2)}\n`);
 }
