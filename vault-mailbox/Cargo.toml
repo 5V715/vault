@@ -38,6 +38,10 @@ name = "mailbox"
 required-features = ["server"]
 
 [[test]]
+name = "logging"
+required-features = ["server"]
+
+[[test]]
 name = "relay_cli"
 required-features = ["bin"]
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -331,49 +331,6 @@ async fn total_limit() {
         .err()
         .unwrap();
     assert_eq!(http_status(e), 429);
-}
-
-#[derive(Clone, Default)]
-struct Buf(Arc<Mutex<Vec<u8>>>);
-impl std::io::Write for Buf {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-    type Writer = Buf;
-    fn make_writer(&'a self) -> Buf {
-        self.clone()
-    }
-}
-
-// Single-threaded runtime so the thread-local subscriber sees relay tasks too.
-#[tokio::test]
-async fn no_payload_logging() {
-    let buf = Buf::default();
-    let sub = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .with_writer(buf.clone())
-        .finish();
-    let _g = tracing::subscriber::set_default(sub);
-    let r = start(cfg()).await;
-    let mut a = join(&r, ID).await.unwrap();
-    let mut b = join(&r, ID).await.unwrap();
-    a.send(bin(b"SECRET-PAYLOAD-0xdeadbeef")).await.unwrap();
-    assert_eq!(next_bin(&mut b).await, b"SECRET-PAYLOAD-0xdeadbeef");
-    a.close(None).await.unwrap();
-    let _ = close_code(&mut b, Duration::from_secs(3)).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let logs = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
-    assert!(logs.contains("mailbox"), "capture works: {logs}");
-    assert!(!logs.contains("SECRET-PAYLOAD"));
-    assert!(!logs.contains(&format!("{:?}", b"SECRET-PAYLOAD-0xdeadbeef")));
-    assert!(!logs.contains(ID), "full mailbox id must not be logged");
 }
 
 #[tokio::test]
