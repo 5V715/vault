@@ -76,6 +76,7 @@ release() {
 # fake <name>: a fresh fake GitHub with v1.2.3 and v1.3.0 (latest).
 fake() {
   local f="$tmp/$1/gh"
+  [ ! -e "$tmp/$1" ] || return 1
   release "$f" v1.2.3
   release "$f" v1.3.0
   echo v1.3.0 > "$f/latest"
@@ -90,6 +91,7 @@ fake() {
 run() {
   local name="$1" f="$2" mode=() extra="${extra:-}"
   shift 2
+  [ -n "$f" ] && [ -s "$f/latest" ] || { echo "FAIL fixture for '$name' was not created"; exit 1; }
   home="$tmp/$name/home"
   scratch="$tmp/$name/scratch"
   log="$tmp/$name/gh.log"
@@ -182,16 +184,16 @@ install_rejects_tampered_archive() {
 
 install_rejects_foreign_signature() {
   local f r
-  f="$(fake foreign)"
+  f="$(fake foreignsig)"
   r="$f/releases/v1.3.0"
   # An attacker swaps the archive, rewrites SHA256SUMS to match and signs with their key.
   make_archive "$r/vault-1.3.0-$host.tar.gz" 6.6.6 "$host"
   sums "$r"
   sign "$r" "$tmp/foreign"
-  run foreign "$f" --dir "$tmp/foreign/dest"
+  run foreignsig "$f" --dir "$tmp/foreignsig/dest"
   check "fails" failed
   check "says the signature check failed" says "signature check failed"
-  check "installs nothing" absent_or_empty "$tmp/foreign/dest"
+  check "installs nothing" absent_or_empty "$tmp/foreignsig/dest"
   check "never downloads the archive" bash -c "! grep -q 'vault-1.3.0-$host' '$log'"
 
   # A signature for another namespace (e.g. an ordinary SSH signature) is not accepted.

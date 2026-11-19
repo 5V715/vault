@@ -90,6 +90,10 @@ def main():
             if not latest.is_file():
                 die("release not found")
             tag = latest.read_text().strip()
+            if jq == [".tagName"]:
+                # Whatever the "server" calls latest, even a malformed tag.
+                print(tag)
+                return
         d = release_dir(tag)
         data = {
             "tagName": tag,
