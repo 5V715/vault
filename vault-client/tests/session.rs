@@ -277,6 +277,28 @@ fn confirm_before_code_shown_is_refused() {
 }
 
 #[test]
+fn cancel_during_pairing_closes_denied() {
+    let mut v = venv();
+    let seen = Seen::default();
+    let cb = seen.callbacks(Rc::new(|_| {}));
+    let c = v.start(cb, PING_INTERVAL_MS);
+    // Nobody scans: the QR is shown and the session waits for a vault.
+    settle(&mut v, 200);
+    assert_eq!(c.state(), SessionState::Pairing);
+    c.cancel_pairing().unwrap();
+    // Takes effect now, not when the offer expires (60 s).
+    let s = seen.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("closed", move || s.closed().is_some()),
+    );
+    assert_eq!(seen.closed(), Some(CloseReason::Denied));
+    assert!(!seen.has(&SessionState::AwaitingApproval));
+    assert!(c.cancel_pairing().is_err(), "closed: nothing to cancel");
+}
+
+#[test]
 fn cancel_aborts_with_denied() {
     for vault_approved_first in [true, false] {
         let mut v = venv();

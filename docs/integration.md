@@ -152,7 +152,7 @@ that uses the store.
 
 | State | Show |
 |---|---|
-| `Pairing` | The QR code (from `on_offer`) and a short line: "Scan with your vault". Offer expires after 60 s. |
+| `Pairing` | The QR code (from `on_offer`) and a short line: "Scan with your vault". Offer expires after 60 s. A **Cancel** here (`cancel_pairing`) closes the session as `Denied` at once. |
 | `AwaitingApproval` | The code (from `on_sas`) large, "Compare it with the code on your phone", buttons **Codes match** (`confirm_sas`) and **Cancel** (`cancel_pairing`). |
 | `Active` | The app. This is the only state in which it may read, write or act on vault data. |
 | `Closed(reason)` | Say why (table below) and offer to pair again with a new session. |

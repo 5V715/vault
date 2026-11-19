@@ -138,13 +138,21 @@ impl Signal {
     }
 }
 
-/// Race `fut` against `stop`; `None` if stopped first.
-async fn unless_stopped<T>(fut: impl Future<Output = T>, stop: &Signal) -> Option<T> {
-    let w = stop.wait();
-    pin_mut!(fut, w);
-    match select(fut, w).await {
-        Either::Left((v, _)) => Some(v),
-        Either::Right(_) => None,
+/// Race `fut` against `stop` (`lock()`) and `cancel` (`cancel_pairing()`);
+/// `Err` with the close reason if either fires first.
+async fn unless_ended<T>(
+    fut: impl Future<Output = T>,
+    stop: &Signal,
+    cancel: &Signal,
+) -> Result<T, CloseReason> {
+    let s = stop.wait().fuse();
+    let c = cancel.wait().fuse();
+    let fut = fut.fuse();
+    pin_mut!(fut, s, c);
+    futures::select_biased! {
+        () = c => Err(CloseReason::Denied),
+        () = s => Err(CloseReason::Cancelled),
+        v = fut => Ok(v),
     }
 }
 
@@ -365,14 +373,13 @@ impl VaultSession {
     /// backend is dropped, `on_deactivate` runs and `Active` is never reported.
     /// No store request is sent before both approvals; while `on_activate` runs
     /// the host's own requests (even a commit) may already have reached the
-    /// vault, so keep that hook read-only. Idempotent while
+    /// vault, so keep that hook read-only. Also works while the QR is still
+    /// shown (`Pairing`): the mailbox wait or handshake is abandoned at once
+    /// and the session closes as `Denied`. Idempotent while
     /// pending. Once `Active` (or `Closed`) it changes nothing and returns an
     /// error: [`Self::lock`] ends an active session.
     pub fn cancel_pairing(&self) -> Result<(), ClientError> {
         let check = &self.shared.sas_check;
-        if check.cancelled.get() {
-            return Ok(());
-        }
         match &*self.shared.state.borrow() {
             SessionState::Active => return Err(perr("session is active; use lock")),
             SessionState::Closed(_) => return Err(perr("no pairing in progress")),
@@ -426,22 +433,23 @@ impl<F: MailboxFactory, C: Clock> Run<F, C> {
 
     async fn run(&self, keys: PairKeys, url: String, device: &str) -> CloseReason {
         let stop = &self.shared.stop;
-        let transport = match unless_stopped(self.factory.open_mailbox(&url), stop).await {
-            None => return CloseReason::Cancelled,
-            Some(Err(e)) => return CloseReason::RelayUnreachable(e.to_string()),
-            Some(Ok(t)) => t,
+        let cancel = &self.shared.sas_check.cancelled_sig;
+        let transport = match unless_ended(self.factory.open_mailbox(&url), stop, cancel).await {
+            Err(r) => return r,
+            Ok(Err(e)) => return CloseReason::RelayUnreachable(e.to_string()),
+            Ok(Ok(t)) => t,
         };
         let hs = rpc::handshake(&transport, keys, self.clock.sleep(PAIR_WAIT_MS));
-        let noise = match unless_stopped(hs, stop).await {
-            None => {
+        let noise = match unless_ended(hs, stop, cancel).await {
+            Err(r) => {
                 transport.close();
-                return CloseReason::Cancelled;
+                return r;
             }
-            Some(Err(e)) => {
+            Ok(Err(e)) => {
                 transport.close();
                 return CloseReason::PairingFailed(e.to_string());
             }
-            Some(Ok(n)) => n,
+            Ok(Ok(n)) => n,
         };
         let rpc = Rc::new(Rpc::new(Box::new(transport), noise));
         (self.cb.on_sas)(&rpc.sas());
