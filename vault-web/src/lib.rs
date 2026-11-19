@@ -254,7 +254,11 @@ impl Session {
         };
         future_to_promise(async move {
             match b.get(&k).await.map_err(client_error)? {
-                Some(v) => Ok(Uint8Array::from(&v[..]).into()),
+                Some(v) => {
+                    // Wiped once copied out to JS (the Uint8Array is the caller's copy).
+                    let v = Zeroizing::new(v);
+                    Ok(Uint8Array::from(&v[..]).into())
+                }
                 None => Ok(JsValue::UNDEFINED),
             }
         })
@@ -299,11 +303,13 @@ impl Session {
             let entries = b.scan_prefix(&p).await.map_err(client_error)?;
             let out = Array::new();
             for (k, v) in entries {
-                let Ok(k) = String::from_utf8(k) else {
+                // Wiped once copied out to JS (the strings and Uint8Arrays are the caller's).
+                let (k, v) = (Zeroizing::new(k), Zeroizing::new(v));
+                let Ok(k) = std::str::from_utf8(&k) else {
                     continue;
                 };
                 let e = Object::new();
-                set(&e, "key", &JsValue::from_str(&k));
+                set(&e, "key", &JsValue::from_str(k));
                 set(&e, "value", &Uint8Array::from(&v[..]).into());
                 out.push(&e);
             }
