@@ -11,6 +11,9 @@ Crates:
   (compiles for `wasm32-unknown-unknown`).
 - `vault-server`: the vault side of the protocol (mailbox dial, Noise responder,
   approval, request serving) and the `vault-dev` laptop test vault.
+- `vault-mailbox`: the relay mailbox (`Mailboxes::handle` pairs two WebSocket clients
+  and pipes Noise frames) and the `vault-relay` binary; `Dockerfile.relay` builds a
+  scratch image of it.
 
 Docs: `docs/vault/README.md` (container and CLI), `docs/protocol/vault.md` (wire
 protocol), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from).
@@ -24,8 +27,7 @@ cargo build -p vault-container --release --bin vaultctl
 
 The label strings, the QR prefix `signal-web-pair:v1:` and the recovery prefix
 `signal-web-recovery:v1:` are still the ones inherited from the original code and are
-scheduled for rename. The relay-dependent integration tests of `vault-server` are
-parked in `vault-server/tests-pending/` until the relay mailbox crate lands here.
+scheduled for rename.
 
 ## Origin
 

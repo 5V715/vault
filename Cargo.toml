@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["vault-container", "vault-proto", "vault-server"]
+members = ["vault-container", "vault-proto", "vault-server", "vault-mailbox"]
 
 [workspace.package]
 edition = "2024"

@@ -7,17 +7,18 @@ Counts are from `cargo test -p <crate> -- --list` in both repositories (unit, in
 |---|---|---|---|
 | container -> vault-container | 147 | 147 | 0 |
 | vault-proto -> vault-proto | 23 | 23 | 0 |
-| vault-server -> vault-server | 37 | 7 | 30 |
+| vault-server -> vault-server | 37 | 37 | 0 |
+| relay (mailbox tests only) -> vault-mailbox | 17 | 18 | 0 |
 
 Test binaries: `unittests src/...` are the unit tests inside the crate, `tests/*.rs` are integration test files, `doc` are doc tests. Doc-test paths are shown as in signal-web (`container/src/...` is `vault-container/src/...` here).
 
-## Parked
+## Relay mailbox tests
 
-The tests of `vault-server/tests/session.rs` and `vault-server/tests/vault_dev.rs` start an in-process
-signal-web `relay` server, which does not exist in this repository yet. They are copied verbatim (apart from the
-`container` -> `vault_container` rename and the MIT header) to `vault-server/tests-pending/`, which cargo
-does not build. Task 2 (`vault-mailbox`) retargets them at `vault-relay` and moves them back to
-`vault-server/tests/`; their rows say `parked` until then.
+`relay/tests/mailbox.rs` (17 tests) moved to `vault-mailbox/tests/mailbox.rs`, retargeted at an in-process
+`vault_mailbox::serve`. Two tests that exercised the tunnel are retargeted at mailbox-only limits:
+`limits_shared_with_tunnel` -> `per_ip_limit`, `total_limit_shared` -> `total_limit`. One test is new
+(`serves_only_healthz_and_mailbox`). The vault-server integration tests (`tests/session.rs`, `tests/vault_dev.rs`)
+now start the same in-process relay instead of signal-web's `relay`; their assertions are unchanged.
 
 ## Tests
 
@@ -200,33 +201,51 @@ does not build. Task 2 (`vault-mailbox`) retargets them at `vault-relay` and mov
 | `approver::tests::stale_and_mismatched_lines_are_ignored` | `unittests src/lib.rs` | `vault-server` | `vault-server` |
 | `transport::tests::extra_ca_must_parse` | `unittests src/lib.rs` | `vault-server` | `vault-server` |
 | `transport::tests::mailbox_urls` | `unittests src/lib.rs` | `vault-server` | `vault-server` |
-| `approval_timeout_closes` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `approval_timeout_starts_when_prompt_is_shown` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `approvals_are_serialized_and_bound_to_the_shown_sas` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `at_most_two_sessions_await_approval` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `commit_failure_reported_as_error` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `compaction_never_folds_another_sessions_pending_writes` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `compaction_runs_after_session_when_threshold_crossed` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `compaction_runs_when_dead_bytes_dominate` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `crud_commit_roundtrip` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `denied_approval_closes` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `handshake_with_wrong_browser_key_fails` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `idle_timeout_ends_session` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `large_value_chunked_roundtrip` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `lock_ends_session` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `lock_ends_session_awaiting_approval` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `malformed_message_closes_session` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `no_compaction_below_threshold` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `panic_in_request_still_cleans_up` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `ping_is_answered_in_every_state` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `requests_before_approval_refused` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `second_session_terminates_first` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `timeout_ends_session` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `uncommitted_writes_discarded_when_session_ends` | `tests/session.rs` | `vault-server` | parked: `vault-server/tests-pending/session.rs` |
-| `approve_persists_put_and_commit` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
-| `bad_offer_and_unreachable_relay_exit_nonzero` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
-| `ctrl_c_saves_high_water` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
-| `deny_and_eof_end_session_without_persisting` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
-| `mailbox_taken_warns_not_to_confirm_the_browser` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
-| `many_commits_are_compacted_at_exit_and_high_water_saved` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
-| `wrong_passphrase_exits_nonzero_without_dialing` | `tests/vault_dev.rs` | `vault-server` | parked: `vault-server/tests-pending/vault_dev.rs` |
+| `approval_timeout_closes` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `approval_timeout_starts_when_prompt_is_shown` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `approvals_are_serialized_and_bound_to_the_shown_sas` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `at_most_two_sessions_await_approval` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `commit_failure_reported_as_error` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `compaction_never_folds_another_sessions_pending_writes` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `compaction_runs_after_session_when_threshold_crossed` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `compaction_runs_when_dead_bytes_dominate` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `crud_commit_roundtrip` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `denied_approval_closes` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `handshake_with_wrong_browser_key_fails` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `idle_timeout_ends_session` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `large_value_chunked_roundtrip` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `lock_ends_session` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `lock_ends_session_awaiting_approval` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `malformed_message_closes_session` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `no_compaction_below_threshold` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `panic_in_request_still_cleans_up` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `ping_is_answered_in_every_state` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `requests_before_approval_refused` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `second_session_terminates_first` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `timeout_ends_session` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `uncommitted_writes_discarded_when_session_ends` | `tests/session.rs` | `vault-server` | `vault-server` |
+| `approve_persists_put_and_commit` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `bad_offer_and_unreachable_relay_exit_nonzero` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `ctrl_c_saves_high_water` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `deny_and_eof_end_session_without_persisting` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `mailbox_taken_warns_not_to_confirm_the_browser` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `many_commits_are_compacted_at_exit_and_high_water_saved` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `wrong_passphrase_exits_nonzero_without_dialing` | `tests/vault_dev.rs` | `vault-server` | `vault-server` |
+| `bad_id_rejected` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `close_propagates` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `first_may_send_before_peer_arrives` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `id_is_free_again_after_both_ended` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `no_payload_logging` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `origin_rules_for_mailbox` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `oversize_frame_closes_pair` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `pairs_two_and_pipes_both_ways` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `per_ip_limit` | `tests/mailbox.rs` | `relay` (was `limits_shared_with_tunnel`) | `vault-mailbox` |
+| `serves_only_healthz_and_mailbox` | `tests/mailbox.rs` | new | `vault-mailbox` |
+| `shutdown_closes_mailboxes_1001` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `slow_peer_backpressure_bounded` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `text_frames_rejected` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `third_connection_rejected` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `total_limit` | `tests/mailbox.rs` | `relay` (was `total_limit_shared`) | `vault-mailbox` |
+| `unpaired_expires_after_60s` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `waiting_client_close_is_echoed` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `waiting_mailboxes_capped` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |

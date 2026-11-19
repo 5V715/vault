@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vault_container::Result as CResult;
-use vault_container::backend::{ContainerBackend, Etag, MemoryBackend, PutOutcome};
-use vault_container::engine::Container;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
+use vault_container::Result as CResult;
+use vault_container::backend::{ContainerBackend, Etag, MemoryBackend, PutOutcome};
+use vault_container::engine::Container;
 use vault_proto::msg::VaultMessage;
 use vault_proto::noise::{PairKeys, Session};
 use vault_proto::{
@@ -38,11 +38,8 @@ async fn relay() -> Relay {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let (tx, rx) = oneshot::channel::<()>();
-    let cfg = relay::Config {
-        static_dir: std::env::temp_dir(),
-        ..relay::Config::default()
-    };
-    tokio::spawn(relay::serve(l, Arc::new(cfg), async move {
+    let mailboxes = vault_mailbox::Mailboxes::new(vault_mailbox::MailboxConfig::default());
+    tokio::spawn(vault_mailbox::serve(l, mailboxes, async move {
         let _ = rx.await;
     }));
     Relay { addr, _stop: tx }

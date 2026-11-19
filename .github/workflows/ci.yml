@@ -21,8 +21,8 @@ jobs:
           set -eo pipefail
           set -x
           cargo fmt --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
 
   wasm:
     runs-on: ubuntu-latest
@@ -36,4 +36,43 @@ jobs:
           rustup target add wasm32-unknown-unknown
           # getrandom 0.2 (via snow's default resolver) gets its `js` feature from
           # vault-proto's wasm32 target dependency, so no extra flags are needed.
-          cargo build -p vault-proto --target wasm32-unknown-unknown
+          cargo build -p vault-proto --locked --target wasm32-unknown-unknown
+
+  # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
+  # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN
+  # runs on the host, the final stage is scratch). Nothing is pushed.
+  relay-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: build and run image
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p logs
+          {
+            set -ex
+            docker buildx build -f Dockerfile.relay --platform linux/amd64 --load -t vault-relay:smoke .
+            docker image inspect vault-relay:smoke --format '{{.Config.User}} {{.Config.Entrypoint}} {{json .Config.Labels}}'
+            docker run -d --name smoke -p 8080:8080 vault-relay:smoke
+            sleep 2
+            docker logs smoke
+            test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)" = 200
+            test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = 404
+            docker rm -f smoke
+          } 2>&1 | tee logs/relay-image.log
+      - name: cross-build arm64 and arm/v7
+        shell: bash
+        run: |
+          set -eo pipefail
+          {
+            set -ex
+            docker buildx build -f Dockerfile.relay --progress=plain --platform linux/arm64,linux/arm/v7 --output type=cacheonly .
+          } 2>&1 | tee -a logs/relay-image.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-relay-image
+          path: logs/relay-image.log

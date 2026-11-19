@@ -1,0 +1,37 @@
+[package]
+name = "vault-mailbox"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Relay mailbox for the vault protocol: pairs two WebSocket clients and pipes binary frames, plus the vault-relay binary"
+
+[features]
+default = ["bin"]
+# `serve`: a small hyper accept loop (`GET /mailbox/<id>`, `GET /healthz`) used by
+# `vault-relay` and by tests. Embedders that mount `Mailboxes::handle` in their own
+# server build with `default-features = false`.
+server = ["tokio/net"]
+bin = ["server", "dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
+
+[[bin]]
+name = "vault-relay"
+path = "src/bin/vault-relay.rs"
+required-features = ["bin"]
+
+[dependencies]
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }

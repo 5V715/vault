@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: MIT
+#
+# vault-relay (the vault mailbox relay), multi-arch:
+#   linux/amd64, linux/arm64, linux/arm/v7
+# This is a reduced matrix by design; signal-web's own image keeps the full one.
+#
+#   docker buildx build -f Dockerfile.relay --platform linux/arm64,linux/arm/v7 -t IMAGE .
+#
+# Every RUN stage executes on the build host ($BUILDPLATFORM); the binary is
+# cross-compiled to a static musl binary with cargo-zigbuild (zig as the cross
+# linker; no per-target C toolchains, no QEMU). The final stage is `scratch`,
+# which contains no shell, so it needs no emulation either.
+
+ARG RUST_IMAGE=rust:1-bookworm
+ARG CARGO_ZIGBUILD_VERSION=0.24.1
+ARG ZIGLANG_VERSION=0.16.0
+
+# ---- toolchain: rust + zig + cargo-zigbuild, sources limited to vault-mailbox
+FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS toolchain
+ARG CARGO_ZIGBUILD_VERSION
+ARG ZIGLANG_VERSION
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Distro packages track bookworm security updates (not pinned); the build tools are pinned above.
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-venv file \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/zig \
+ && /opt/zig/bin/pip install --no-cache-dir "cargo-zigbuild==${CARGO_ZIGBUILD_VERSION}" "ziglang==${ZIGLANG_VERSION}"
+ENV PATH="/opt/zig/bin:${PATH}" \
+    CARGO_TERM_COLOR=never \
+    CARGO_PROFILE_RELEASE_STRIP=true \
+    CARGO_PROFILE_RELEASE_LTO=true \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY vault-mailbox vault-mailbox
+# The other workspace members are not needed here, so drop them from the members;
+# cargo then only prunes unused lock entries (versions of everything else stay as locked).
+RUN sed -i 's#^members = .*#members = ["vault-mailbox"]#' Cargo.toml \
+ && grep -q '^members = \["vault-mailbox"\]$' Cargo.toml \
+ && cargo fetch
+# Dependencies are fetched once here, into this shared layer. The per-platform
+# builds below run --offline in parallel. They share no registry cache mount
+# (parallel unpacking into one mount failed with ".cargo-ok File exists").
+
+# ---- vault-relay, cross-compiled for $TARGETPLATFORM
+FROM toolchain AS relay
+ARG TARGETPLATFORM
+RUN --mount=type=cache,target=/src/target,id=vault-relay-target-${TARGETPLATFORM},sharing=locked \
+    set -eu; \
+    case "${TARGETPLATFORM}" in \
+      linux/amd64)  target=x86_64-unknown-linux-musl ;; \
+      linux/arm64)  target=aarch64-unknown-linux-musl ;; \
+      linux/arm/v7) target=armv7-unknown-linux-musleabihf ;; \
+      *) echo "unsupported TARGETPLATFORM ${TARGETPLATFORM} (see the header of this Dockerfile)" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$target"; \
+    cargo zigbuild --offline --release -p vault-mailbox --bin vault-relay --target "$target"; \
+    install -m 0755 "target/$target/release/vault-relay" /vault-relay; \
+    file /vault-relay > /tmp/file.txt; cat /tmp/file.txt; grep -Eq 'statically linked|static-pie linked' /tmp/file.txt
+
+# ---- final image: the static binary, nothing else
+FROM scratch
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="vault-relay" \
+      org.opencontainers.image.description="Relay mailbox for the vault protocol" \
+      org.opencontainers.image.source="https://github.com/5V715/vault" \
+      org.opencontainers.image.url="https://github.com/5V715/vault" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
+COPY --from=relay /vault-relay /vault-relay
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/vault-relay"]
