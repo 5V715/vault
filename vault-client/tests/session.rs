@@ -369,8 +369,9 @@ fn ping_keeps_session_alive() {
     assert_eq!(seen.closed(), None, "session survived 2.6 s idle");
     assert!(store_works(&mut v, &c));
 
-    // Control: without pings the same relay ends the session.
-    let (c2, seen2) = v.new_client(60_000);
+    // Control: at the default interval (30 s, longer than this relay's 1 s idle
+    // timeout) the same relay ends the session.
+    let (c2, seen2) = v.new_client(PING_INTERVAL_MS);
     v.confirm_and_wait_active(&c2, &seen2);
     let s = seen2.clone();
     run(
@@ -508,4 +509,36 @@ fn pair_rejects_bad_device_names_and_relay_urls() {
     assert!(bad("http://127.0.0.1:1", &"x".repeat(65)).is_some());
     assert!(bad("ftp://relay.example", "ok").is_some());
     assert!(bad("http://127.0.0.1:1", "ok").is_none());
+}
+
+fn pair_with_ping(ping_interval_ms: u64) -> Result<VaultSession, ClientError> {
+    VaultSession::pair_with(
+        TokioFactory,
+        TokioClock,
+        &SystemRng,
+        "http://127.0.0.1:1",
+        "ok",
+        SessionCallbacks::new(Rc::new(|_| {}), Rc::new(|_| {}), Rc::new(|_| {})),
+        SessionOptions { ping_interval_ms },
+    )
+    .map(|(s, _fut)| s)
+}
+
+#[test]
+fn ping_interval_above_protocol_max_rejected() {
+    // The protocol requires a ping at least every 30 s.
+    for ms in [PING_INTERVAL_MS + 1, 60_000, u64::MAX] {
+        assert!(
+            matches!(pair_with_ping(ms), Err(ClientError::Protocol(_))),
+            "{ms} ms accepted"
+        );
+    }
+    assert!(pair_with_ping(PING_INTERVAL_MS).is_ok());
+    assert_eq!(SessionOptions::default().ping_interval_ms, PING_INTERVAL_MS);
+}
+
+#[test]
+fn ping_interval_zero_rejected() {
+    assert!(matches!(pair_with_ping(0), Err(ClientError::Protocol(_))));
+    assert!(pair_with_ping(1).is_ok());
 }

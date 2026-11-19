@@ -9,7 +9,7 @@ Counts are from `cargo test -p <crate> -- --list` in both repositories (unit, in
 | vault-proto -> vault-proto | 23 | 23 | 0 |
 | vault-server -> vault-server | 37 | 37 | 0 |
 | relay (mailbox tests only) -> vault-mailbox | 17 | 20 | 0 |
-| core (vault client tests only) -> vault-client | 15 moved, 7 stay | 21 | 0 |
+| core (vault client tests only) -> vault-client | 15 moved, 7 stay | 23 | 0 |
 
 Test binaries: `unittests src/...` are the unit tests inside the crate, `tests/*.rs` are integration test files, `doc` are doc tests. Doc-test paths are shown as in signal-web (`container/src/...` is `vault-container/src/...` here).
 
@@ -39,10 +39,12 @@ assertions use `ClientError` (`denied_pairing_is_an_error`: `ClientError::Denied
 `vault-client/tests/common/mod.rs`, shared with the unit tests; frames sent are counted by a wrapping
 `MailboxFactory` instead of a thread-local in the transport.
 
-6 tests are new: `error::tests::texts_are_stable`, `transport::tests::mailbox_urls` (unit), and
+8 tests are new: `error::tests::texts_are_stable`, `transport::tests::mailbox_urls` (unit), and
 `lock_discards_the_backend_and_reports_locked`, `activate_runs_before_active_and_deactivate_before_closed`,
-`failed_activation_closes_with_the_hosts_reason`, `pair_rejects_bad_device_names_and_relay_urls`
-(`tests/session.rs`).
+`failed_activation_closes_with_the_hosts_reason`, `pair_rejects_bad_device_names_and_relay_urls`,
+`ping_interval_above_protocol_max_rejected`, `ping_interval_zero_rejected` (`tests/session.rs`).
+`ping_keeps_session_alive` uses the default 30 s interval as its no-ping control (was 60 s, which the
+public API now refuses).
 
 These Signal-dependent vault tests stay in signal-web (`core/src/client/tests/vault.rs`), running
 against the signal-web adapter over `vault-client`:
@@ -307,6 +309,8 @@ against the signal-web adapter over `vault-client`:
 | `activate_runs_before_active_and_deactivate_before_closed` | `tests/session.rs` | new | `vault-client` |
 | `failed_activation_closes_with_the_hosts_reason` | `tests/session.rs` | new | `vault-client` |
 | `pair_rejects_bad_device_names_and_relay_urls` | `tests/session.rs` | new | `vault-client` |
+| `ping_interval_above_protocol_max_rejected` | `tests/session.rs` | new | `vault-client` |
+| `ping_interval_zero_rejected` | `tests/session.rs` | new | `vault-client` |
 | `client::tests::vault::link_and_receive_through_vault` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
 | `client::tests::vault::ack_only_after_vault_commit` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
 | `client::tests::vault::drop_mid_session_discards_pending_and_redelivers` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |

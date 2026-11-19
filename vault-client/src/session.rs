@@ -42,9 +42,12 @@ pub enum SessionState {
 
 /// Runs once both sides approved, with the session's backend, before `Active`
 /// is reported. `Err(reason)` ends the session with [`CloseReason::Failed`].
+///
+/// Hooks run inside the session future: they must not await
+/// [`VaultSession::lock`] (it waits for that future, so it would never return).
 pub type ActivateHook = Rc<dyn Fn(RemoteBackend) -> LocalBoxFuture<'static, Result<(), String>>>;
 /// Runs once the session ended and its backend was discarded, before `Closed`
-/// is reported.
+/// is reported. Must not await [`VaultSession::lock`] (see [`ActivateHook`]).
 pub type DeactivateHook = Rc<dyn Fn() -> LocalBoxFuture<'static, ()>>;
 
 /// Callbacks of [`VaultSession::pair`]. They are called on the task that runs
@@ -94,7 +97,8 @@ impl SessionCallbacks {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionOptions {
     /// Milliseconds between keepalive pings (also while the approval is
-    /// pending). The protocol requires at most 30 s.
+    /// pending). Must be in `1..=PING_INTERVAL_MS` (the protocol requires a ping
+    /// at least every 30 s); [`VaultSession::pair_with`] refuses other values.
     pub ping_interval_ms: u64,
 }
 
@@ -226,7 +230,8 @@ impl Drop for VaultSession {
 impl VaultSession {
     /// Pair with a vault through the relay at `relay_origin`. Returns the handle
     /// and the future that runs the whole session (spawn it on a local
-    /// executor): it reports the QR text, the SAS and the [`SessionState`]s.
+    /// executor and let it run to completion; dropping it early skips the
+    /// cleanup that discards the backend): it reports the QR text, the SAS and the [`SessionState`]s.
     /// Once `Active`, [`Self::backend`] is the vault-backed store. When the
     /// session ends (disconnect, the vault's `SessionTerminated`/`Locked`, a
     /// failed commit, [`Self::lock`], [`Self::cancel_pairing`] before Active)
@@ -273,6 +278,11 @@ impl VaultSession {
     {
         if !valid_device_name(device_name) {
             return Err(perr("device name too long or with control characters"));
+        }
+        if !(1..=PING_INTERVAL_MS).contains(&options.ping_interval_ms) {
+            return Err(perr(format!(
+                "ping interval must be 1..={PING_INTERVAL_MS} ms (protocol: at least every 30 s)"
+            )));
         }
         let origin = relay_origin.trim_end_matches('/').to_string();
         let mut id = [0u8; 16];
