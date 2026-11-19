@@ -1,0 +1,94 @@
+/* SPDX-License-Identifier: MIT */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  line-height: 1.4;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  justify-content: center;
+}
+
+main {
+  width: min(36rem, 100% - 2rem);
+  padding: 2rem 0;
+}
+
+button {
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  margin: 0.25rem 0.5rem 0.25rem 0;
+  cursor: pointer;
+}
+
+button.primary {
+  font-weight: 600;
+}
+
+.qr {
+  display: block;
+  width: 16rem;
+  height: 16rem;
+  margin: 1rem 0;
+}
+
+.sas {
+  font-size: 2.5rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.3rem;
+  margin: 1rem 0;
+}
+
+.hint,
+.status {
+  opacity: 0.7;
+  font-size: 0.9rem;
+}
+
+.warning {
+  border: 2px solid #c60;
+  padding: 0.5rem 0.75rem;
+}
+
+.notice {
+  font-weight: 600;
+}
+
+form.add {
+  display: flex;
+  gap: 0.5rem;
+}
+
+form.add input {
+  flex: 1;
+  font: inherit;
+  padding: 0.4rem;
+}
+
+ul.todos {
+  list-style: none;
+  padding: 0;
+}
+
+li.todo {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  border-bottom: 1px solid #8884;
+  padding: 0.25rem 0;
+}
+
+li.todo label {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+
+li.done .text {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
