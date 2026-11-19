@@ -13,7 +13,9 @@ Crates:
   approval, request serving) and the `vault-dev` laptop test vault.
 - `vault-mailbox`: the relay mailbox (`Mailboxes::handle` pairs two WebSocket clients
   and pipes Noise frames) and the `vault-relay` binary; `Dockerfile.relay` builds a
-  scratch image of it.
+  scratch image of it. `vault-relay` requires at least one allowed browser origin
+  (`--allow-origin` or `VAULT_RELAY_ALLOW_ORIGIN`); see `docs/integration.md`,
+  "Running the relay".
 - `vault-client`: the app/browser side (pairing session with the two-sided code check,
   Noise request channel, RAM write-back `RemoteBackend`); feature `wasm` for the browser
   WebSocket, `native` for a tokio-tungstenite client. Compiles for `wasm32-unknown-unknown`.

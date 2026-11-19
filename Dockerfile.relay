@@ -7,6 +7,15 @@
 #
 #   docker buildx build -f Dockerfile.relay --platform linux/arm64,linux/arm/v7 -t IMAGE .
 #
+# Run it with the page origin of every app that uses the relay (comma-separated),
+# behind a TLS-terminating reverse proxy that overwrites X-Forwarded-For:
+#
+#   docker run -p 8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://app.example IMAGE --trust-proxy
+#
+# (or pass `--allow-origin https://app.example` as arguments). Without an allowed
+# origin the container exits at once with status 2 and says why: an open relay
+# would let any website use it. See docs/integration.md, "Running the relay".
+#
 # Every RUN stage executes on the build host ($BUILDPLATFORM); the binary is
 # cross-compiled to a static musl binary with cargo-zigbuild (zig as the cross
 # linker; no per-target C toolchains, no QEMU). The final stage is `scratch`,
@@ -17,6 +26,7 @@ ARG CARGO_ZIGBUILD_VERSION=0.24.1
 ARG ZIGLANG_VERSION=0.16.0
 
 # ---- toolchain: rust + zig + cargo-zigbuild, sources limited to vault-mailbox
+# and vault-proto (vault-relay validates allowed origins with its binding rules)
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS toolchain
 ARG CARGO_ZIGBUILD_VERSION
 ARG ZIGLANG_VERSION
@@ -36,10 +46,11 @@ ENV PATH="/opt/zig/bin:${PATH}" \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY vault-mailbox vault-mailbox
+COPY vault-proto vault-proto
 # The other workspace members are not needed here, so drop them from the members;
 # cargo then only prunes unused lock entries (versions of everything else stay as locked).
-RUN sed -i 's#^members = .*#members = ["vault-mailbox"]#' Cargo.toml \
- && grep -q '^members = \["vault-mailbox"\]$' Cargo.toml \
+RUN sed -i 's#^members = .*#members = ["vault-mailbox", "vault-proto"]#' Cargo.toml \
+ && grep -q '^members = \["vault-mailbox", "vault-proto"\]$' Cargo.toml \
  && cargo fetch
 # Dependencies are fetched once here, into this shared layer. The per-platform
 # builds below run --offline in parallel. They share no registry cache mount
@@ -73,4 +84,6 @@ LABEL org.opencontainers.image.title="vault-relay" \
 COPY --from=relay /vault-relay /vault-relay
 USER 65532:65532
 EXPOSE 8080
+# The allowlist comes from VAULT_RELAY_ALLOW_ORIGIN or --allow-origin; there is
+# deliberately no default, so an unconfigured container fails fast.
 ENTRYPOINT ["/vault-relay"]

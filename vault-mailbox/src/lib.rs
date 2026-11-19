@@ -34,8 +34,12 @@ pub use serve::serve;
 /// Mailbox limits and policy. The defaults are the limits the relay used before the split.
 #[derive(Clone, Debug)]
 pub struct MailboxConfig {
-    /// Browser origins allowed to open a mailbox (exact match). A request without
-    /// an `Origin` header (a native vault) is always allowed. Empty: any origin.
+    /// Browser origins allowed to open a mailbox, compared byte for byte with the
+    /// request's `Origin` header, so give them in the form browsers send
+    /// (`https://app.example`: lower case, no default port, no trailing `/`; see
+    /// `vault_proto::binding::normalize_origin`). A request without an `Origin`
+    /// header (a native vault) is always allowed. Empty (the default): no browser
+    /// origin is allowed, only Origin-less native clients.
     pub allowed_origins: Vec<String>,
     /// Maximum simultaneously waiting (unpaired) mailboxes.
     pub max_mailboxes_waiting: usize,
@@ -281,19 +285,17 @@ fn ws_handshake(
     if !is_ws {
         return Err((StatusCode::BAD_REQUEST, "websocket upgrade required"));
     }
-    if !cfg.allowed_origins.is_empty() {
-        let origin = h.get("origin");
-        // Native clients (the vault) send no Origin; a browser one must match.
-        let ok = match origin {
-            None => true,
-            Some(o) => o
-                .to_str()
-                .ok()
-                .is_some_and(|o| cfg.allowed_origins.iter().any(|a| a == o)),
-        };
-        if !ok {
-            return Err((StatusCode::FORBIDDEN, "origin not allowed"));
-        }
+    // Native clients (the vault) send no Origin; a browser one must be listed
+    // (an empty list admits no browser).
+    let ok = match h.get("origin") {
+        None => true,
+        Some(o) => o
+            .to_str()
+            .ok()
+            .is_some_and(|o| cfg.allowed_origins.iter().any(|a| a == o)),
+    };
+    if !ok {
+        return Err((StatusCode::FORBIDDEN, "origin not allowed"));
     }
     Ok(key)
 }

@@ -12,7 +12,7 @@ default = ["bin"]
 # `vault-relay` and by tests. Embedders that mount `Mailboxes::handle` in their own
 # server build with `default-features = false`.
 server = ["tokio/net"]
-bin = ["server", "dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
+bin = ["server", "dep:clap", "dep:tracing-subscriber", "dep:vault-proto", "tokio/rt-multi-thread", "tokio/signal"]
 
 [[bin]]
 name = "vault-relay"
@@ -28,12 +28,18 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tracing = "0.1"
-clap = { version = "4", features = ["derive"], optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+# Only the binary validates `--allow-origin` with the app-binding origin rules.
+vault-proto = { path = "../vault-proto", optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
 
 [[test]]
 name = "mailbox"
 required-features = ["server"]
+
+[[test]]
+name = "relay_cli"
+required-features = ["bin"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }

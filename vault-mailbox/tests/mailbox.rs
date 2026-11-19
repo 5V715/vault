@@ -195,11 +195,23 @@ async fn origin_rules_for_mailbox() {
         .err()
         .unwrap();
     assert_eq!(http_status(e), 403);
-    // Without an allowlist any Origin is fine.
-    let r2 = start(cfg()).await;
-    join_with_origin(&r2, ID, Some("https://anything"))
-        .await
-        .unwrap();
+}
+
+#[tokio::test]
+async fn empty_allowlist_rejects_browser_origins() {
+    // The default (empty) allowlist admits no browser at all, only clients that
+    // send no Origin (native vaults).
+    let r = start(cfg()).await;
+    assert!(cfg().allowed_origins.is_empty());
+    for o in ["https://anything", "http://localhost:3000", "null"] {
+        let e = join_with_origin(&r, "22222222222222222222222222222222", Some(o))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{o} was admitted"));
+        assert_eq!(http_status(e), 403, "{o}");
+    }
+    join_with_origin(&r, ID, None).await.unwrap();
+    join_with_origin(&r, ID, None).await.unwrap();
 }
 
 #[tokio::test]

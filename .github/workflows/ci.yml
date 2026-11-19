@@ -60,11 +60,21 @@ jobs:
             set -ex
             docker buildx build -f Dockerfile.relay --platform linux/amd64 --load -t vault-relay:smoke .
             docker image inspect vault-relay:smoke --format '{{.Config.User}} {{.Config.Entrypoint}} {{json .Config.Labels}}'
-            docker run -d --name smoke -p 8080:8080 vault-relay:smoke
+            # Without an allowed origin the image must refuse to start, and say why.
+            set +e
+            docker run --rm vault-relay:smoke > logs/no-origin.txt 2>&1
+            code=$?
+            set -e
+            cat logs/no-origin.txt
+            test "$code" = 2
+            grep -q 'no browser origin is allowed' logs/no-origin.txt
+            docker run -d --name smoke -p 8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://app.example vault-relay:smoke
             sleep 2
             docker logs smoke
             test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)" = 200
             test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/)" = 404
+            ws=(-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+            test "$(curl -s -o /dev/null -w '%{http_code}' "${ws[@]}" -H 'Origin: https://evil.example' http://127.0.0.1:8080/mailbox/0123456789abcdef0123456789abcdef)" = 403
             docker rm -f smoke
           } 2>&1 | tee logs/relay-image.log
       - name: cross-build arm64 and arm/v7

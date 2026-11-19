@@ -18,7 +18,11 @@ crate. Design context: `docs/design/vault.md` ("Pairing and sessions (V2)") and
 - Relay: `GET /mailbox/<32 hex chars>` upgrades to WebSocket (binary frames
   only) and pairs the first two connections on that mailbox id (128-bit random,
   chosen by the browser). A mailbox expires 60 s after creation if unpaired.
-  Other limits and timeouts as for `/tunnel`. The relay forwards bytes and
+  A browser's `Origin` must be on the relay's allowlist (HTTP 403 otherwise;
+  an empty allowlist admits no browser); requests without `Origin` (native
+  vaults) are admitted. Limits and timeouts are the relay's configuration
+  (`vault_mailbox::MailboxConfig`; `vault-relay` flags; deployment notes in
+  `docs/integration.md`, "Running the relay"). The relay forwards bytes and
   does not parse them.
 - One Noise transport message per WebSocket binary frame.
 
