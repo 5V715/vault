@@ -208,6 +208,11 @@ export class Debouncer<T> {
     return this.#items.length;
   }
 
+  /** Batches handed to `flush` that have not finished (the running one and those queued behind it). */
+  get running(): number {
+    return this.#running;
+  }
+
   /** Something is waiting or being flushed. */
   get busy(): boolean {
     return this.#items.length > 0 || this.#running > 0;

@@ -320,6 +320,64 @@ describe("TodoApp", () => {
 });
 
 describe("TodoList", () => {
+  test("saved_only_after_all_batches_committed", async () => {
+    const s = new FakeSession();
+    s.st = "active";
+    // Commits wait until the test releases them.
+    const gates = [];
+    const realCommit = s.commit.bind(s);
+    s.commit = () =>
+      new Promise((resolve, reject) => {
+        gates.push(() => realCommit().then(resolve, reject));
+      });
+    const statuses = [];
+    const list = new TodoList(s, { debounceMs: 10, warn: () => {}, onChange: () => statuses.push(list.status) });
+    await list.load();
+    statuses.length = 0;
+    const until = async (pred, what) => {
+      for (let i = 0; i < 200 && !pred(); i++) await sleep(5);
+      assert.ok(pred(), what);
+    };
+
+    list.add("a");
+    await until(() => gates.length === 1, "first commit started");
+    list.add("b"); // during the in-flight commit
+    await sleep(40); // b's batch comes due and queues behind the running flush
+    assert.equal(gates.length, 1, "flushes never overlap");
+    gates[0]();
+    await until(() => gates.length === 2, "second commit started");
+    assert.equal(list.status, "saving", "not saved while b's commit is in flight");
+    assert.ok(!statuses.includes("saved"), `no "saved" yet: ${statuses}`);
+    gates[1]();
+    await list.idle();
+    assert.equal(list.status, "saved");
+    assert.equal(s.store.size, 2);
+  });
+
+  test("a close mid-batch stops calling the session", async () => {
+    const s = new FakeSession();
+    s.st = "active";
+    let release;
+    const realPut = s.put.bind(s);
+    let puts = 0;
+    s.put = async (k, v) => {
+      puts++;
+      if (puts === 1) await new Promise((r) => (release = r));
+      return realPut(k, v);
+    };
+    const list = new TodoList(s, { debounceMs: 10, warn: () => {} });
+    await list.load();
+    list.add("a");
+    list.add("b");
+    for (let i = 0; i < 200 && !release; i++) await sleep(5);
+    assert.ok(release, "the first put is running");
+    list.close();
+    release();
+    await list.idle();
+    assert.equal(puts, 1, "no further put after close");
+    assert.ok(!s.calls.some(([n]) => n === "commit"), "no commit after close");
+  });
+
   test("edits before the load finished are ignored", async () => {
     const s = new FakeSession();
     s.st = "active";

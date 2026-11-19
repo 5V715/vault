@@ -173,14 +173,20 @@ export class TodoList {
   }
 
   async #flush(writes: Write[]): Promise<void> {
-    if (this.#closed) return;
+    // Stop at the first await after a close: the session is gone (its calls
+    // would reject anyway) and nothing of this batch may be committed.
     for (const w of coalesceWrites(writes)) {
+      if (this.#closed) return;
       if (w.op === "put") await this.#session.put(w.key, utf8.encode(w.value));
       else await this.#session.delete(w.key);
     }
+    if (this.#closed) return;
     await this.#session.commit();
     if (this.#closed) return;
-    if (this.#debouncer.pending === 0) {
+    // "saved" only when this was the last batch: none waiting for the quiet
+    // period and none queued behind this one (running counts this flush).
+    // A failed commit throws above and the error handler shows "not saved".
+    if (this.#debouncer.pending === 0 && this.#debouncer.running === 1) {
       this.#status = "saved";
       this.#onChange();
     }
