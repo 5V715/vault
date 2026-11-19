@@ -73,6 +73,13 @@ the header.
   `Notice::WrongApp` and closes the session: no approval prompt is shown, no
   `OpenSession` is read and no data is touched. The browser reports the session
   as `closed(wrong app)` (`CloseReason::WrongApp`).
+- The binding compared is that of the container the vault holds at the moment
+  of the check, never a value taken before the handshake. A vault that can swap
+  containers (lock, then unlock another one) repeats the comparison immediately
+  before it shows the approval prompt and again, atomically with becoming the
+  active session, before it answers `Approved`. A mismatch at either point is
+  handled the same way: `Notice::WrongApp`, the session ends, the prompt is not
+  shown (or its answer is ignored) and no data is touched.
 - The approval prompt shows the app id, the origin and the relay host along with
   the device name and the SAS.
 
@@ -258,7 +265,7 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
 |---|---|
 | SessionTerminated{ reason } | vault ended the session (replaced, revoked, timeout) |
 | Locked | vault locked; session is over |
-| WrongApp | the offer's `app_id` or `origin` is not this vault's binding; sent right after the handshake, before any approval prompt; session is over |
+| WrongApp | the offer's `app_id` or `origin` is not this vault's binding; sent right after the handshake, before any approval prompt (or, if the vault's container changed meanwhile, in place of the prompt or of `Approved`); session is over |
 
 ### Error codes
 

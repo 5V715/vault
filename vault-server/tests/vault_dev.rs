@@ -545,12 +545,11 @@ async fn vault_dev_pre_v1_dir_reports_unsupported_format() {
     for pass in ["fixture-passphrase", "not it"] {
         let mut v = spawn_vault(d, pass, &o.text, &tmp.path().join("pw"));
         let st = v.exit().await;
+        // The stderr pump thread may not have read everything yet when the child exits.
+        v.wait_err("unsupported container format (created before vault v1)")
+            .await;
         let err = v.err.lock().unwrap().clone();
         assert_eq!(st.code(), Some(1), "{err}");
-        assert!(
-            err.contains("unsupported container format (created before vault v1)"),
-            "{err}"
-        );
         assert!(!err.contains("checksum"), "{err}");
         assert!(!err.contains("Connecting"), "relay not dialled: {err}");
     }

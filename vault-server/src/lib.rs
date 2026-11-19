@@ -12,7 +12,11 @@
 //! - A session whose offer names another app or origin than the container is
 //!   bound to gets `Notice::WrongApp` right after the handshake and ends
 //!   ([`EndReason::WrongApp`]): before any request is read, before the approver
-//!   is asked and without touching the container.
+//!   is asked and without touching the container. The binding is that of the
+//!   container installed at the time of each check: right after the handshake,
+//!   again immediately before the approver is asked and again (under the
+//!   container lock) before `Approved` is granted, so a `lock`/`unlock` that swaps
+//!   the container in between cannot let a mismatched offer through.
 //! - One approval prompt at a time (server-wide); at most
 //!   [`MAX_AWAITING_APPROVAL`] sessions wait for approval, further `OpenSession`s
 //!   are answered `Denied`. Each prompt's timeout starts when it is shown.
@@ -288,8 +292,16 @@ pub(crate) struct Offered {
     pub app_id: String,
     pub origin: String,
     pub relay_host: String,
-    /// The offer's app id and origin are the container's binding.
-    pub bound: bool,
+}
+
+impl Offered {
+    /// Whether the offer names exactly this binding. Checked against the
+    /// installed container at every decision point (after the handshake, before
+    /// the prompt, before `Approved`), never from a value computed earlier: a
+    /// `lock`/`unlock` can swap the container at any time.
+    pub(crate) fn matches(&self, b: &BindingPair) -> bool {
+        self.app_id == b.0 && self.origin == b.1
+    }
 }
 
 pub(crate) struct Inner {
@@ -317,12 +329,12 @@ impl Inner {
         self.static_secret.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn binding(&self) -> MutexGuard<'_, BindingPair> {
+    pub(crate) fn binding(&self) -> MutexGuard<'_, BindingPair> {
         self.binding.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-fn binding_of(c: &VaultContainer) -> BindingPair {
+pub(crate) fn binding_of(c: &VaultContainer) -> BindingPair {
     let (a, o) = c.binding();
     (a.to_string(), o.to_string())
 }
@@ -412,14 +424,12 @@ impl VaultServer {
     /// gets the handshake, so that the browser learns why: the session then
     /// only sends `Notice::WrongApp` and ends with [`EndReason::WrongApp`].
     pub async fn serve_offer(&self, offer: PairOffer) -> Result<SessionHandle, ServerError> {
-        let offered = {
-            let b = self.inner.binding();
-            Offered {
-                bound: offer.app_id == b.0 && offer.origin == b.1,
-                app_id: offer.app_id.clone(),
-                origin: offer.origin.clone(),
-                relay_host: relay_host(&offer.relay_url).to_string(),
-            }
+        // The binding is not decided here: the session task checks it against the
+        // container installed at each decision point (see `Offered::matches`).
+        let offered = Offered {
+            app_id: offer.app_id.clone(),
+            origin: offer.origin.clone(),
+            relay_host: relay_host(&offer.relay_url).to_string(),
         };
         let responder = {
             let secret = self.inner.secret();

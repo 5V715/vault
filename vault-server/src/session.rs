@@ -211,6 +211,16 @@ async fn pre_approval(ch: &mut Channel, m: Result<Zeroizing<Vec<u8>>, ChannelErr
     }
 }
 
+/// The offer does not match the installed container's binding.
+async fn wrong_app(ch: &mut Channel, id: u64) -> EndReason {
+    tracing::warn!(
+        session = id,
+        "vault session: offer for another app or origin"
+    );
+    let _ = send_notice(ch, Notice::WrongApp).await;
+    EndReason::WrongApp
+}
+
 /// A second `OpenSession` while one is pending approval.
 async fn duplicate_open(ch: &mut Channel, id: u64) -> EndReason {
     let _ = respond(
@@ -238,13 +248,8 @@ async fn drive(
 
     // Another app or origin than the container's binding: say so and end, before
     // reading any request, asking the user or touching the container.
-    if !offered.bound {
-        tracing::warn!(
-            session = id,
-            "vault session: offer for another app or origin"
-        );
-        let _ = send_notice(ch, Notice::WrongApp).await;
-        return EndReason::WrongApp;
+    if !offered.matches(&inner.binding()) {
+        return wrong_app(ch, id).await;
     }
 
     // AwaitApproval 1: wait for OpenSession (Pings are answered).
@@ -307,6 +312,11 @@ async fn drive(
         }
     };
 
+    // The container may have been swapped (unlock) since the handshake.
+    if !offered.matches(&inner.binding()) {
+        return wrong_app(ch, id).await;
+    }
+
     // AwaitApproval 3: the prompt is shown; its timeout starts now.
     tracing::info!(session = id, "vault session: awaiting user approval");
     let req = ApprovalRequest {
@@ -358,10 +368,19 @@ async fn drive(
             let _ = send_notice(ch, Notice::Locked).await;
             return EndReason::Locked;
         };
-        c.discard_pending();
-        let mut st = inner.state();
-        let old = st.active.replace(id);
-        old.and_then(|o| st.sessions.get(&o).cloned())
+        // The user approved this offer, but the container may have been swapped
+        // while the prompt was shown: never activate on another binding.
+        if !offered.matches(&crate::binding_of(c)) {
+            None
+        } else {
+            c.discard_pending();
+            let mut st = inner.state();
+            let old = st.active.replace(id);
+            Some(old.and_then(|o| st.sessions.get(&o).cloned()))
+        }
+    };
+    let Some(old) = old else {
+        return wrong_app(ch, id).await;
     };
     if let Some(tx) = old {
         let (atx, arx) = oneshot::channel();

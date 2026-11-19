@@ -311,6 +311,16 @@ impl Browser {
 
 /// Handshake only (no `OpenSession`).
 async fn pair(server: &VaultServer, relay: &Relay) -> (Browser, SessionHandle) {
+    pair_hooked(server, relay, async {}).await
+}
+
+/// Like [`pair`], running `between` after msg2 arrived and before msg3 is sent,
+/// i.e. while the vault is in the middle of the handshake.
+async fn pair_hooked(
+    server: &VaultServer,
+    relay: &Relay,
+    between: impl std::future::Future<Output = ()>,
+) -> (Browser, SessionHandle) {
     let keys = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
     let offer: PairOffer = keys.offer().clone();
     let (mut ws, _) = tokio_tungstenite::connect_async(format!(
@@ -331,6 +341,7 @@ async fn pair(server: &VaultServer, relay: &Relay) -> (Browser, SessionHandle) {
         other => panic!("expected msg2, got {other:?}"),
     };
     let (m3, noise) = init.handle_msg2(&m2).unwrap();
+    between.await;
     ws.send(Message::Binary(m3.into())).await.unwrap();
     let handle = srv.await.unwrap().unwrap();
     assert_eq!(handle.sas(), noise.sas());
@@ -1155,4 +1166,75 @@ async fn compaction_never_folds_another_sessions_pending_writes() {
         c.call(get(&[b'k', 2])).await,
         ResponseBody::Value(Some(vec![2; 100]))
     );
+}
+
+/// A container with another binding, opened with the same static key.
+async fn other_container() -> vault_server::VaultContainer {
+    let backend: SharedBackend = Arc::new(MemoryBackend::new());
+    Container::create(backend, "other-app", ORIGIN)
+        .await
+        .unwrap()
+        .0
+}
+
+/// The vault is locked and unlocked with a container bound to another app while
+/// the handshake runs: the session must be checked against the container it would
+/// serve, not the one installed when the offer was scanned.
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_rechecked_after_handshake() {
+    let relay = relay().await;
+    let approver = Auto::new(true);
+    let s = server(approver.clone(), ServerConfig::default()).await;
+    let swap = {
+        let s = s.clone();
+        async move {
+            s.lock().await;
+            s.unlock(other_container().await, vault_secret()).await;
+        }
+    };
+    let (mut b, h) = pair_hooked(&s, &relay, swap).await;
+    let r = b
+        .call_any(RequestBody::OpenSession {
+            device_name: "A".into(),
+        })
+        .await;
+    assert_eq!(r, Some(VaultMessage::Notice(Notice::WrongApp)));
+    assert_eq!(ended(h).await, EndReason::WrongApp);
+    assert!(approver.calls().is_empty(), "approver must not be asked");
+    assert_eq!(s.active_session(), None);
+}
+
+/// The container is swapped after the handshake but before the prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_rechecked_before_prompt() {
+    let relay = relay().await;
+    let approver = Auto::new(true);
+    let s = server(approver.clone(), ServerConfig::default()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    s.unlock(other_container().await, vault_secret()).await;
+    let r = b
+        .call_any(RequestBody::OpenSession {
+            device_name: "A".into(),
+        })
+        .await;
+    assert_eq!(r, Some(VaultMessage::Notice(Notice::WrongApp)));
+    assert_eq!(ended(h).await, EndReason::WrongApp);
+    assert!(approver.calls().is_empty(), "approver must not be asked");
+}
+
+/// The container is swapped while the prompt is shown: a "yes" for the old
+/// binding must not activate the session on the new container.
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_rechecked_before_approved() {
+    let relay = relay().await;
+    let gate = Gate::new();
+    let s = server(gate.clone(), ServerConfig::default()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    open_request(&mut b, "A").await;
+    gate.wait_prompts(1).await;
+    s.unlock(other_container().await, vault_secret()).await;
+    gate.answer(true);
+    assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::WrongApp)));
+    assert_eq!(ended(h).await, EndReason::WrongApp);
+    assert_eq!(s.active_session(), None);
 }
