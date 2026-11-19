@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Application messages and the QR pair offer.
 
 use crate::ProtoError;

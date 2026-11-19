@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Chunking of application messages into Noise-sized frames.
 //!
 //! Each frame plaintext is `postcard{msg_id:u64, index:u32, last:bool}` followed

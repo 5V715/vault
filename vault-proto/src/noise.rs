@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Noise transport (`Noise_XX_25519_ChaChaPoly_SHA256`) between the browser
 //! (initiator, per-session static key shown in the QR) and the vault (responder,
 //! long-term static key), plus the short authentication string.

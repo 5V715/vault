@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Wire protocol between the browser client of an app and a vault.
 //!
 //! Pure data and framing: no I/O, no clock, no async runtime, so it compiles
