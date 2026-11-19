@@ -14,7 +14,7 @@
 //! when opening; a manifest with a lower `seq`, or the same `seq` with a different
 //! hash, is refused with [`Error::Rollback`].
 //!
-//! Objects: `header` = `version(1) || postcard(HeaderBody)` holding only the
+//! Objects: `header` = `"vault" || format_version(1) || postcard(HeaderBody)` holding only the
 //! recovery-wrapped CRK (the same bytes are inside every manifest; no plaintext
 //! identifiers); written once with `put_if_absent`. A header without a manifest is
 //! an interrupted `create` ([`Error::IncompleteCreate`]) unless the caller holds a
@@ -35,12 +35,15 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::backend::{ContainerBackend, Etag, PutOutcome};
 use crate::manifest::{self, MAX_WRAPPED_CRK, Manifest};
 use crate::segment::{Record, SegmentReader, SegmentWriter, random_segment_id};
-use crate::{Crk, Error, RecoveryKey, Result, Subkeys, unwrap_crk, wrap_crk};
+use crate::{
+    CONTAINER_FORMAT_VERSION, Crk, Error, RecoveryKey, Result, Subkeys, unwrap_crk, wrap_crk,
+};
 
 const HEADER: &str = "header";
 const MANIFEST: &str = "manifest";
 const SEG_PREFIX: &str = "seg/";
-const HEADER_VERSION: u8 = 1;
+/// Fixed marker that starts every v1 header (containers from before the split have none).
+const HEADER_MAGIC: &[u8] = b"vault";
 const MAX_HEADER: usize = 4096;
 /// Record stream budget per segment so that each segment object stays <= 32 MiB.
 const SEGMENT_TARGET: usize = 32 * 1024 * 1024 - 64 * 1024;
@@ -64,7 +67,8 @@ pub(crate) struct HeaderBody {
 }
 
 fn encode_header(h: &HeaderBody) -> Result<Vec<u8>> {
-    let mut out = vec![HEADER_VERSION];
+    let mut out = HEADER_MAGIC.to_vec();
+    out.push(CONTAINER_FORMAT_VERSION);
     out.extend(postcard::to_allocvec(h).map_err(|e| Error::Format(e.to_string()))?);
     Ok(out)
 }
@@ -73,12 +77,20 @@ pub(crate) fn decode_header(bytes: &[u8]) -> Result<HeaderBody> {
     if bytes.len() > MAX_HEADER {
         return Err(Error::Format("header too large".into()));
     }
-    match bytes.first() {
-        None => return Err(Error::Format("empty header".into())),
-        Some(&HEADER_VERSION) => {}
-        Some(v) => return Err(Error::Unsupported(format!("header version {v}"))),
+    if bytes.is_empty() {
+        return Err(Error::Format("empty header".into()));
     }
-    let (h, rest) = postcard::take_from_bytes::<HeaderBody>(&bytes[1..])
+    let Some(rest) = bytes.strip_prefix(HEADER_MAGIC) else {
+        // Not a v1 header; headers from before the split also land here.
+        return Err(Error::Format("not a vault container header".into()));
+    };
+    // The format version comes first and is checked before the body is decoded.
+    let body = match rest.split_first() {
+        None => return Err(Error::Format("header without format version".into())),
+        Some((&CONTAINER_FORMAT_VERSION, body)) => body,
+        Some((&v, _)) => return Err(Error::UnsupportedFormatVersion(v)),
+    };
+    let (h, rest) = postcard::take_from_bytes::<HeaderBody>(body)
         .map_err(|_| Error::Format("malformed header".into()))?;
     if !rest.is_empty() {
         return Err(Error::Format("trailing bytes in header".into()));
@@ -886,10 +898,12 @@ mod tests {
             recovery_wrapped_crk: vec![1, 2, 3],
         };
         let bytes = encode_header(&h).unwrap();
+        // marker, then the format version, then postcard(body)
+        assert_eq!(bytes, b"vault\x01\x03\x01\x02\x03");
         let back = decode_header(&bytes).unwrap();
         assert_eq!(back.recovery_wrapped_crk, vec![1, 2, 3]);
         assert!(matches!(decode_header(&[]), Err(Error::Format(_))));
-        assert!(matches!(decode_header(&[2]), Err(Error::Unsupported(_))));
+        assert!(matches!(decode_header(b"vault"), Err(Error::Format(_))));
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(matches!(decode_header(&trailing), Err(Error::Format(_))));
@@ -902,6 +916,37 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(decode_header(&big), Err(Error::Format(_))));
+    }
+
+    #[test]
+    fn header_rejects_unknown_format_version() {
+        assert_eq!(crate::CONTAINER_FORMAT_VERSION, 1);
+        for v in [0u8, 2, 0xff] {
+            let mut bytes = b"vault".to_vec();
+            bytes.push(v);
+            bytes.extend_from_slice(&[3, 1, 2, 3]);
+            assert!(
+                matches!(
+                    decode_header(&bytes),
+                    Err(Error::UnsupportedFormatVersion(got)) if got == v
+                ),
+                "version {v}"
+            );
+        }
+        // Checked before the body: an unknown version with any body is refused as such.
+        assert!(matches!(
+            decode_header(b"vault\x02"),
+            Err(Error::UnsupportedFormatVersion(2))
+        ));
+        assert_eq!(
+            Error::UnsupportedFormatVersion(2).to_string(),
+            "unsupported container format version 2"
+        );
+        // No marker: not a v1 header (a distinct error from an unknown version).
+        assert!(matches!(
+            decode_header(&[1, 3, 1, 2, 3]),
+            Err(Error::Format(_))
+        ));
     }
 
     #[test]

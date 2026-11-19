@@ -13,6 +13,10 @@ pub mod segment;
 
 pub use keys::{Crk, RecoveryKey, Subkeys, unwrap_crk, wrap_crk};
 
+/// Container format version, stored in the `header` object right after its marker.
+/// A container with any other version is refused.
+pub const CONTAINER_FORMAT_VERSION: u8 = 1;
+
 /// Errors returned by the container crate.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -41,6 +45,9 @@ pub enum Error {
     /// A fresh random segment id collided twice: broken RNG or a hostile backend.
     #[error("segment id collided twice")]
     SegmentIdCollision,
+    /// The container header carries a format version this code does not know.
+    #[error("unsupported container format version {0}")]
+    UnsupportedFormatVersion(u8),
     /// The data uses an unsupported format version or feature.
     #[error("unsupported: {0}")]
     Unsupported(String),

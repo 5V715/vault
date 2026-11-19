@@ -11,14 +11,15 @@ pub mod noise;
 pub use frame::{Chunk, Chunker, Reassembler};
 pub use msg::{ErrorCode, Notice, PairOffer, Request, RequestBody, Response, ResponseBody};
 
-/// Protocol version carried in the QR prefix and the Noise prologue label.
-pub const VERSION: u8 = 1;
+/// Protocol version: the first wire field of [`PairOffer`], and the `v1` of the QR
+/// prefix and the labels. An offer with any other version is refused.
+pub const PROTOCOL_VERSION: u8 = 1;
 /// Noise protocol name.
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 /// Noise prologue label; the full prologue is label ‖ mailbox_id ‖ browser_eph_pub.
-pub const PROLOGUE_LABEL: &[u8] = b"signal-web/vault/v1";
+pub const PROLOGUE_LABEL: &[u8] = b"vault/v1";
 /// HKDF info string for the short authentication string.
-pub const SAS_INFO: &[u8] = b"signal-web/vault/v1/sas";
+pub const SAS_INFO: &[u8] = b"vault/v1/sas";
 
 /// Errors from encoding, decoding and framing.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -27,6 +28,8 @@ pub enum ProtoError {
     BadQrPrefix,
     #[error("QR payload is not valid base64url")]
     BadQrEncoding,
+    #[error("unsupported protocol version {0}")]
+    UnsupportedVersion(u8),
     #[error("invalid relay url: {0}")]
     BadRelayUrl(&'static str),
     #[error("malformed message")]

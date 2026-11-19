@@ -4,8 +4,8 @@ Extracted from the design notes written in the signal-web repository (2026-11-18
 keeping the parts that concern the vault, its container, relay mailbox transport
 and pairing; app-specific sections are omitted or reworded to "the app". The wire
 details are in `docs/protocol/vault.md`, the container and CLI in `docs/vault/README.md`.
-The `signal-web/...` label strings quoted below are carried over byte-identically from
-the extraction and are scheduled for rename to neutral `vault-...` labels.
+Label strings are the neutral `vault/v1/...` ones; the full list is in
+`docs/protocol/vault.md` ("Versions and labels").
 
 ## Intent
 
@@ -64,7 +64,7 @@ nothing; sessions are approved and revoked on the phone.
   per use, biometric or device credential; (2) by the **recovery key**.
 - **Recovery key**: 32 random bytes, shown once as 64 base32 characters in
   groups of 4 plus a QR code; wrap key = HKDF-SHA256(recovery key,
-  "signal-web/vault/v1/recovery"). Shown again only after biometric
+  "vault/v1/recovery"). Shown again only after biometric
   confirmation. Rotation (re-wrapping the CRK under a new recovery key) is
   **not implemented yet** (future work; replicas' headers would then need an
   explicit update).

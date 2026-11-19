@@ -26,11 +26,12 @@ cargo test --workspace
 cargo build -p vault-container --release --bin vaultctl
 ```
 
-## Status
+## Versions
 
-The label strings, the QR prefix `signal-web-pair:v1:` and the recovery prefix
-`signal-web-recovery:v1:` are still the ones inherited from the original code and are
-scheduled for rename.
+Protocol version 1 and container format version 1, with neutral labels: QR prefix
+`vault-pair:v1:`, recovery prefix `vault-recovery:v1:`, `vault/v1/...` for every key
+derivation and the Noise prologue (`docs/protocol/vault.md`, "Versions and labels").
+Known-answer values are recomputed independently by `tools/kat/kat.py`.
 
 ## Origin
 

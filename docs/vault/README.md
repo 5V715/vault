@@ -135,11 +135,11 @@ cargo build -p vault-server --release --bin vault-dev
 # binary: target/release/vault-dev
 
 vaultctl --dir ~/vault create                 # once; remember the passphrase
-vault-dev serve --dir ~/vault --pair "signal-web-pair:v1:..."
+vault-dev serve --dir ~/vault --pair "vault-pair:v1:..."
 ```
 
 1. Open the web app. The "Connect to your vault" screen shows a QR code.
-2. Get the pairing text (`signal-web-pair:v1:...`) from it. **Gap:** the web app has no
+2. Get the pairing text (`vault-pair:v1:...`) from it. **Gap:** the web app has no
    "copy pairing text" button yet, only the QR. Read the QR with your phone's built-in
    camera (or a scanner you already trust), copy the text and paste it between the
    quotes. **Treat the text as a short-lived secret:** whoever has it within its 60 s
@@ -203,6 +203,44 @@ Security caveats (development only):
 - One session is served per run, and only while the process is running; stdin must be
   a terminal you control (anything that can write to it can approve).
 - The printed prompt shows the browser-supplied device name escaped; treat it as untrusted.
+
+## Format v1: header, labels and key derivation
+
+This is the normative definition; `tools/kat/kat.py` recomputes the known answers
+from it (see `docs/protocol/vault.md`, "Known answers").
+
+- **Container format version:** `1` (`vault_container::CONTAINER_FORMAT_VERSION`).
+- **`header` object:** `"vault"` (5 ASCII bytes, a fixed marker) `||
+  format_version (u8) || postcard{ recovery_wrapped_crk: bytes }`, at most 4096
+  bytes, no trailing bytes. `format_version` is the first field after the marker
+  and is checked before anything else is decoded: an unknown value is refused as
+  `unsupported container format version N`. A header without the marker is not a
+  v1 container. Containers created before the split carry no marker and no
+  format version.
+- **Subkeys:** each is `HKDF-SHA256(ikm = CRK, salt = none, info = label, L = 32)`
+  (`salt = none` is RFC 5869's default: 32 zero bytes).
+
+  | Subkey | `info` |
+  |---|---|
+  | `enc` (segment AEAD) | `vault/v1/enc` |
+  | `mac` (record-key HMAC) | `vault/v1/mac` |
+  | `manifest` (manifest AEAD) | `vault/v1/manifest` |
+  | `manifest_auth` (manifest `auth_tag` HMAC key) | `vault/v1/manifest-auth` |
+  | `replica_id` | `vault/v1/replica-id` |
+
+- **Recovery wrap key:** `HKDF-SHA256(ikm = recovery key (32 bytes), salt = none,
+  info = "vault/v1/recovery", L = 32)`.
+- **Recovery checksum:** the first 8 bytes of `SHA-256("vault/v1/recovery-check" ||
+  recovery key)`.
+- **Recovery key text:** `BASE32` (RFC 4648 alphabet, no padding) of `recovery key
+  || checksum` (40 bytes → 64 characters), shown in 16 groups of 4 joined by `-`. The
+  QR payload is `vault-recovery:v1:` followed by the 64 characters without dashes.
+- **Wrapped CRK:** `0x01 || nonce (12) || AES-256-GCM(recovery wrap key, CRK)` with
+  AAD `"vault/v1/crk-wrap" || 0x01`.
+- **Manifest `auth_tag`:** `HMAC-SHA256(manifest_auth, "vault/v1/manifest-auth-tag" ||
+  0x01 || postcard((seq, prev, segments, recovery_wrapped_crk)))`.
+
+Labels are ASCII byte strings without a terminator, concatenated as shown.
 
 ## Recovery key handling
 

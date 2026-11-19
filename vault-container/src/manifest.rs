@@ -29,7 +29,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const VERSION: u8 = 1;
-const AUTH_DOMAIN: &[u8] = b"signal-web/vault/v1/manifest-auth-tag";
+const AUTH_DOMAIN: &[u8] = b"vault/v1/manifest-auth-tag";
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 const OVERHEAD: usize = 1 + NONCE_LEN + TAG_LEN;
@@ -471,6 +471,13 @@ mod tests {
                 Err(Error::Crypto)
             ));
         }
+    }
+
+    #[test]
+    fn auth_input_uses_v1_label() {
+        let m = sample(1, 1);
+        let input = m.auth_input().unwrap();
+        assert!(input.starts_with(b"vault/v1/manifest-auth-tag\x01"));
     }
 
     #[test]

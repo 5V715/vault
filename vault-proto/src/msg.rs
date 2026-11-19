@@ -12,7 +12,7 @@ mod alloc_prelude {
 }
 
 /// Prefix of the QR payload.
-pub const QR_PREFIX: &str = "signal-web-pair:v1:";
+pub const QR_PREFIX: &str = "vault-pair:v1:";
 /// Maximum relay URL length in bytes.
 pub const MAX_RELAY_URL: usize = 512;
 /// Maximum `device_name` length in bytes (UTF-8, no control characters).
@@ -45,14 +45,18 @@ fn check_len(len: usize, max: usize) -> Result<(), ProtoError> {
 /// What the browser shows as a QR code and the vault scans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairOffer {
+    /// Protocol version, [`crate::PROTOCOL_VERSION`]. First on the wire so that a
+    /// decoder can refuse an unknown version before reading the rest.
+    pub version: u8,
     pub relay_url: String,
     pub mailbox_id: [u8; 16],
     pub browser_eph_pub: [u8; 32],
 }
 
 impl PairOffer {
-    /// Validate and encode as `signal-web-pair:v1:<base64url(postcard)>`.
+    /// Validate and encode as `vault-pair:v1:<base64url(postcard)>`.
     pub fn to_qr(&self) -> Result<String, ProtoError> {
+        check_version(self.version)?;
         validate_relay_url(&self.relay_url)?;
         let bytes = postcard::to_allocvec(self).map_err(|_| ProtoError::Malformed)?;
         let mut s = String::from(QR_PREFIX);
@@ -66,9 +70,19 @@ impl PairOffer {
         let bytes = URL_SAFE_NO_PAD
             .decode(b64)
             .map_err(|_| ProtoError::BadQrEncoding)?;
+        // postcard writes a u8 as one raw byte: the first byte is the version.
+        check_version(*bytes.first().ok_or(ProtoError::Malformed)?)?;
         let offer: PairOffer = decode_exact(&bytes)?;
         validate_relay_url(&offer.relay_url)?;
         Ok(offer)
+    }
+}
+
+fn check_version(v: u8) -> Result<(), ProtoError> {
+    if v == crate::PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(ProtoError::UnsupportedVersion(v))
     }
 }
 
@@ -301,6 +315,7 @@ mod tests {
 
     fn offer(url: &str) -> PairOffer {
         PairOffer {
+            version: crate::PROTOCOL_VERSION,
             relay_url: url.into(),
             mailbox_id: [7; 16],
             browser_eph_pub: [9; 32],
@@ -311,19 +326,52 @@ mod tests {
     fn qr_roundtrip_and_rejects_bad_prefix() {
         let o = offer("wss://relay.example/mailbox");
         let qr = o.to_qr().unwrap();
-        assert!(qr.starts_with("signal-web-pair:v1:"));
+        assert!(qr.starts_with("vault-pair:v1:"));
         assert_eq!(PairOffer::from_qr(&qr).unwrap(), o);
         let bad = qr.replacen("v1", "v2", 1);
         assert_eq!(PairOffer::from_qr(&bad), Err(ProtoError::BadQrPrefix));
         assert_eq!(PairOffer::from_qr("hello"), Err(ProtoError::BadQrPrefix));
         assert_eq!(
-            PairOffer::from_qr("signal-web-pair:v1:!!!"),
+            PairOffer::from_qr("vault-pair:v1:!!!"),
             Err(ProtoError::BadQrEncoding)
         );
+        // bytes 01 00 00: version 1, then a truncated body
         assert_eq!(
-            PairOffer::from_qr("signal-web-pair:v1:AAAA"),
+            PairOffer::from_qr("vault-pair:v1:AQAA"),
             Err(ProtoError::Malformed)
         );
+    }
+
+    #[test]
+    fn offer_rejects_unknown_version() {
+        assert_eq!(crate::PROTOCOL_VERSION, 1);
+        let o = offer("wss://r.example");
+        let raw = postcard::to_allocvec(&o).unwrap();
+        // The version is the first wire field.
+        assert_eq!(raw[0], 1);
+        for v in [0u8, 2, 0xff] {
+            let mut bad = raw.clone();
+            bad[0] = v;
+            let qr = alloc_prelude::String::from(QR_PREFIX) + &URL_SAFE_NO_PAD.encode(&bad);
+            assert_eq!(
+                PairOffer::from_qr(&qr),
+                Err(ProtoError::UnsupportedVersion(v)),
+                "version {v}"
+            );
+            // Checked before the rest is decoded.
+            let qr = alloc_prelude::String::from(QR_PREFIX) + &URL_SAFE_NO_PAD.encode([v]);
+            assert_eq!(
+                PairOffer::from_qr(&qr),
+                Err(ProtoError::UnsupportedVersion(v))
+            );
+            let o2 = PairOffer {
+                version: v,
+                ..o.clone()
+            };
+            assert_eq!(o2.to_qr(), Err(ProtoError::UnsupportedVersion(v)));
+        }
+        let empty = alloc_prelude::String::from(QR_PREFIX);
+        assert_eq!(PairOffer::from_qr(&empty), Err(ProtoError::Malformed));
     }
 
     #[test]

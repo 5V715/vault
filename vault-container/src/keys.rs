@@ -2,6 +2,9 @@
 
 //! Key hierarchy: container root key, HKDF subkeys, recovery key and CRK wrapping.
 //!
+//! Labels and derivations are defined in `docs/vault/README.md` ("Format v1"); the
+//! known answers in the tests come from `tools/kat/kat.py`.
+//!
 //! All secret material lives in [`Zeroizing`] buffers and no type here prints
 //! key bytes through `Debug`.
 
@@ -16,14 +19,14 @@ use std::fmt;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-const INFO_ENC: &[u8] = b"signal-web/vault/v1/enc";
-const INFO_MAC: &[u8] = b"signal-web/vault/v1/mac";
-const INFO_MANIFEST: &[u8] = b"signal-web/vault/v1/manifest";
-const INFO_MANIFEST_AUTH: &[u8] = b"signal-web/vault/v1/manifest-auth";
-const INFO_REPLICA_ID: &[u8] = b"signal-web/vault/v1/replica-id";
-const INFO_RECOVERY: &[u8] = b"signal-web/vault/v1/recovery";
-const RECOVERY_CHECK_DOMAIN: &[u8] = b"signal-web/vault/v1/recovery-check";
-const CRK_WRAP_AAD: &[u8] = b"signal-web/vault/v1/crk-wrap";
+const INFO_ENC: &[u8] = b"vault/v1/enc";
+const INFO_MAC: &[u8] = b"vault/v1/mac";
+const INFO_MANIFEST: &[u8] = b"vault/v1/manifest";
+const INFO_MANIFEST_AUTH: &[u8] = b"vault/v1/manifest-auth";
+const INFO_REPLICA_ID: &[u8] = b"vault/v1/replica-id";
+const INFO_RECOVERY: &[u8] = b"vault/v1/recovery";
+const RECOVERY_CHECK_DOMAIN: &[u8] = b"vault/v1/recovery-check";
+const CRK_WRAP_AAD: &[u8] = b"vault/v1/crk-wrap";
 
 /// AAD = label || version byte.
 fn wrap_aad() -> Vec<u8> {
@@ -31,7 +34,7 @@ fn wrap_aad() -> Vec<u8> {
     aad.push(WRAP_VERSION);
     aad
 }
-const QR_PREFIX: &str = "signal-web-recovery:v1:";
+const QR_PREFIX: &str = "vault-recovery:v1:";
 const WRAP_VERSION: u8 = 1;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
@@ -150,7 +153,7 @@ impl RecoveryKey {
         Zeroizing::new(groups.join("-"))
     }
 
-    /// Payload for a QR code: `signal-web-recovery:v1:<64 chars>`.
+    /// Payload for a QR code: `vault-recovery:v1:<64 chars>`.
     pub fn qr_payload(&self) -> Zeroizing<String> {
         Zeroizing::new(format!("{QR_PREFIX}{}", &**self.encoded()))
     }
@@ -210,7 +213,7 @@ impl fmt::Debug for RecoveryKey {
     }
 }
 
-/// Wraps the CRK: `version(1) || nonce(12) || GCM(ct || tag)`, AAD `signal-web/vault/v1/crk-wrap || version`.
+/// Wraps the CRK: `version(1) || nonce(12) || GCM(ct || tag)`, AAD `vault/v1/crk-wrap || version`.
 pub fn wrap_crk(crk: &Crk, rk: &RecoveryKey, rng: &mut impl CryptoRng) -> Vec<u8> {
     let aad = wrap_aad();
     let key = rk.wrap_key();
@@ -320,7 +323,7 @@ mod tests {
         let loose = shown.to_lowercase().replace('-', " ");
         assert_eq!(RecoveryKey::parse(&loose).unwrap().to_display(), shown);
         let qr = rk.qr_payload();
-        let rest = qr.strip_prefix("signal-web-recovery:v1:").unwrap();
+        let rest = qr.strip_prefix("vault-recovery:v1:").unwrap();
         assert_eq!(rest.len(), 64);
         assert_eq!(RecoveryKey::parse(rest).unwrap().to_display(), shown);
     }
@@ -364,40 +367,89 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
+    /// Known answers from `tools/kat/kat.py` (Python `cryptography`, independent of
+    /// this code), for CRK and recovery key = `[0x11; 32]`.
+    #[test]
+    fn subkey_kats_v1() {
+        let s = Crk(Zeroizing::new([0x11; 32])).subkeys();
+        assert_eq!(
+            hex(&*s.enc),
+            "fadf21e22aeeb4991efd0af527ddfdfe15a9d07c797d49b5f93e239f98a085d5"
+        );
+        assert_eq!(
+            hex(&*s.mac),
+            "95386a492d73b845448b54e6f46de466c1a76a74d3b04103d7e9401a95f59fd4"
+        );
+        assert_eq!(
+            hex(&*s.manifest),
+            "8348e40177efe9bf9096df8d9f037acbe54dca8d279b5f068ac45ad14e71b16a"
+        );
+        assert_eq!(
+            hex(&*s.manifest_auth),
+            "f39f7075471082f238686355f684641795ed0e576e04a86e777fe5843c9d36e4"
+        );
+        assert_eq!(
+            hex(&*s.replica_id),
+            "88c1e18db40d7125c8cb58e8f44d8ff7a79989b9d5f577518054dd82379317c7"
+        );
+        assert_eq!(
+            hex(&*RecoveryKey(Zeroizing::new([0x11; 32])).wrap_key()),
+            "89b2113a8f028550ac5c7f8156bd26d761bb0b75af35083109ca3d303c87be37"
+        );
+    }
+
+    /// Known answers from `tools/kat/kat.py` for recovery key = `[0x11; 32]`.
+    #[test]
+    fn recovery_checksum_kat_v1() {
+        let key = [0x11u8; 32];
+        assert_eq!(hex(&RecoveryKey::checksum(&key)), "52c5e2d43fcec705");
+        let rk = RecoveryKey(Zeroizing::new(key));
+        assert_eq!(
+            &*rk.to_display(),
+            "CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIV-FRPC-2Q74-5RYF"
+        );
+        assert_eq!(
+            &*rk.qr_payload(),
+            "vault-recovery:v1:CEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIVFRPC2Q745RYF"
+        );
+    }
+
+    /// Known answers from `tools/kat/kat.py` for the inputs `1..=32` (CRK) and
+    /// `0xa0..=0xbf` (recovery key).
     #[test]
     fn known_answers() {
         let s = kat_crk().subkeys();
         assert_eq!(
             hex(&*s.enc),
-            "9a83852dfded7de416ca3d5ffd268dead59fe694792b266d038ecf37def1ec3a"
+            "44c845ff40730b73eeb9808f4c4b1aeab99cb101a897b84cbad68185e0988ce9"
         );
         assert_eq!(
             hex(&*s.mac),
-            "276f22570088ce7dbc0d65099bae770f1d7066dc37c64532d5b2142a0b2c484a"
+            "fb134726d0eb7249a8d2ba0d5260da7ce2a055017fa20c32d6bf2cbdcfb1533e"
         );
         assert_eq!(
             hex(&*s.manifest),
-            "bf232dd83c1bf20004dd4ee86be46609292609353240e071e302e49b07c68d35"
+            "d115b3f28b0f6a768a75885ffdb90e4173ef3a1dd6354752092bdaa239908a95"
         );
         assert_eq!(
             hex(&*s.manifest_auth),
-            "d3bb9b841c6126f379ba72683a99fcac2e887c4e7642605e993146fa63942491"
+            "7634e8564c41a2bc5a955b682d9c804bfeb2fae2fbdacc0c4f83741328969c8e"
         );
         assert_eq!(
             hex(&*s.replica_id),
-            "442db32b203b8826d1ef2509844475cec84f1951246deb1a363a1a76a560eda8"
+            "70c468f9f142c85652197b3d0de2834f701336b477a03e5516894b41ac07413f"
         );
         let rk = kat_rk();
         let display =
-            "UCQ2-FI5E-UWTK-PKFJ-VKV2-ZLNO-V6YL-DMVT-WS23-NN5Y-XG5L-XPF5-X277-7SOE-ZZVD-L262";
+            "UCQ2-FI5E-UWTK-PKFJ-VKV2-ZLNO-V6YL-DMVT-WS23-NN5Y-XG5L-XPF5-X277-ES6E-QNBE-6W4K";
         assert_eq!(&*rk.to_display(), display);
         assert_eq!(
             &*rk.qr_payload(),
-            &format!("signal-web-recovery:v1:{}", display.replace('-', ""))
+            &format!("vault-recovery:v1:{}", display.replace('-', ""))
         );
         assert_eq!(
             hex(&*rk.wrap_key()),
-            "a39b2fa65f6f1d8f36021c31db71c625308f6f1959b8b514d17d1d4674407871"
+            "f26b29d2181715e8fd2a03ac9895fba6c98315ddbd1bf3f2c8aa534a6272d174"
         );
     }
 
@@ -405,13 +457,14 @@ mod tests {
     fn known_answer_wrap_blob_and_aad() {
         let blob = (0..61)
             .map(|i| {
-                let h = "01a0ce4a8df256558162747d72f92bedf9d54d5be26354ee6fad887e8bb62407f976ece06cc6bf7ae127d80c5db6d9938c468ad27cc69dfc46be4a8c98";
+                let h = "01a0ce4a8df256558162747d72bad79a9d4dae96ab3a10a2b2e45124fc95b5eea037ba52b2f26c7008f5c73ad0078dd4a43130442b0bcd870f8c89bbb8";
                 u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()
             })
             .collect::<Vec<u8>>();
         let crk = unwrap_crk(&blob, &kat_rk()).unwrap();
         assert_eq!(crk.0[..], kat_crk().0[..]);
-        // Pinned wrap output for a seeded RNG.
+        // Pinned wrap output for a seeded RNG (printed by this code; the CRK decrypts
+        // from it in Python with the wrap key and AAD of `docs/vault/README.md`).
         assert_eq!(wrap_crk(&kat_crk(), &kat_rk(), &mut rng(99)), blob);
         // AAD is exactly label || version byte.
         let key = kat_rk().wrap_key();
@@ -428,9 +481,9 @@ mod tests {
                 )
                 .is_ok()
         };
-        assert!(ok(b"signal-web/vault/v1/crk-wrap\x01"));
-        assert!(!ok(b"signal-web/vault/v1/crk-wrap"));
-        assert!(!ok(b"signal-web/vault/v1/crk-wrap\x02"));
+        assert!(ok(b"vault/v1/crk-wrap\x01"));
+        assert!(!ok(b"vault/v1/crk-wrap"));
+        assert!(!ok(b"vault/v1/crk-wrap\x02"));
     }
 
     #[test]

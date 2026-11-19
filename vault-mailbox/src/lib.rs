@@ -31,7 +31,7 @@ pub use pipe::parse_id;
 #[cfg(feature = "server")]
 pub use serve::serve;
 
-/// Mailbox limits and policy. The defaults are those of the signal-web relay.
+/// Mailbox limits and policy. The defaults are the limits the relay used before the split.
 #[derive(Clone, Debug)]
 pub struct MailboxConfig {
     /// Browser origins allowed to open a mailbox (exact match). A request without

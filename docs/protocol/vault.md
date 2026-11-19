@@ -23,9 +23,14 @@ crate. Design context: `docs/superpowers/specs/2026-11-18-vault-design.md` ("Pai
 ## QR pair offer
 
 ```
-signal-web-pair:v1:<base64url-no-pad( postcard{ relay_url, mailbox_id[16], browser_eph_pub[32] } )>
+vault-pair:v1:<base64url-no-pad( postcard{ version: u8, relay_url, mailbox_id[16], browser_eph_pub[32] } )>
 ```
 
+- `version`: the protocol version, `1` (`vault_proto::PROTOCOL_VERSION`). It is
+  the first wire field (postcard writes a `u8` as one raw byte), so a decoder
+  reads it before anything else and refuses any other value as
+  `UnsupportedVersion(v)`, distinct from a malformed payload. Encoding an offer
+  with another version is refused too.
 - `relay_url`: string, at most 512 bytes. `https://` or `wss://`; `http://` or
   `ws://` only when the host is loopback (`localhost`, `127.0.0.1`, `[::1]`).
   No userinfo; an explicit port must be numeric, 1-65535; no backslash, control
@@ -40,7 +45,7 @@ Pattern `Noise_XX_25519_ChaChaPoly_SHA256`.
 Prologue (both sides, byte concatenation):
 
 ```
-"signal-web/vault/v1" || mailbox_id (16 bytes) || browser_eph_pub (32 bytes)
+"vault/v1" || mailbox_id (16 bytes) || browser_eph_pub (32 bytes)
 ```
 
 The vault builds the prologue from the scanned QR; the browser from its own
@@ -58,7 +63,7 @@ copies the QR values could handshake with a different static key.
 After the handshake both sides compute:
 
 ```
-okm = HKDF-SHA256(ikm = handshake_hash, salt = none, info = "signal-web/vault/v1/sas", L = 4)
+okm = HKDF-SHA256(ikm = handshake_hash, salt = none, info = "vault/v1/sas", L = 4)
 sas = (u32_be(okm) mod 1_000_000), zero-padded to 6 decimal digits
 ```
 
@@ -252,10 +257,52 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
 - A compromised active browser sees what it reads while the session lasts and
   loses access on revocation or session end.
 
-## Labels
+## Versions and labels
 
-The QR prefix (`signal-web-pair:v1:`), the HKDF/AAD/Noise-prologue/SAS labels
-(`signal-web/vault/v1/...`) and the recovery prefix (`signal-web-recovery:v1:`) still carry the
-name of the project this code was extracted from. They are kept byte-identical for now so
-existing containers and pairings stay valid, and are scheduled to be renamed to neutral
-`vault-...` labels (with explicit version bytes) in a later change.
+- Protocol version `1`: the `version` field of the offer, and the `v1` in the QR
+  prefix and in every label below. A new protocol version changes all three.
+- Container format version `1`: stored in the container `header` (see
+  `docs/vault/README.md`, "Format v1"); an unknown version is refused.
+- Labels (ASCII, no terminator):
+
+  | Use | Label |
+  |---|---|
+  | QR prefix of the pair offer | `vault-pair:v1:` |
+  | QR prefix of the recovery key | `vault-recovery:v1:` |
+  | Noise prologue label | `vault/v1` |
+  | SAS HKDF info | `vault/v1/sas` |
+  | Container subkey HKDF infos | `vault/v1/enc`, `vault/v1/mac`, `vault/v1/manifest`, `vault/v1/manifest-auth`, `vault/v1/replica-id` |
+  | Recovery wrap key HKDF info | `vault/v1/recovery` |
+  | Recovery checksum domain (SHA-256 prefix) | `vault/v1/recovery-check` |
+  | Wrapped-CRK AAD (followed by the wrap version byte) | `vault/v1/crk-wrap` |
+  | Manifest `auth_tag` domain (HMAC input prefix) | `vault/v1/manifest-auth-tag` |
+
+  Containers and pairings made with the labels used before the split do not
+  work with these; there is no compatibility path.
+
+## Known answers
+
+Computed independently of the Rust code by `tools/kat/kat.py` (Python,
+`cryptography` package) from the definitions above and in
+`docs/vault/README.md`, and pinned in the Rust tests (`sas_kat_v1` in
+`vault-proto`, `subkey_kats_v1`, `recovery_checksum_kat_v1` and `known_answers`
+in `vault-container`). Recompute with:
+
+```sh
+python3 -I tools/kat/kat.py
+```
+
+| Input | Value |
+|---|---|
+| SAS, `handshake_hash = [0; 32]` | okm `83f0d811`, SAS `599249` |
+| `enc`, CRK `[0x11; 32]` | `fadf21e22aeeb4991efd0af527ddfdfe15a9d07c797d49b5f93e239f98a085d5` |
+| `mac`, CRK `[0x11; 32]` | `95386a492d73b845448b54e6f46de466c1a76a74d3b04103d7e9401a95f59fd4` |
+| `manifest`, CRK `[0x11; 32]` | `8348e40177efe9bf9096df8d9f037acbe54dca8d279b5f068ac45ad14e71b16a` |
+| `manifest_auth`, CRK `[0x11; 32]` | `f39f7075471082f238686355f684641795ed0e576e04a86e777fe5843c9d36e4` |
+| `replica_id`, CRK `[0x11; 32]` | `88c1e18db40d7125c8cb58e8f44d8ff7a79989b9d5f577518054dd82379317c7` |
+| recovery wrap key, recovery key `[0x11; 32]` | `89b2113a8f028550ac5c7f8156bd26d761bb0b75af35083109ca3d303c87be37` |
+| recovery checksum, recovery key `[0x11; 32]` | `52c5e2d43fcec705` |
+| recovery key text, recovery key `[0x11; 32]` | `CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIV-FRPC-2Q74-5RYF` |
+
+The script also prints the values for the older test inputs (CRK `1..=32`,
+recovery key `0xa0..=0xbf`) used by `known_answers`.

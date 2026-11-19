@@ -3,7 +3,7 @@
 #
 # vault-relay (the vault mailbox relay), multi-arch:
 #   linux/amd64, linux/arm64, linux/arm/v7
-# This is a reduced matrix by design; signal-web's own image keeps the full one.
+# This is a reduced matrix by design; an embedding app's own image may build more.
 #
 #   docker buildx build -f Dockerfile.relay --platform linux/arm64,linux/arm/v7 -t IMAGE .
 #

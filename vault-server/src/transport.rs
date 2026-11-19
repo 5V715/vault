@@ -251,6 +251,7 @@ mod tests {
 
     fn offer(url: &str) -> PairOffer {
         PairOffer {
+            version: vault_proto::PROTOCOL_VERSION,
             relay_url: url.into(),
             mailbox_id: [0xab; 16],
             browser_eph_pub: [1; 32],

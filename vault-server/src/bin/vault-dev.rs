@@ -62,7 +62,7 @@ struct ServeArgs {
     /// Container directory created by `vaultctl create`.
     #[arg(long)]
     dir: PathBuf,
-    /// Pairing text from the web app (`signal-web-pair:v1:...`).
+    /// Pairing text from the web app (`vault-pair:v1:...`).
     #[arg(long)]
     pair: String,
     /// Read the passphrase from this file (one line) instead of prompting.

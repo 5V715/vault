@@ -301,6 +301,7 @@ impl PairKeys {
         let mut secret = Zeroizing::new([0u8; 32]);
         rng.fill_bytes(&mut *secret);
         let offer = PairOffer {
+            version: crate::PROTOCOL_VERSION,
             relay_url,
             mailbox_id,
             browser_eph_pub: public_of(&secret),
@@ -506,6 +507,7 @@ mod tests {
 
     fn offer_for(secret: &[u8; 32], mailbox: u8) -> PairOffer {
         PairOffer {
+            version: crate::PROTOCOL_VERSION,
             relay_url: "wss://relay.example/".into(),
             mailbox_id: [mailbox; 16],
             browser_eph_pub: public_of(secret),
@@ -554,15 +556,22 @@ mod tests {
 
     #[test]
     fn sas_format_is_zero_padded_and_pinned() {
-        // Known answer, computed independently (Python `cryptography` HKDF).
-        assert_eq!(sas_from_hash(&[0u8; 32]), "200882");
         let hash = [0u8; 32];
         let hk = Hkdf::<Sha256>::new(None, &hash);
         let mut okm = [0u8; 4];
-        hk.expand(b"signal-web/vault/v1/sas", &mut okm).unwrap();
+        hk.expand(SAS_INFO, &mut okm).unwrap();
         let want = format!("{:06}", u32::from_be_bytes(okm) % 1_000_000);
         assert_eq!(sas_from_hash(&hash), want);
         assert_eq!(sas_from_hash(&hash).len(), 6);
+    }
+
+    /// Known answer from `tools/kat/kat.py` (Python `cryptography` HKDF, independent
+    /// of this code): okm = 83f0d811 under info `vault/v1/sas`.
+    #[test]
+    fn sas_kat_v1() {
+        assert_eq!(SAS_INFO, b"vault/v1/sas");
+        assert_eq!(PROLOGUE_LABEL, b"vault/v1");
+        assert_eq!(sas_from_hash(&[0u8; 32]), "599249");
     }
 
     /// Run the handshake with the initiator and responder each on a chosen resolver.
