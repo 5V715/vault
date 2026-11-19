@@ -204,14 +204,16 @@ fn rejected(e: JsValue) -> Promise {
     Promise::reject(&e)
 }
 
-#[wasm_bindgen]
 impl Session {
     /// The store, or the rejection of a data call outside `Active` (checked
     /// when the call is made, before anything is sent).
     fn backend(&self) -> Result<RemoteBackend, JsValue> {
         self.inner.backend().ok_or_else(|| js_error(NOT_ACTIVE))
     }
+}
 
+#[wasm_bindgen]
+impl Session {
     /// The user's "Codes match": the session goes `active` once the vault
     /// approved too. Throws before the code was shown, after `cancel()` and
     /// after `lock()`.
