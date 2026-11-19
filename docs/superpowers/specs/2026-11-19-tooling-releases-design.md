@@ -45,9 +45,13 @@ with the user's login.
   Any failure aborts with nothing installed.
 - **Windows:** `--passphrase-fd` stays Unix-only and is not shown in Windows
   `--help`; the interactive prompt and `--passphrase-file` work everywhere.
-- **Honest limit:** the offline signature protects against tampering with the
-  release after it is built (storage, account takeover after signing,
-  download path). It does not protect against a compromised CI producing bad
+- **Honest limit:** the offline signature protects the release assets and the
+  download path against tampering after the build. Against a GitHub account
+  takeover it helps only users whose install script predates it, or who compared
+  the embedded key with a fingerprint the owner publishes outside the repository
+  (the script and its trust root come from the same repository). It does not stop
+  a rollback to an older signed release; `--version` pins (amended after the final
+  review). It does not protect against a compromised CI producing bad
   binaries that the owner then signs. Reproducible builds would close that;
   they are out of scope here.
 
