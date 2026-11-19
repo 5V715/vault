@@ -147,7 +147,8 @@ install_happy_path() {
     test "$(find "$d" -type f -perm 755 \( -name vaultctl -o -name vault-dev -o -name vault-relay \) | wc -l | tr -d ' ')" = 3
   check "installs nothing else" test "$(listing "$d")" = "vault-dev vault-relay vaultctl "
   check "temporary files are removed" empty_dir "$scratch"
-  check "asked gh for the latest published release" logged $'^release\tview\t--repo\t5V715/vault'
+  check "asked gh for published releases, without drafts and pre-releases" \
+    logged $'^release\tlist\t--repo\t5V715/vault\t--exclude-drafts\t--exclude-pre-releases'
   run happy "$f"
   check "default directory is ~/.local/bin" installed_version "$home/.local/bin" 1.3.0
   run happy "$f" --dir "$d"
@@ -259,7 +260,7 @@ install_pins_version() {
   run pin "$f" --version v1.2.3 --dir "$d"
   check "exits 0" succeeded
   check "installs the pinned version, not the latest" installed_version "$d" 1.2.3
-  check "does not look up the latest release" bash -c "! grep -q $'^release\tview' '$log'"
+  check "does not look up the latest release" bash -c "! grep -qE $'^release\t(view|list)' '$log'"
   run pin "$f" --version=v1.2.3 --dir "$d"
   check "--version=TAG form works" succeeded
   local bad
@@ -271,10 +272,6 @@ install_pins_version() {
   run pin "$f" --version v9.9.9 --dir "$tmp/pin/bad"
   check "unknown version: fails" failed
   check "unknown version: installs nothing" absent_or_empty "$tmp/pin/bad"
-  # A latest tag that is not a version is refused too.
-  echo 'v1.3.0*' > "$f/latest"
-  run pin "$f" --dir "$tmp/pin/bad"
-  check "malformed latest tag: refused" says "invalid version"
 }
 
 install_cleans_up_on_failure() {
@@ -393,10 +390,57 @@ install_dir_with_spaces_cleanup_is_safe() {
   check "temporary files are removed" empty_dir "$scratch"
 }
 
+latest_skips_prerelease() {
+  local f d
+  # A newer release marked as a pre-release is not "latest" for the install.
+  f="$(fake pre)"
+  release "$f" v1.4.0-rc.1
+  touch "$f/releases/v1.4.0-rc.1/.prerelease"
+  d="$tmp/pre/dest"
+  run pre "$f" --dir "$d"
+  check "marked pre-release: installs the newest stable release" installed_version "$d" 1.3.0
+  # A suffixed tag that was not marked as a pre-release (even marked latest) is skipped too.
+  release "$f" v1.4.0-rc.2
+  echo v1.4.0-rc.2 > "$f/latest"
+  run pre "$f" --dir "$d"
+  check "unmarked -rc tag marked latest: skipped" installed_version "$d" 1.3.0
+  # So is a tag that is not a version at all.
+  mkdir -p "$f/releases/nightly"
+  printf 'nightly\nv1.4.0-rc.2\nv1.4.0-rc.1\nv1.3.0\nv1.2.3\n' > "$f/order"
+  echo nightly > "$f/latest"
+  run pre "$f" --dir "$d"
+  check "non-version tag marked latest: skipped" installed_version "$d" 1.3.0
+  # Among stable releases the one GitHub marks latest wins, not the newest.
+  printf 'v1.2.3\nv1.3.0\n' > "$f/order"
+  echo v1.3.0 > "$f/latest"
+  run pre "$f" --dir "$tmp/pre/order"
+  check "the release marked latest wins over a newer backport" installed_version "$tmp/pre/order" 1.3.0
+  # Only pre-releases: nothing to install by default.
+  f="$tmp/preonly/gh"
+  release "$f" v2.0.0-rc.1
+  touch "$f/releases/v2.0.0-rc.1/.prerelease"
+  echo v2.0.0-rc.1 > "$f/latest"
+  run preonly "$f" --dir "$tmp/preonly/dest"
+  check "only pre-releases: fails" failed
+  check "only pre-releases: says there is no stable release" says "no published stable release"
+  check "only pre-releases: installs nothing" absent_or_empty "$tmp/preonly/dest"
+}
+
+pinned_prerelease_installs() {
+  local f d
+  f="$(fake pinpre)"
+  release "$f" v1.4.0-rc.1
+  touch "$f/releases/v1.4.0-rc.1/.prerelease"
+  d="$tmp/pinpre/dest"
+  run pinpre "$f" --version v1.4.0-rc.1 --dir "$d"
+  check "exits 0" succeeded
+  check "installs the pinned pre-release" all_versions "$d" 1.4.0-rc.1
+}
+
 all="install_happy_path install_rejects_tampered_archive install_rejects_foreign_signature
 install_rejects_unsigned_release install_refuses_placeholder_key install_requires_gh_login
 install_pins_version install_cleans_up_on_failure test_override_ignored_without_test_mode
-install_detects_target install_partial_failure_rolls_back install_dir_with_spaces_cleanup_is_safe"
+install_detects_target install_partial_failure_rolls_back install_dir_with_spaces_cleanup_is_safe latest_skips_prerelease pinned_prerelease_installs"
 # shellcheck disable=SC2086 # word list
 [ $# -gt 0 ] || set -- $all
 for t in "$@"; do

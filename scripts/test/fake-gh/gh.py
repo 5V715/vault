@@ -7,6 +7,8 @@ Serves releases from a local directory instead of GitHub:
     $VAULT_FAKE_GH_DIR/latest              tag of the latest published release
     $VAULT_FAKE_GH_DIR/releases/<tag>/*    the release's assets
     $VAULT_FAKE_GH_DIR/releases/<tag>/.draft   present while the release is a draft
+    $VAULT_FAKE_GH_DIR/releases/<tag>/.prerelease   present if marked as a pre-release
+    $VAULT_FAKE_GH_DIR/order               optional: tags newest first (default: name, descending)
 
 Environment:
     VAULT_FAKE_GH_DIR         the directory above (required)
@@ -14,7 +16,8 @@ Environment:
     VAULT_FAKE_GH_LOG         every invocation is appended here (one line, args joined by a tab)
 
 Supported: auth status; release view [tag] --json F --jq EXPR (EXPR: .tagName, .isDraft,
-.assets[].name); release download <tag> -p NAME... -D DIR; release upload <tag> FILE...;
+.assets[].name); release list [--exclude-drafts] [--exclude-pre-releases] [--limit N]
+--json F --jq '.[] | [.tagName, (.isLatest|tostring)] | @tsv'; release download <tag> -p NAME... -D DIR; release upload <tag> FILE...;
 release edit <tag> --draft=false. Every command must name --repo 5V715/vault (or -R).
 """
 import fnmatch
@@ -80,6 +83,32 @@ def main():
             die("release not found")
         return d
 
+    if sub == "list":
+        exclude_drafts = "--exclude-drafts" in args
+        exclude_pre = "--exclude-pre-releases" in args
+        args[:] = [a for a in args if a not in ("--exclude-drafts", "--exclude-pre-releases")]
+        limit = take(args, "--limit", "-L")
+        fields = take(args, "--json")
+        jq = take(args, "--jq", "-q")
+        if args or not fields or jq != ['.[] | [.tagName, (.isLatest|tostring)] | @tsv']:
+            die(f"fake gh: unsupported list arguments: {argv}")
+        order = root / "order"
+        if order.is_file():
+            tags = [t for t in order.read_text().split() if (releases / t).is_dir()]
+        else:
+            tags = sorted((p.name for p in releases.iterdir() if p.is_dir()), reverse=True)
+        latest = (root / "latest").read_text().strip() if (root / "latest").is_file() else None
+        shown = 0
+        for t in tags:
+            if exclude_drafts and (releases / t / ".draft").exists():
+                continue
+            if exclude_pre and (releases / t / ".prerelease").exists():
+                continue
+            if limit and shown >= int(limit[0]):
+                break
+            print(f"{t}\t{'true' if t == latest else 'false'}")
+            shown += 1
+        return
     if sub == "view":
         fields = take(args, "--json")
         jq = take(args, "--jq", "-q")
@@ -98,7 +127,7 @@ def main():
         data = {
             "tagName": tag,
             "isDraft": (d / ".draft").exists(),
-            "assets": [{"name": p.name} for p in sorted(d.iterdir()) if p.name != ".draft"],
+            "assets": [{"name": p.name} for p in sorted(d.iterdir()) if not p.name.startswith(".")],
         }
         if not fields or len(jq) != 1:
             die("fake gh: release view needs --json and --jq")
@@ -119,7 +148,7 @@ def main():
             die(f"fake gh: unsupported download arguments: {argv}")
         d = release_dir(args[0])
         dest = Path(dirs[0])
-        hits = [p for p in sorted(d.iterdir()) if p.name != ".draft"
+        hits = [p for p in sorted(d.iterdir()) if not p.name.startswith(".")
                 and any(fnmatch.fnmatchcase(p.name, pat) for pat in patterns)]
         if not hits:
             die("no assets match the file pattern")

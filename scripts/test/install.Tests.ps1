@@ -134,7 +134,7 @@ Describe 'install.ps1' {
         Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
         Get-Listing $d | Should -Be 'vault-dev.exe vault-relay.exe vaultctl.exe'
         Get-Listing $script:Scratch | Should -Be ''
-        Get-Log | Should -Match "release`tview`t--repo`t5V715/vault"
+        Get-Log | Should -Match "release`tlist`t--repo`t5V715/vault`t--exclude-drafts`t--exclude-pre-releases"
         & $script:Install -Dir $d
         Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
     }
@@ -229,7 +229,7 @@ Describe 'install.ps1' {
         $d = Join-Path $script:Root 'pin\dest'
         & $script:Install -Version v1.2.3 -Dir $d
         Get-Installed $d | Should -Be "vaultctl 1.2.3 $script:Target"
-        Get-Log | Should -Not -Match "release`tview"
+        Get-Log | Should -Not -Match "release`t(view|list)"
         # Invalid versions are refused before gh downloads anything.
         Set-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Value '' -NoNewline
         foreach ($bad in '1.2.3', 'v1.2', 'v1.2.3*', 'v1.2.3 x', '..\v1.2.3') {
@@ -238,8 +238,6 @@ Describe 'install.ps1' {
         Get-Log | Should -Not -Match "release`tdownload"
         { & $script:Install -Version v9.9.9 -Dir (Join-Path $script:Root 'pin\bad') } | Should -Throw
         Get-Listing (Join-Path $script:Root 'pin\bad') | Should -Be ''
-        Set-Content -LiteralPath (Join-Path $f 'latest') -Value 'v1.3.0*'
-        { & $script:Install -Dir $d } | Should -Throw '*invalid version*'
     }
 
     It 'install_cleans_up_on_failure' {
@@ -306,6 +304,43 @@ Describe 'install.ps1' {
         Test-AllVersions $d '1.3.0' | Should -BeTrue
         Get-Listing $d | Should -Be 'vault-dev.exe vault-relay.exe vaultctl.exe'
         Get-Listing $script:Scratch | Should -Be ''
+    }
+
+    It 'latest_skips_prerelease' {
+        $f = New-Fake 'pre'
+        New-Release $f 'v1.4.0-rc.1'
+        Set-Content -LiteralPath (Join-Path $f 'releases\v1.4.0-rc.1\.prerelease') -Value ''
+        $d = Join-Path $script:Root 'pre\dest'
+        & $script:Install -Dir $d
+        Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
+        # An unmarked -rc tag, even marked latest, is skipped too; so is a non-version tag.
+        New-Release $f 'v1.4.0-rc.2'
+        Set-Content -LiteralPath (Join-Path $f 'latest') -Value 'v1.4.0-rc.2'
+        & $script:Install -Dir $d
+        Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
+        New-Item -ItemType Directory -Path (Join-Path $f 'releases\nightly') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $f 'order'), "nightly`nv1.4.0-rc.2`nv1.4.0-rc.1`nv1.3.0`nv1.2.3`n")
+        Set-Content -LiteralPath (Join-Path $f 'latest') -Value 'nightly'
+        & $script:Install -Dir $d
+        Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
+
+        $f = New-Fake 'preonly'
+        Remove-Item -LiteralPath (Join-Path $f 'releases\v1.2.3'), (Join-Path $f 'releases\v1.3.0') -Recurse
+        New-Release $f 'v2.0.0-rc.1'
+        Set-Content -LiteralPath (Join-Path $f 'releases\v2.0.0-rc.1\.prerelease') -Value ''
+        Set-Content -LiteralPath (Join-Path $f 'latest') -Value 'v2.0.0-rc.1'
+        $d = Join-Path $script:Root 'preonly\dest'
+        { & $script:Install -Dir $d } | Should -Throw '*no published stable release*'
+        Get-Listing $d | Should -Be ''
+    }
+
+    It 'pinned_prerelease_installs' {
+        $f = New-Fake 'pinpre'
+        New-Release $f 'v1.4.0-rc.1'
+        Set-Content -LiteralPath (Join-Path $f 'releases\v1.4.0-rc.1\.prerelease') -Value ''
+        $d = Join-Path $script:Root 'pinpre\dest'
+        & $script:Install -Version v1.4.0-rc.1 -Dir $d
+        Test-AllVersions $d '1.4.0-rc.1' | Should -BeTrue
     }
 
     It 'install_ps1_idempotent_path' {
