@@ -163,7 +163,10 @@ its own WebSocket.
   reason `wrong app`.
 - Before `Approved` and the user's local confirmation (the app's
   `confirm_sas`) the browser sends only `OpenSession`, `Ping` and
-  `Close`, and links/connects nothing; `cancel_pairing` ends the session with reason `denied`. The state is
+  `Close`, and links/connects nothing; `cancel_pairing` ends the session with reason `denied` and wins at any point
+  before `active`: also after "Codes match" and after the vault's `Approved`
+  (no data request is sent, `active` is never reported). After `active` it is
+  refused; `lock` ends an active session. The state is
   reported to the UI as `pairing`, `awaitingApproval` (until both
   confirmations), `active`, then `closed(reason)`.
 - It sends `Ping` every 30 s from the end of the handshake on.
@@ -222,6 +225,14 @@ an answer.
 These mirror `KvBackend`. Reads see the session's staged writes. `Clear` has no
 dedicated storage primitive: the vault implements it as a scan of all keys
 followed by deletes.
+
+**Scope of `Clear`.** A vault is bound to one app and origin (see "App
+binding"), so its whole key space is that app's data: `Clear` erases the bound
+app's data, nothing else, and takes effect at `Commit` like any write. An app
+uses it to implement "unlink" (erase this app's vault). Replicas are not
+touched by the erase itself: they receive the new, empty state at the next
+replication, but older replica snapshots keep the old data until the replica's
+own retention expires them (the vault does not control that retention).
 
 Decoding is strict: after the postcard value there must be no trailing bytes
 (also for the QR payload), and the field caps below are enforced on decode.

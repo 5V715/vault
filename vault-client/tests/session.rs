@@ -291,7 +291,7 @@ fn cancel_aborts_with_denied() {
             eventually("prompt", move || !st.calls.lock().unwrap().is_empty()),
         );
         let sent = v.frames_sent();
-        c.cancel_pairing();
+        c.cancel_pairing().unwrap();
         let s = seen.clone();
         run(
             &mut v.pool,
@@ -316,6 +316,120 @@ fn cancel_aborts_with_denied() {
             }),
         );
     }
+}
+
+#[test]
+fn cancel_after_confirm_before_approval_wins() {
+    let mut v = venv();
+    v.st.approver.hold.store(true, Ordering::SeqCst);
+    let (c, seen) = v.new_client(PING_INTERVAL_MS);
+    let s = seen.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("sas shown", move || !s.sas.borrow().is_empty()),
+    );
+    c.confirm_sas().unwrap();
+    settle(&mut v, 100);
+    let sent = v.frames_sent();
+    c.cancel_pairing().unwrap();
+    let s = seen.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("closed", move || s.closed().is_some()),
+    );
+    // The vault's Approved arrives after the cancel: still denied, never Active.
+    v.st.approver.hold.store(false, Ordering::SeqCst);
+    settle(&mut v, 300);
+    assert_eq!(seen.closed(), Some(CloseReason::Denied));
+    assert!(!seen.has(&SessionState::Active));
+    assert!(c.backend().is_none());
+    // At most the goodbye went out; never a data request.
+    assert!(v.frames_sent() <= sent + 1);
+    assert!(
+        c.confirm_sas().is_err(),
+        "a cancelled session stays cancelled"
+    );
+}
+
+#[test]
+fn cancel_after_confirm_and_approval_before_active_wins() {
+    let mut v = venv();
+    let seen = Seen::default();
+    let log: Rc<RefCell<Vec<String>>> = Rc::default();
+    let gate = Rc::new(Cell::new(false));
+    let entered = Rc::new(Cell::new(false));
+    let rt = v.st.rt.handle().clone();
+    let server = v.st.server.clone();
+    let cb = seen
+        .callbacks(Rc::new(move |qr: &str| {
+            common::scan_with_handle(&rt, &server, qr);
+        }))
+        .with_activate({
+            let (log, gate, entered) = (log.clone(), gate.clone(), entered.clone());
+            Rc::new(move |_backend: vault_client::RemoteBackend| {
+                let (log, gate, entered) = (log.clone(), gate.clone(), entered.clone());
+                Box::pin(async move {
+                    log.borrow_mut().push("activate".into());
+                    entered.set(true);
+                    // The host is still loading its account.
+                    while !gate.get() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .with_deactivate({
+            let log = log.clone();
+            Rc::new(move || {
+                let log = log.clone();
+                Box::pin(async move { log.borrow_mut().push("deactivate".into()) })
+            })
+        });
+    let c = v.start(cb, PING_INTERVAL_MS);
+    let s = seen.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("sas shown", move || !s.sas.borrow().is_empty()),
+    );
+    c.confirm_sas().unwrap();
+    let e = entered.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("activation started", move || e.get()),
+    );
+    // Confirmed and approved, activation under way, Active not reported yet.
+    assert!(!seen.has(&SessionState::Active));
+    c.cancel_pairing().unwrap();
+    gate.set(true);
+    let s = seen.clone();
+    run(
+        &mut v.pool,
+        &v.st,
+        eventually("closed", move || s.closed().is_some()),
+    );
+    assert_eq!(seen.closed(), Some(CloseReason::Denied));
+    assert!(!seen.has(&SessionState::Active));
+    assert!(c.backend().is_none());
+    assert_eq!(*log.borrow(), ["activate", "deactivate"]);
+}
+
+#[test]
+fn cancel_after_active_is_rejected() {
+    let mut v = venv();
+    let (c, seen) = v.new_client(PING_INTERVAL_MS);
+    v.confirm_and_wait_active(&c, &seen);
+    assert!(c.cancel_pairing().is_err(), "lock() ends an active session");
+    settle(&mut v, 200);
+    assert_eq!(c.state(), SessionState::Active);
+    assert!(seen.closed().is_none());
+    assert!(store_works(&mut v, &c));
+    run(&mut v.pool, &v.st, c.lock());
+    assert_eq!(seen.closed(), Some(CloseReason::Locked));
 }
 
 #[test]
@@ -349,7 +463,7 @@ fn impostor_vault_with_qr_text_cannot_reach_active_without_confirmation() {
     assert_eq!(v.frames_sent(), sent);
     assert!(c.backend().is_none());
     // The user's phone showed no code, so the user cancels.
-    c.cancel_pairing();
+    c.cancel_pairing().unwrap();
     let s = seen.clone();
     run(
         &mut v.pool,

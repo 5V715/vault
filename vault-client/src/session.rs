@@ -148,39 +148,28 @@ async fn unless_stopped<T>(fut: impl Future<Output = T>, stop: &Signal) -> Optio
     }
 }
 
-/// The user's answer in the browser to "does the phone show this code?".
-/// One decision per pairing; the first one wins.
+/// The user's answers in the browser to "does the phone show this code?".
+/// "Codes match" and "Cancel" are independent: Cancel wins over a prior
+/// "Codes match" until the session is `Active`.
 #[derive(Default)]
 struct SasCheck {
-    /// The code has been reported (`on_sas`); deciding before that is refused.
+    /// The code has been reported (`on_sas`); confirming before that is refused.
     shown: Cell<bool>,
-    /// `Some(true)`: "Codes match"; `Some(false)`: cancelled.
-    decision: Cell<Option<bool>>,
-    decided: Signal,
+    confirmed: Cell<bool>,
+    confirmed_sig: Signal,
+    cancelled: Cell<bool>,
+    cancelled_sig: Signal,
 }
 
 impl SasCheck {
-    fn decide(&self, confirmed: bool) {
-        if self.decision.get().is_none() {
-            self.decision.set(Some(confirmed));
-            self.decided.fire();
-        }
+    fn confirm(&self) {
+        self.confirmed.set(true);
+        self.confirmed_sig.fire();
     }
 
-    /// Resolves once the user confirmed; never if they cancelled.
-    async fn confirmed(&self) {
-        self.decided.wait().await;
-        if self.decision.get() != Some(true) {
-            std::future::pending::<()>().await;
-        }
-    }
-
-    /// Resolves once the user cancelled; never if they confirmed.
-    async fn cancelled(&self) {
-        self.decided.wait().await;
-        if self.decision.get() != Some(false) {
-            std::future::pending::<()>().await;
-        }
+    fn cancel(&self) {
+        self.cancelled.set(true);
+        self.cancelled_sig.fire();
     }
 }
 
@@ -362,20 +351,32 @@ impl VaultSession {
         if !check.shown.get() {
             return Err(perr("no code to confirm yet"));
         }
-        match check.decision.get() {
-            Some(false) => Err(perr("pairing was cancelled")),
-            _ => {
-                check.decide(true);
-                Ok(())
-            }
+        if check.cancelled.get() {
+            return Err(perr("pairing was cancelled"));
         }
+        check.confirm();
+        Ok(())
     }
 
-    /// The user cancelled the code comparison (or closed the dialog): the
-    /// session ends with [`CloseReason::Denied`] unless the code was already
-    /// confirmed (use [`Self::lock`] then). Idempotent.
-    pub fn cancel_pairing(&self) {
-        self.shared.sas_check.decide(false);
+    /// The user cancelled the code comparison (or closed the dialog). Cancel
+    /// wins at any point before the session is `Active`, also after "Codes
+    /// match" and after the vault's `Approved` (while the host's activation
+    /// hook still runs): the session ends with [`CloseReason::Denied`], no
+    /// store request is sent and `Active` is never reported. Idempotent while
+    /// pending. Once `Active` (or `Closed`) it changes nothing and returns an
+    /// error: [`Self::lock`] ends an active session.
+    pub fn cancel_pairing(&self) -> Result<(), ClientError> {
+        let check = &self.shared.sas_check;
+        if check.cancelled.get() {
+            return Ok(());
+        }
+        match &*self.shared.state.borrow() {
+            SessionState::Active => return Err(perr("session is active; use lock")),
+            SessionState::Closed(_) => return Err(perr("no pairing in progress")),
+            _ => {}
+        }
+        check.cancel();
+        Ok(())
     }
 
     /// End the session (a goodbye `Close` to the vault, then
@@ -448,15 +449,16 @@ impl<F: MailboxFactory, C: Clock> Run<F, C> {
         let main = self.vault_main(&rpc, device).fuse();
         let ping = self.ping_loop(&rpc).fuse();
         let stopped = stop.wait().fuse();
-        // Cancel counts only until the code was confirmed (the first decision wins).
-        let cancelled = self.shared.sas_check.cancelled().fuse();
+        // Cancel wins until the session is Active (`vault_main` re-checks the
+        // flag right before reporting Active, with no await in between).
+        let cancelled = self.shared.sas_check.cancelled_sig.wait().fuse();
         pin_mut!(drive, main, ping, stopped, cancelled);
         let (reason, goodbye) = futures::select_biased! {
+            () = cancelled => (CloseReason::Denied, true),
             r = main => (r, false),
             r = drive => (r, false),
             r = ping => (r, false),
             () = stopped => (CloseReason::Locked, true),
-            () = cancelled => (CloseReason::Denied, true),
         };
         if goodbye {
             // Our own goodbye; the vault ends the session.
@@ -482,8 +484,8 @@ impl<F: MailboxFactory, C: Clock> Run<F, C> {
         // the browser too (or already did). Whoever holds the QR text could
         // have answered as the vault; only the user can tell that their phone
         // showed this code. Until then the channel stays closed for requests.
-        self.shared.sas_check.confirmed().await;
-        if self.shared.sas_check.decision.get() != Some(true) {
+        self.shared.sas_check.confirmed_sig.wait().await;
+        if self.shared.sas_check.cancelled.get() {
             return CloseReason::Denied;
         }
         rpc.set_approved();
@@ -493,6 +495,10 @@ impl<F: MailboxFactory, C: Clock> Run<F, C> {
             && let Err(reason) = h(backend).await
         {
             return CloseReason::Failed(reason);
+        }
+        // Cancel may have arrived while the activation hook ran.
+        if self.shared.sas_check.cancelled.get() {
+            return CloseReason::Denied;
         }
         self.set_state(SessionState::Active);
         std::future::pending().await

@@ -18,8 +18,8 @@ Crates:
   Noise request channel, RAM write-back `RemoteBackend`); feature `wasm` for the browser
   WebSocket, `native` for a tokio-tungstenite client. Compiles for `wasm32-unknown-unknown`.
 
-Docs: `docs/vault/README.md` (container and CLI), `docs/protocol/vault.md` (wire
-protocol), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from).
+Docs: `docs/integration.md` (how an app pairs with a vault and what its UI must do),
+`docs/protocol/vault.md` (wire protocol), `docs/vault/README.md` (container and CLI), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from).
 
 ```sh
 cargo test --workspace
