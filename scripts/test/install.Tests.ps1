@@ -91,7 +91,11 @@ Describe 'install.ps1' {
         }
         function Get-Listing([string]$Dir) {
             if (-not (Test-Path -LiteralPath $Dir)) { return '' }
-            (Get-ChildItem -LiteralPath $Dir -Force | Sort-Object Name | ForEach-Object Name) -join ' '
+            # Ordinal, like the expected strings: Windows PowerShell 5.1's Sort-Object is
+            # culture-aware and ignores the hyphen.
+            [string[]]$names = @(Get-ChildItem -LiteralPath $Dir -Force | ForEach-Object Name)
+            [Array]::Sort($names, [StringComparer]::Ordinal)
+            $names -join ' '
         }
         function Get-Log { Get-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Raw }
 
