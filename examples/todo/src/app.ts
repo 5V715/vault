@@ -84,6 +84,9 @@ export class TodoList {
   #ready = false;
   #loading = false;
   #closed = false;
+  #locking = false;
+  /** Writes made but not yet committed (pending, queued or in flight). */
+  #unsaved = 0;
 
   constructor(session: DataSession, opts: TodoListOptions = {}) {
     this.#session = session;
@@ -111,9 +114,37 @@ export class TodoList {
     return this.#status;
   }
 
-  /** Loaded and not closed: edits are accepted. */
+  /** Loaded, not locking and not closed: edits are accepted. */
   get ready(): boolean {
-    return this.#ready && !this.#closed;
+    return this.#ready && !this.#closed && !this.#locking;
+  }
+
+  /** Lock was clicked: no more edits. */
+  get locking(): boolean {
+    return this.#locking;
+  }
+
+  /** Changes made but not committed yet. */
+  get unsaved(): number {
+    return this.#unsaved;
+  }
+
+  /**
+   * Before a voluntary lock: stop taking edits, commit what is pending now and
+   * wait for it, at most `ms`. Resolves with the number of changes still not
+   * committed (0 when everything was saved).
+   */
+  async flushForLock(ms: number): Promise<number> {
+    this.#locking = true;
+    this.#onChange();
+    this.#debouncer.flushNow();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.#debouncer.idle(),
+      new Promise<void>((r) => (timer = setTimeout(r, ms))),
+    ]);
+    clearTimeout(timer);
+    return this.#unsaved;
   }
 
   model(): ListModel {
@@ -147,13 +178,16 @@ export class TodoList {
     this.#edit({ kind: "delete", id });
   }
 
-  /** The session closed: drop pending edits and clear the list. Returns how many edits were dropped. */
+  /**
+   * The session closed: drop pending edits and clear the list. Returns how many
+   * changes were not committed (dropped from the debounce, or in flight).
+   */
   close(): number {
     this.#closed = true;
-    const dropped = this.#debouncer.drop();
+    this.#debouncer.drop();
     this.#state = emptyState();
     this.#ready = false;
-    return dropped;
+    return this.#unsaved;
   }
 
   /** Resolves once every edit so far was committed (or failed, or dropped). */
@@ -167,6 +201,7 @@ export class TodoList {
     if (r.writes.length === 0) return false;
     this.#state = r.state;
     for (const w of r.writes) this.#debouncer.push(w);
+    this.#unsaved += r.writes.length;
     this.#status = "saving";
     this.#onChange();
     return true;
@@ -182,6 +217,7 @@ export class TodoList {
     }
     if (this.#closed) return;
     await this.#session.commit();
+    this.#unsaved -= writes.length;
     if (this.#closed) return;
     // "saved" only when this was the last batch: none waiting for the quiet
     // period and none queued behind this one (running counts this flush).
@@ -202,7 +238,18 @@ export interface TodoAppOptions {
   dev: boolean;
   copyText?: (text: string) => Promise<void>;
   debounceMs?: number;
+  /** How long Lock waits for pending changes to be committed (default 5 s). */
+  lockFlushMs?: number;
   warn?: Warn;
+}
+
+/** Lock waits at most this long for pending changes to be committed. */
+export const LOCK_FLUSH_MS = 5_000;
+
+/** " N change(s) were not saved." for a notice, or "". */
+export function unsavedNotice(n: number): string {
+  if (n <= 0) return "";
+  return n === 1 ? " 1 change was not saved." : ` ${n} changes were not saved.`;
 }
 
 export class TodoApp {
@@ -275,6 +322,19 @@ export class TodoApp {
     }
   }
 
+  /** Lock: first commit what is pending (bounded wait), then end the session. */
+  async #lock(session: AppSession, list: TodoList): Promise<void> {
+    if (list.locking) return; // a second click
+    try {
+      const left = await list.flushForLock(this.#o.lockFlushMs ?? LOCK_FLUSH_MS);
+      if (left > 0) this.#warn(`vault-todo: locking with ${left} change(s) not committed`);
+    } catch (e) {
+      this.#warn("vault-todo: saving before lock failed:", e);
+    }
+    // The closed notice reports whatever is still not committed.
+    await session.lock().catch((e: unknown) => this.#warn("vault-todo: lock failed:", e));
+  }
+
   #onState(session: AppSession, state: string, reason?: string, detail?: string): void {
     const { ui } = this.#o;
     if (state === "active") {
@@ -290,7 +350,7 @@ export class TodoApp {
           onAdd: (text) => void list.add(text),
           onToggle: (id) => list.toggle(id),
           onDelete: (id) => list.remove(id),
-          onLock: () => void session.lock().catch((e: unknown) => this.#warn("vault-todo: lock failed:", e)),
+          onLock: () => void this.#lock(session, list),
         });
       this.#list = list;
       render();
@@ -299,9 +359,11 @@ export class TodoApp {
       this.#open = false;
       const list = this.#list;
       this.#list = undefined;
-      const dropped = list?.close() ?? 0;
-      if (dropped > 0) this.#warn(`vault-todo: ${dropped} unsaved edit(s) dropped`);
-      ui.showClosed(closeMessage(reason, detail), { onPairAgain: () => void this.connect() });
+      const unsaved = list?.close() ?? 0;
+      if (unsaved > 0) this.#warn(`vault-todo: ${unsaved} unsaved change(s) dropped`);
+      ui.showClosed(closeMessage(reason, detail) + unsavedNotice(unsaved), {
+        onPairAgain: () => void this.connect(),
+      });
     }
   }
 }

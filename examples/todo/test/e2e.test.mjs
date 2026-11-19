@@ -102,16 +102,19 @@ class RecordingUi {
 function newApp() {
   const ui = new RecordingUi();
   const warnings = [];
+  const env = { ui, warnings, session: undefined };
   const app = new TodoApp({
     // Node has no `location`: pass the page origin the vault was created for.
-    pair: (opts) => pair({ ...opts, testOrigin: TEST_ORIGIN }),
+    // The raw session is kept so a test can end it behind the app's back.
+    pair: async (opts) => (env.session = await pair({ ...opts, testOrigin: TEST_ORIGIN })),
     ui,
     relayOrigin: ctx.relay.origin,
     deviceName: "todo e2e",
     dev: false,
     warn: (...a) => warnings.push(a.map(String).join(" ")),
   });
-  return { app, ui, warnings };
+  env.app = app;
+  return env;
 }
 
 /**
@@ -138,11 +141,11 @@ async function pairApp(h, env, vault) {
 }
 
 /** "Lock" on the list screen; waits for the notice and vault-dev's clean exit. */
-async function lockApp(env, vd) {
+async function lockApp(env, vd, notice = "Vault locked.") {
   const from = env.ui.mark();
   env.ui.last.h.onLock();
   const closed = await env.ui.waitFor((s) => s.name === "closed", "the closed screen", from);
-  assert.equal(closed.message, "Vault locked.");
+  assert.equal(closed.message, notice);
   assert.equal((await vd.exit()).code, 0, "vault-dev exit status");
 }
 
@@ -243,16 +246,33 @@ describe("todo e2e", () => {
       await env.app.list.idle();
       env.ui.last.h.onAdd("lost");
       assert.equal(env.ui.last.model.status, "saving");
-      // Lock inside the 500 ms window: the edit is dropped and the list cleared.
-      await lockApp(env, a.vd);
-      assert.ok(
-        env.warnings.some((w) => /1 unsaved edit\(s\) dropped/.test(w)),
-        `the drop is reported: ${env.warnings}`,
-      );
+      // The session ends inside the 500 ms window without the app's Lock (as when
+      // the vault locks): the edit is dropped, the list cleared, the user told.
+      const from = env.ui.mark();
+      await env.session.lock();
+      const closed = await env.ui.waitFor((s) => s.name === "closed", "the closed screen", from);
+      assert.equal(closed.message, "Vault locked. 1 change was not saved.");
+      assert.equal((await a.vd.exit()).code, 0);
+      assert.equal(env.app.list, undefined, "the list is cleared");
       await new Promise((r) => setTimeout(r, 800));
 
       const b = await pairApp(h, env, vault);
       assert.deepEqual(shown(env), [["kept", false]], "the dropped edit does not reappear");
+      await lockApp(env, b.vd);
+    }),
+  );
+
+  test("lock_flushes_pending_edits_first_e2e", T, () =>
+    withHarness(ctx, async (h) => {
+      const vault = h.initVault();
+      const env = newApp();
+      const a = await pairApp(h, env, vault);
+      env.ui.last.h.onAdd("saved by lock");
+      assert.equal(env.ui.last.model.status, "saving");
+      // Lock at once, inside the 500 ms window: the app commits first.
+      await lockApp(env, a.vd);
+      const b = await pairApp(h, env, vault);
+      assert.deepEqual(shown(env), [["saved by lock", false]]);
       await lockApp(env, b.vd);
     }),
   );

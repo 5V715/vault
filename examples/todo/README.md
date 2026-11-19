@@ -11,8 +11,11 @@ It follows `docs/integration.md`:
   with **Codes match** and **Cancel**.
 - It makes no data call before `active`. The first call is `list("todo/")`.
 - Changes are committed after 500 ms of quiet.
+- **Lock** first commits the pending edits and waits for the commit, at most 5 s.
+  Then it locks.
 - On `closed` it drops edits still waiting to be committed, clears the list, and
-  shows why the session ended.
+  shows why the session ended. The notice also says how many changes were not
+  saved, if any.
 
 ## Data
 

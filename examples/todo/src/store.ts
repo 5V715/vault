@@ -224,6 +224,12 @@ export class Debouncer<T> {
     this.#timer = setTimeout(() => this.#fire(), this.#ms);
   }
 
+  /** Flush the pending items now instead of after the quiet period. */
+  flushNow(): void {
+    if (this.#timer !== undefined) clearTimeout(this.#timer);
+    this.#fire();
+  }
+
   /** Forget the pending items (a flush already running is not stopped). Returns how many. */
   drop(): number {
     if (this.#timer !== undefined) clearTimeout(this.#timer);

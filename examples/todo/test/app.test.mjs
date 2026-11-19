@@ -101,7 +101,7 @@ function fakePair(store) {
   return p;
 }
 
-function setup({ dev = false, store = new Map(), debounceMs = 30 } = {}) {
+function setup({ dev = false, store = new Map(), debounceMs = 30, lockFlushMs } = {}) {
   const ui = new FakeUi();
   const pair = fakePair(store);
   const warnings = [];
@@ -113,6 +113,7 @@ function setup({ dev = false, store = new Map(), debounceMs = 30 } = {}) {
     deviceName: "test",
     dev,
     debounceMs,
+    ...(lockFlushMs !== undefined ? { lockFlushMs } : {}),
     warn: (...a) => warnings.push(a.join(" ")),
     copyText: async (t) => copied.push(t),
   });
@@ -183,7 +184,7 @@ describe("TodoApp", () => {
     o.onState("closed", "locked", "locked");
     await settle();
     assert.equal(env.ui.last.name, "closed");
-    assert.equal(env.ui.last.message, "Vault locked.");
+    assert.equal(env.ui.last.message, "Vault locked. 2 changes were not saved.");
     await sleep(150);
     assert.deepEqual(
       s.dataCalls().filter(([n]) => n !== "list"),
@@ -198,6 +199,41 @@ describe("TodoApp", () => {
     assert.notEqual(b.s, s, "a new session");
     assert.equal(env.ui.last.name, "list");
     assert.deepEqual(env.ui.last.model.todos, []);
+  });
+
+  test("lock_flushes_pending_edits_first", async () => {
+    const env = setup({ debounceMs: 500 });
+    const { s, o } = await activate(env);
+    env.ui.last.h.onAdd("a");
+    env.ui.last.h.onLock(); // well inside the 500 ms window
+    for (let i = 0; i < 100 && !s.calls.some(([n]) => n === "lock"); i++) await sleep(5);
+    const names = s.calls.map(([n]) => n);
+    assert.ok(names.includes("lock"), `lock called: ${names}`);
+    assert.ok(names.indexOf("commit") >= 0 && names.indexOf("commit") < names.indexOf("lock"), `commit before lock: ${names}`);
+    assert.equal(env.store.size, 1, "the edit was committed");
+    assert.equal(env.ui.last.model.ready, false, "no edits while locking");
+    env.ui.last.h.onAdd("late");
+    assert.equal(env.ui.last.model.todos.length, 1, "an edit after Lock is ignored");
+    s.st = "closed";
+    o.onState("closed", "locked", "locked");
+    await settle();
+    assert.equal(env.ui.last.message, "Vault locked.", "nothing to report");
+  });
+
+  test("lock reports the changes it could not save in time", async () => {
+    const env = setup({ debounceMs: 500, lockFlushMs: 50 });
+    const { s, o } = await activate(env);
+    s.commit = () => new Promise(() => {}); // never returns
+    env.ui.last.h.onAdd("a");
+    const t0 = Date.now();
+    env.ui.last.h.onLock();
+    for (let i = 0; i < 200 && !s.calls.some(([n]) => n === "lock"); i++) await sleep(5);
+    assert.ok(s.calls.some(([n]) => n === "lock"), "locks after the bounded wait");
+    assert.ok(Date.now() - t0 < 900, "the wait is bounded");
+    s.st = "closed";
+    o.onState("closed", "locked", "locked");
+    await settle();
+    assert.equal(env.ui.last.message, "Vault locked. 1 change was not saved.");
   });
 
   test("edits are coalesced into one commit", async () => {
@@ -387,6 +423,29 @@ describe("TodoList", () => {
     assert.ok(list.add("later"));
     await list.idle();
     assert.equal(s.store.size, 1);
+  });
+
+  test("lock while the list is still loading still locks", async () => {
+    const env = setup();
+    await env.app.connect();
+    const s = env.pair.sessions[0];
+    const o = env.pair.opts[0];
+    let releaseList;
+    s.list = () => new Promise((r) => (releaseList = () => r([])));
+    s.st = "active";
+    o.onState("active");
+    await settle();
+    assert.equal(env.ui.last.model.ready, false);
+    env.ui.last.h.onLock();
+    env.ui.last.h.onLock();
+    await settle();
+    await settle();
+    assert.deepEqual(
+      s.calls.filter(([n]) => n === "lock"),
+      [["lock"]],
+      "locked once",
+    );
+    releaseList();
   });
 
   test("a failed commit marks the status and warns", async () => {
