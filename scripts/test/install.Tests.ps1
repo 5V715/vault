@@ -163,12 +163,13 @@ Describe 'install.ps1' {
     }
 
     It 'install_rejects_foreign_signature' {
-        $f = New-Fake 'foreign'
+        # 'foreignsig', not 'foreign': $script:Root\foreign is the foreign key file.
+        $f = New-Fake 'foreignsig'
         $r = Join-Path $f 'releases\v1.3.0'
         New-Zip (Join-Path $r "vault-1.3.0-$script:Target.zip") '6.6.6'
         Write-Sums $r
         Write-Sig $r (Join-Path $script:Root 'foreign')
-        $d = Join-Path $script:Root 'foreign\dest'
+        $d = Join-Path $script:Root 'foreignsig\dest'
         { & $script:Install -Dir $d } | Should -Throw '*signature check failed*'
         Get-Listing $d | Should -Be ''
         Get-Log | Should -Not -Match "vault-1\.3\.0-$script:Target"
@@ -218,10 +219,12 @@ Describe 'install.ps1' {
         & $script:Install -Version v1.2.3 -Dir $d
         Get-Installed $d | Should -Be "vaultctl 1.2.3 $script:Target"
         Get-Log | Should -Not -Match "release`tview"
+        # Invalid versions are refused before gh downloads anything.
+        Set-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Value '' -NoNewline
         foreach ($bad in '1.2.3', 'v1.2', 'v1.2.3*', 'v1.2.3 x', '..\v1.2.3') {
             { & $script:Install -Version $bad -Dir $d } | Should -Throw '*invalid version*'
         }
-        Get-Log | Should -Not -Match "release`tdownload`tv1\.2"
+        Get-Log | Should -Not -Match "release`tdownload"
         { & $script:Install -Version v9.9.9 -Dir (Join-Path $script:Root 'pin\bad') } | Should -Throw
         Get-Listing (Join-Path $script:Root 'pin\bad') | Should -Be ''
         Set-Content -LiteralPath (Join-Path $f 'latest') -Value 'v1.3.0*'

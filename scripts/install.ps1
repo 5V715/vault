@@ -53,28 +53,34 @@ function ConvertTo-Argument([string]$Value) {
     return '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
 
-# Runs a program without the shell; stdin (optional) comes byte-for-byte from a file.
+# Runs a program without the shell and captures its output. With -StdinFile, stdin is
+# the file itself (Start-Process opens it as the child's handle): Windows PowerShell 5.1
+# re-encodes piped text, and .NET Framework's redirected StandardInput writer appends
+# its encoding preamble on close, either of which changes the signed bytes.
 function Invoke-Native([string]$File, [string[]]$Arguments, [string]$StdinFile) {
+    $argLine = (@($Arguments) | ForEach-Object { ConvertTo-Argument $_ }) -join ' '
+    if ($StdinFile) {
+        $dir = Split-Path -Parent $StdinFile
+        $o = Join-Path $dir '.native-stdout'
+        $e = Join-Path $dir '.native-stderr'
+        try {
+            $p = Start-Process -FilePath $File -ArgumentList $argLine -NoNewWindow -Wait -PassThru `
+                -RedirectStandardInput $StdinFile -RedirectStandardOutput $o -RedirectStandardError $e
+            return [pscustomobject]@{ ExitCode = $p.ExitCode; Out = [IO.File]::ReadAllText($o); Err = [IO.File]::ReadAllText($e) }
+        } finally {
+            Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue
+        }
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $File
-    $psi.Arguments = (@($Arguments) | ForEach-Object { ConvertTo-Argument $_ }) -join ' '
+    $psi.Arguments = $argLine
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
-    $psi.RedirectStandardInput = [bool]$StdinFile
     $p = [System.Diagnostics.Process]::Start($psi)
     $out = $p.StandardOutput.ReadToEndAsync()
     $err = $p.StandardError.ReadToEndAsync()
-    if ($StdinFile) {
-        try {
-            $bytes = [IO.File]::ReadAllBytes($StdinFile)
-            $p.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
-            $p.StandardInput.Close()
-        } catch [System.IO.IOException] {
-            # The program exited without reading everything; its exit code decides.
-        }
-    }
     $p.WaitForExit()
     return [pscustomobject]@{ ExitCode = $p.ExitCode; Out = $out.Result; Err = $err.Result }
 }
@@ -223,7 +229,7 @@ try {
             $count++
         }
     }
-    if ($count -eq 0) { Fail "SHA256SUMS does not list $Archive (no build for $Target in $Version?)" }
+    if ($count -eq 0) { Fail "SHA256SUMS does not list $Archive (no build for $Target in $($Version)?)" }
     if ($count -ne 1) { Fail "SHA256SUMS lists $Archive more than once; refusing an ambiguous release" }
     $Zip = Join-Path $Dl $Archive
     $r = Invoke-Native $Gh @('release', 'download', $Version, '--repo', $Repo, '-p', $Archive, '-D', $Dl)
@@ -257,7 +263,7 @@ try {
     foreach ($b in $Binaries) {
         $s = Join-Path $Dir ".$b$suffix"
         $d = Join-Path $Dir $b
-        if (Test-Path -LiteralPath $d) { [IO.File]::Replace($s, $d, $null) } else { [IO.File]::Move($s, $d) }
+        if (Test-Path -LiteralPath $d) { [IO.File]::Replace($s, $d, [NullString]::Value) } else { [IO.File]::Move($s, $d) }
     }
     $Staged = @()
     Write-Host "installed $($Binaries -join ' ') ($Version) to $Dir"
