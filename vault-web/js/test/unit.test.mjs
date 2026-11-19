@@ -256,3 +256,39 @@ describe("build.mjs", () => {
     assert.ok(manifest.includes(`wasm-bindgen = "=${v}"`), `vault-web pins wasm-bindgen =${v}`);
   });
 });
+
+describe("package exports", () => {
+  const pkg = new URL("../", import.meta.url);
+  const expected = {
+    "vault-web": "dist/index.js",
+    "vault-web/node": "dist/node.js",
+    "vault-web/web": "pkg/web/vault_web.js",
+    "vault-web/web/vault_web_bg.wasm": "pkg/web/vault_web_bg.wasm",
+  };
+
+  test("every public import path resolves to its file", () => {
+    for (const [spec, file] of Object.entries(expected)) {
+      assert.equal(import.meta.resolve(spec), new URL(file, pkg).href, spec);
+    }
+  });
+
+  test("every import path named in the docs is exported", async () => {
+    const { readFileSync } = await import("node:fs");
+    const named = new Set();
+    for (const f of ["index.ts", "node.ts"]) {
+      const src = readFileSync(new URL(f, pkg), "utf8");
+      for (const m of src.matchAll(/"(vault-web(?:\/[^"\s]*)?)"/g)) named.add(m[1]);
+    }
+    assert.ok(named.has("vault-web/web") && named.has("vault-web/node"), [...named].join(", "));
+    for (const spec of named) {
+      assert.ok(spec in expected, `${spec} is documented but not in this test's list`);
+      assert.doesNotThrow(() => import.meta.resolve(spec), spec);
+    }
+  });
+
+  test("internal paths stay private", () => {
+    assert.throws(() => import.meta.resolve("vault-web/pkg/web/vault_web.js"), {
+      code: "ERR_PACKAGE_PATH_NOT_EXPORTED",
+    });
+  });
+});

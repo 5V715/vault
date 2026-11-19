@@ -176,7 +176,12 @@ jobs:
         working-directory: vault-web/js
         env:
           VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
-        run: npm test
+        run: npm run test:unit && npm run test:e2e
+      # The browser path: the --target web build loaded through "vault-web/web", and a
+      # tiny consumer that must type-check and bundle with esbuild (unresolved imports fail).
+      - name: web build and esbuild consumer bundle
+        working-directory: vault-web/js
+        run: npm run test:web && npm run test:bundle
 
   # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
   # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN

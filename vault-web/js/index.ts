@@ -8,8 +8,18 @@
  *
  * Loading the wasm module:
  * - Node 22+: `import { pair } from "vault-web/node"` (loads `pkg/node`).
- * - Browsers: `import * as glue from "vault-web/pkg/web/vault_web.js"`, then
- *   `await loadWeb(glue)` once, then `pair(...)`.
+ * - Browsers: `import * as glue from "vault-web/web"` (the `--target web`
+ *   glue), then `await loadWeb(glue, wasmUrl)` once, then `pair(...)` from
+ *   `"vault-web"`. `wasmUrl` is where the page serves
+ *   `"vault-web/web/vault_web_bg.wasm"` (with esbuild:
+ *   `import wasmUrl from "vault-web/web/vault_web_bg.wasm"` and
+ *   `--loader:.wasm=file`). Without it the glue fetches `vault_web_bg.wasm`
+ *   next to its own URL, which a bundle does not have.
+ *
+ * Copies of your data in JS: `get` and `list` return fresh `Uint8Array`s and
+ * key strings, which this package cannot wipe; the Rust side wipes its own
+ * plaintext copies. Keep a reference to the `Session`: if it is garbage
+ * collected, the session is locked (`closed`, `locked`).
  *
  * Transport: the runtime's global `WebSocket` (browsers; Node 22+ has one).
  */
@@ -153,8 +163,11 @@ export interface WasmBindings {
 
 /** The `--target web` module: its default export instantiates the wasm. */
 export interface WebGlue extends WasmBindings {
-  default(init?: { module_or_path: unknown }): Promise<unknown>;
+  default(init?: { module_or_path: WasmSource }): Promise<unknown>;
 }
+
+/** Where `loadWeb` gets the wasm: a URL to fetch, its bytes, or a compiled module. */
+export type WasmSource = string | URL | BufferSource | WebAssembly.Module;
 
 /** The vault's limit on key and prefix length (`vault_proto::msg::MAX_KEY`). */
 export const MAX_KEY_BYTES = 1024;
@@ -174,9 +187,12 @@ export function setWasm(bindings: WasmBindings): void {
   wasm = bindings;
 }
 
-/** Instantiate the `--target web` module (optionally from `wasmUrl`) and use it. */
-export async function loadWeb(glue: WebGlue, wasmUrl?: string | URL): Promise<void> {
-  await glue.default(wasmUrl === undefined ? undefined : { module_or_path: wasmUrl });
+/**
+ * Instantiate the `--target web` glue (`import * as glue from "vault-web/web"`)
+ * from `source` (default: `vault_web_bg.wasm` next to the glue) and use it.
+ */
+export async function loadWeb(glue: WebGlue, source?: WasmSource): Promise<void> {
+  await glue.default(source === undefined ? undefined : { module_or_path: source });
   setWasm(glue);
 }
 

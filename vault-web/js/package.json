@@ -16,7 +16,12 @@
     "./node": {
       "types": "./dist/node.d.ts",
       "default": "./dist/node.js"
-    }
+    },
+    "./web": {
+      "types": "./pkg/web/vault_web.d.ts",
+      "default": "./pkg/web/vault_web.js"
+    },
+    "./web/vault_web_bg.wasm": "./pkg/web/vault_web_bg.wasm"
   },
   "files": [
     "dist",
@@ -26,11 +31,14 @@
     "build": "tsc -p tsconfig.json",
     "build:wasm": "node build.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "npm run test:unit && npm run test:e2e",
+    "test": "npm run test:unit && npm run test:e2e && npm run test:web && npm run test:bundle",
     "test:unit": "npm run build && node --test test/unit.test.mjs",
-    "test:e2e": "npm run build && node --test --test-force-exit --test-concurrency=1 --test-reporter=spec test/e2e.test.mjs"
+    "test:e2e": "npm run build && node --test --test-force-exit --test-concurrency=1 --test-reporter=spec test/e2e.test.mjs",
+    "test:web": "npm run build && node --test --test-force-exit --test-reporter=spec test/web.test.mjs",
+    "test:bundle": "npm run build && node test/bundle-check.mjs"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
     "typescript": "6.0.3"
   }
 }
