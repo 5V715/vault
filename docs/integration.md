@@ -87,8 +87,15 @@ Rules:
   code visible, and never click it for the user. The session goes `Active` only
   after both the vault's approval and this click.
 - Cancel wins at any point before `Active`, even after "Codes match" or after
-  the vault approved: the session closes as `Denied` and no data request is
-  sent. After `Active`, `cancel_pairing()` returns an error; use `lock()`.
+  the vault approved: the session closes as `Denied` and `Active` is never
+  reported. Until both approvals have happened the client sends no store
+  request. While your `on_activate` hook runs the session already has a live
+  backend, so the hook's own requests (reads, and even a `flush_commit`) can
+  reach the vault before a cancel arrives; a later cancel still ends the
+  session as `Closed(Denied)`, drops the backend and runs `on_deactivate`.
+  After `Active`, `cancel_pairing()` returns an error; use `lock()`.
+- Keep `on_activate` read-only: no writes and no commit there, so a cancel
+  never leaves new data behind. Write only after `Active`.
 
 ## 4. Commit before you acknowledge or transmit
 

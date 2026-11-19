@@ -165,7 +165,9 @@ its own WebSocket.
   `confirm_sas`) the browser sends only `OpenSession`, `Ping` and
   `Close`, and links/connects nothing; `cancel_pairing` ends the session with reason `denied` and wins at any point
   before `active`: also after "Codes match" and after the vault's `Approved`
-  (no data request is sent, `active` is never reported). After `active` it is
+  (`active` is never reported; no data request is sent before both approvals,
+  but the app's activation step runs with a live backend, so its own requests
+  may reach the vault before the cancel, which apps should keep read-only). After `active` it is
   refused; `lock` ends an active session. The state is
   reported to the UI as `pairing`, `awaitingApproval` (until both
   confirmations), `active`, then `closed(reason)`.

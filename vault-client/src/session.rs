@@ -361,8 +361,11 @@ impl VaultSession {
     /// The user cancelled the code comparison (or closed the dialog). Cancel
     /// wins at any point before the session is `Active`, also after "Codes
     /// match" and after the vault's `Approved` (while the host's activation
-    /// hook still runs): the session ends with [`CloseReason::Denied`], no
-    /// store request is sent and `Active` is never reported. Idempotent while
+    /// hook still runs): the session ends with [`CloseReason::Denied`], the
+    /// backend is dropped, `on_deactivate` runs and `Active` is never reported.
+    /// No store request is sent before both approvals; while `on_activate` runs
+    /// the host's own requests (even a commit) may already have reached the
+    /// vault, so keep that hook read-only. Idempotent while
     /// pending. Once `Active` (or `Closed`) it changes nothing and returns an
     /// error: [`Self::lock`] ends an active session.
     pub fn cancel_pairing(&self) -> Result<(), ClientError> {
