@@ -20,6 +20,10 @@ Crates:
   Noise request channel, RAM write-back `RemoteBackend`); feature `wasm` for the browser
   WebSocket, `native` for a tokio-tungstenite client. Compiles for `wasm32-unknown-unknown`.
 
+Example: `examples/todo` is a minimal to-do web app whose only storage is the vault,
+through the `vault-web` browser package (`vault-web/js`); its README has a four-command
+local run.
+
 Docs: `docs/integration.md` (how an app pairs with a vault and what its UI must do),
 `docs/protocol/vault.md` (wire protocol), `docs/vault/README.md` (container and CLI), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from),
 `docs/install.md` (prebuilt binaries: signed releases, verifying install scripts, the

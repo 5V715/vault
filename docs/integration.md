@@ -188,6 +188,26 @@ again, and it is lost. If a commit fails the backend is dead and
 `flush_commit` returns `ClientError::CommitFailed`: treat the writes as not
 durable, do not acknowledge or transmit, and let the session close.
 
+### Traffic and commit batching
+
+What a session costs on the network, so you can decide how often to commit:
+
+- **Requests** are small. A `get`, `put` or `list` of a typical app record (a
+  to-do, a setting) is a few hundred bytes of Noise frames through the relay.
+- **Keepalive.** An open session pings every 30 s at most; through the relay
+  that is about 15 to 20 KB per hour, idle or not. `lock()` when the user is done.
+- **Commits** are the expensive part. Each `flush_commit` (`commit()` in
+  `vault-web`) makes the vault seal a new segment of at least 64 KiB and upload
+  it to every replica (S3, WebDAV, ...), however small the change was.
+
+So batch: buffer writes and commit once after a short quiet period instead of
+once per keystroke or click. The to-do example (`examples/todo`) commits 500 ms
+after the last edit, so a burst of edits becomes one segment. Batching does not
+relax section 5: commit, and wait for it, before you acknowledge or transmit
+anything derived from the writes. A `Closed` inside the quiet period drops the
+buffered writes (section 6), so keep the window short and show the user a
+"saving…" state until the commit has returned.
+
 ## 6. Handling `Closed(reason)`
 
 `reason.to_string()` gives the text in the second column.
