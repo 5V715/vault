@@ -1,0 +1,4 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Test-only fake GitHub CLI (see gh.py).
+exec python3 -I "$(dirname "$0")/gh.py" "$@"
