@@ -97,10 +97,16 @@ Describe 'install.ps1' {
             [Array]::Sort($names, [StringComparer]::Ordinal)
             $names -join ' '
         }
+        function Test-AllVersions([string]$Dir, [string]$Version) {
+            foreach ($b in 'vaultctl', 'vault-dev', 'vault-relay') {
+                if ((Get-Content -LiteralPath (Join-Path $Dir "$b.exe") -Raw) -cne "$b $Version $script:Target") { return $false }
+            }
+            return $true
+        }
         function Get-Log { Get-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Raw }
 
         $script:SavedEnv = @{}
-        foreach ($n in 'PATH', 'TEMP', 'TMP', 'VAULT_INSTALL_TEST', 'VAULT_INSTALL_TEST_ALLOWED_SIGNERS', 'VAULT_INSTALL_TEST_PATH_KEY', 'VAULT_FAKE_GH_AUTH_FAIL') {
+        foreach ($n in 'PATH', 'TEMP', 'TMP', 'VAULT_INSTALL_TEST', 'VAULT_INSTALL_TEST_ALLOWED_SIGNERS', 'VAULT_INSTALL_TEST_PATH_KEY', 'VAULT_FAKE_GH_AUTH_FAIL', 'VAULT_INSTALL_TEST_FAIL_RENAME') {
             $script:SavedEnv[$n] = [Environment]::GetEnvironmentVariable($n, 'Process')
         }
         $env:PATH = "$script:Shim;$env:PATH"
@@ -118,6 +124,7 @@ Describe 'install.ps1' {
         $env:VAULT_INSTALL_TEST_ALLOWED_SIGNERS = $script:TestSigners
         $env:VAULT_INSTALL_TEST_PATH_KEY = $script:PathKey
         Remove-Item Env:VAULT_FAKE_GH_AUTH_FAIL -ErrorAction SilentlyContinue
+        Remove-Item Env:VAULT_INSTALL_TEST_FAIL_RENAME -ErrorAction SilentlyContinue
     }
 
     It 'install_happy_path' {
@@ -265,6 +272,40 @@ Describe 'install.ps1' {
             ($err -like '*release key not configured*' -or $err -like '*signature check failed*') | Should -BeTrue
             Get-Listing $d | Should -Be ''
         }
+    }
+
+    It 'install_partial_failure_rolls_back' {
+        New-Fake 'rollback' | Out-Null
+        $d = Join-Path $script:Root 'rollback\dest dir'
+        & $script:Install -Version v1.2.3 -Dir $d
+        Test-AllVersions $d '1.2.3' | Should -BeTrue
+
+        # A locked (e.g. running) vault-relay.exe cannot be moved aside: the update aborts
+        # and the binaries already moved aside are put back.
+        $lock = [IO.File]::Open((Join-Path $d 'vault-relay.exe'), 'Open', 'Read', 'None')
+        try {
+            { & $script:Install -Dir $d } | Should -Throw '*stop*'
+        } finally { $lock.Close() }
+        Test-AllVersions $d '1.2.3' | Should -BeTrue
+        Get-Listing $d | Should -Be 'vault-dev.exe vault-relay.exe vaultctl.exe'
+        Get-Listing $script:Scratch | Should -Be ''
+
+        # A rename into place fails midway (test hook, test mode only): rolled back.
+        foreach ($b in 'vault-dev', 'vault-relay') {
+            $env:VAULT_INSTALL_TEST_FAIL_RENAME = $b
+            { & $script:Install -Dir $d } | Should -Throw
+            Test-AllVersions $d '1.2.3' | Should -BeTrue
+            Get-Listing $d | Should -Be 'vault-dev.exe vault-relay.exe vaultctl.exe'
+        }
+        $fresh = Join-Path $script:Root 'rollback\fresh'
+        { & $script:Install -Dir $fresh } | Should -Throw
+        Get-Listing $fresh | Should -Be ''
+        Remove-Item Env:VAULT_INSTALL_TEST_FAIL_RENAME
+
+        & $script:Install -Dir $d
+        Test-AllVersions $d '1.3.0' | Should -BeTrue
+        Get-Listing $d | Should -Be 'vault-dev.exe vault-relay.exe vaultctl.exe'
+        Get-Listing $script:Scratch | Should -Be ''
     }
 
     It 'install_ps1_idempotent_path' {

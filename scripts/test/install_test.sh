@@ -131,6 +131,10 @@ absent_or_empty() { [ ! -e "$1" ] || empty_dir "$1"; }
 no_download() { ! grep -q $'^release\tdownload' "$log"; }
 installed_version() { [ "$("$1/vaultctl")" = "vaultctl $2 ${3:-$host}" ]; }
 logged() { grep -q "$1" "$log"; }
+all_versions() { # all_versions <dir> <version>: every binary is that version
+  local b
+  for b in vaultctl vault-dev vault-relay; do [ "$("$1/$b")" = "$b $2 $host" ] || return 1; done
+}
 
 install_happy_path() {
   local f d
@@ -340,10 +344,59 @@ install_detects_target() {
   done
 }
 
+install_partial_failure_rolls_back() {
+  local f d
+  f="$(fake rollback)"
+  d="$tmp/rollback/dest"
+  run rollback "$f" --version v1.2.3 --dir "$d"
+  check "previous install in place" all_versions "$d" 1.2.3
+  # Renaming the second binary into place fails (test hook, test mode only).
+  extra="VAULT_INSTALL_TEST_FAIL_RENAME=vault-dev" run rollback "$f" --dir "$d"
+  check "failed rename: fails" failed
+  check "failed rename: every binary is the previous version" all_versions "$d" 1.2.3
+  check "failed rename: no stray files" test "$(listing "$d")" = "vault-dev vault-relay vaultctl "
+  check "failed rename: temporary files are removed" empty_dir "$scratch"
+  extra="VAULT_INSTALL_TEST_FAIL_RENAME=vault-relay" run rollback "$f" --dir "$d"
+  check "failed last rename: every binary is the previous version" all_versions "$d" 1.2.3
+  check "failed last rename: no stray files" test "$(listing "$d")" = "vault-dev vault-relay vaultctl "
+  # A fresh install that fails leaves nothing behind.
+  extra="VAULT_INSTALL_TEST_FAIL_RENAME=vault-relay" run rollback "$f" --dir "$tmp/rollback/fresh"
+  check "fresh install, failed rename: nothing left" empty_dir "$tmp/rollback/fresh"
+  # The hook is a test hook: without it the same update succeeds.
+  run rollback "$f" --dir "$d"
+  check "update without the hook succeeds" all_versions "$d" 1.3.0
+  # A destination that is a directory is refused before anything changes.
+  rm "$d/vault-relay"; mkdir "$d/vault-relay"
+  run rollback "$f" --dir "$d"
+  check "destination is a directory: fails" failed
+  check "destination is a directory: says so" says "not a regular file"
+  check "destination is a directory: other binaries untouched" installed_version "$d" 1.3.0
+  check "destination is a directory: no stray files" test "$(listing "$d")" = "vault-dev vault-relay vaultctl "
+  check "destination is a directory: left empty" empty_dir "$d/vault-relay"
+}
+
+install_dir_with_spaces_cleanup_is_safe() {
+  local f base d
+  f="$(fake spaces)"
+  base="$tmp/spaces/opt"
+  d="$base/my tools"
+  mkdir -p "$base"
+  echo keep > "$base/my"
+  run spaces "$f" --version v1.2.3 --dir "$d"
+  check "previous install in place" all_versions "$d" 1.2.3
+  extra="VAULT_INSTALL_TEST_FAIL_RENAME=vault-relay" run spaces "$f" --dir "$d"
+  check "fails" failed
+  check "the sibling file named like the first word survives" test "$(cat "$base/my" 2> /dev/null)" = keep
+  check "nothing else appears next to the directory" test "$(listing "$base")" = "my my tools "
+  check "every binary is the previous version" all_versions "$d" 1.2.3
+  check "no staged or backup files remain" test "$(listing "$d")" = "vault-dev vault-relay vaultctl "
+  check "temporary files are removed" empty_dir "$scratch"
+}
+
 all="install_happy_path install_rejects_tampered_archive install_rejects_foreign_signature
 install_rejects_unsigned_release install_refuses_placeholder_key install_requires_gh_login
 install_pins_version install_cleans_up_on_failure test_override_ignored_without_test_mode
-install_detects_target"
+install_detects_target install_partial_failure_rolls_back install_dir_with_spaces_cleanup_is_safe"
 # shellcheck disable=SC2086 # word list
 [ $# -gt 0 ] || set -- $all
 for t in "$@"; do
