@@ -21,7 +21,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v1.2.3 -Dir C:\t
 #>
 [CmdletBinding()]
 param(
-    # A release tag vX.Y.Z; default: the latest published release.
+    # A release tag vX.Y.Z (or vX.Y.Z-suffix); default: the latest stable release.
     [string]$Version,
     # Install directory; default: %LOCALAPPDATA%\vault\bin.
     [string]$Dir
@@ -180,11 +180,22 @@ if ((Invoke-Native $Gh @('auth', 'status')).ExitCode -ne 0) {
 }
 
 if (-not $PSBoundParameters.ContainsKey('Version')) {
-    # The latest published release (drafts and prereleases are never "latest").
-    $r = Invoke-Native $Gh @('release', 'view', '--repo', $Repo, '--json', 'tagName', '--jq', '.tagName')
-    if ($r.ExitCode -ne 0) { Fail "could not find the latest release of ${Repo}: $($r.Err.Trim())" }
-    $Version = $r.Out.TrimEnd("`r", "`n")
-    if ($Version -cnotmatch $VersionPattern) { Fail "invalid version '$Version' reported as the latest release" }
+    # The latest stable release: published (no drafts), not marked as a pre-release, and a
+    # plain vX.Y.Z tag (an unmarked -rc tag is skipped too). Among those, the one GitHub
+    # marks latest; otherwise the newest. Pre-releases install only with -Version.
+    $r = Invoke-Native $Gh @('release', 'list', '--repo', $Repo, '--exclude-drafts', '--exclude-pre-releases', '--limit', '100',
+        '--json', 'tagName,isLatest', '--jq', '.[] | [.tagName, (.isLatest|tostring)] | @tsv')
+    if ($r.ExitCode -ne 0) { Fail "could not list the releases of ${Repo} (gh too old for 'release list --json'? update gh): $($r.Err.Trim())" }
+    $first = $null
+    $Version = $null
+    foreach ($line in ($r.Out -split "`n")) {
+        $fields = $line.TrimEnd("`r") -split "`t"
+        if ($fields[0] -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+\z') { continue }
+        if (-not $first) { $first = $fields[0] }
+        if ($fields.Count -ge 2 -and $fields[1] -ceq 'true') { $Version = $fields[0]; break }
+    }
+    if (-not $Version) { $Version = $first }
+    if (-not $Version) { Fail "no published stable release of $Repo found (pre-releases install only with -Version)" }
 }
 $Archive = "vault-$($Version.Substring(1))-$Target.zip"
 

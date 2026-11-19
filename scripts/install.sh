@@ -18,6 +18,7 @@ set -euo pipefail
 REPO=5V715/vault
 BINARIES="vaultctl vault-dev vault-relay"
 VERSION_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+STABLE_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 # The release trust root: must equal keys/allowed_signers (scripts/test/trust_root_test.sh
 # enforces it). Replace it only together with keys/release.pub and keys/allowed_signers.
@@ -86,9 +87,20 @@ esac
 gh auth status > /dev/null 2>&1 || die "gh is not logged in to GitHub; run: gh auth login"
 
 if [ -z "$version" ]; then
-  # The latest published release (drafts and prereleases are never "latest").
-  version="$(gh release view --repo "$REPO" --json tagName --jq .tagName)" || die "could not find the latest release of $REPO"
-  [[ "$version" =~ $VERSION_RE ]] || die "invalid version '$version' reported as the latest release"
+  # The latest stable release: published (no drafts), not marked as a pre-release, and a
+  # plain vX.Y.Z tag (an unmarked -rc tag is skipped too). Among those, the one GitHub
+  # marks latest; otherwise the newest. Pre-releases install only with --version.
+  releases="$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
+    --json tagName,isLatest --jq '.[] | [.tagName, (.isLatest|tostring)] | @tsv')" ||
+    die "could not list the releases of $REPO (gh too old for 'release list --json'? update gh)"
+  first=""
+  while IFS=$'\t' read -r t is_latest; do
+    [[ "$t" =~ $STABLE_RE ]] || continue
+    [ -n "$first" ] || first="$t"
+    if [ "$is_latest" = true ]; then version="$t"; break; fi
+  done <<< "$releases"
+  [ -n "$version" ] || version="$first"
+  [ -n "$version" ] || die "no published stable release of $REPO found (pre-releases install only with --version)"
 fi
 archive="vault-${version#v}-$target.tar.gz"
 
