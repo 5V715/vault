@@ -58,6 +58,67 @@ jobs:
           # --no-fail-fast: one failing test binary must not hide the rest.
           cargo test --locked --no-fail-fast -p vault-container -p vault-server -p vault-mailbox
 
+  # The release signing and install scripts (scripts/install.sh, install.ps1,
+  # sign-release.sh) against a local fake release: throwaway keys and a fake gh.
+  # macOS runs them under its stock /bin/bash 3.2, which install.sh must support.
+  install-scripts:
+    name: install scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: shellcheck (the runner image's shellcheck)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          shellcheck --version
+          shellcheck scripts/*.sh scripts/test/*.sh scripts/test/fake-gh/gh
+      - name: trust root files agree
+        run: /bin/bash scripts/test/trust_root_test.sh
+      - name: install.sh tests
+        run: /bin/bash scripts/test/install_test.sh
+      - name: sign-release.sh tests
+        run: /bin/bash scripts/test/sign_release_test.sh
+
+  # install.ps1 under Windows PowerShell 5.1 and PowerShell 7. Pester is installed from
+  # the PowerShell Gallery at a pinned version (the images' inbox Pester 3.4 is too old).
+  install-scripts-windows:
+    name: install scripts (windows-latest, ${{ matrix.shell }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Pester 5.7.1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          $PSVersionTable
+          (Get-Command ssh-keygen.exe).Source
+      - name: install.ps1 tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module Pester -RequiredVersion 5.7.1
+          $c = New-PesterConfiguration
+          $c.Run.Path = 'scripts/test/install.Tests.ps1'
+          $c.Run.Exit = $true
+          $c.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $c
+
   wasm:
     runs-on: ubuntu-latest
     steps:

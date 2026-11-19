@@ -1,7 +1,8 @@
-# Pinned, hash-checked build tools for the release workflow (linux x86_64 runners only).
+# Pinned, hash-checked build tools for the release workflow and Dockerfile.relay
+# (linux x86_64 build hosts only).
 # Install: python3 -m venv V && V/bin/pip install --require-hashes --only-binary :all: -r tools/release-requirements.txt
-# Same versions as Dockerfile.relay. To bump: pip download the new wheels, check `pip hash`
-# against the PyPI-published sha256 values, and update both files together.
+# To bump: pip download the new wheels, check `pip hash` against the PyPI-published
+# sha256 values, and update the pins and hashes here.
 cargo-zigbuild==0.24.1 \
     --hash=sha256:238a1ab54a95053a4eadc34775c81f795a8ad75f80bfed63f3f445f518102375
 ziglang==0.16.0 \

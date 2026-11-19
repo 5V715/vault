@@ -11,6 +11,7 @@ shim="$scripts/test/fake-gh"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/vault-install-test.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 fails=0
+export COPYFILE_DISABLE=1 # macOS tar: no AppleDouble entries in the test archives
 placeholder='PLACEHOLDER — owner must replace'
 targets="x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin"
 windows_target=x86_64-pc-windows-msvc
@@ -89,7 +90,8 @@ fake() {
 # VAULT_INSTALL_TEST=1; $path_prefix is put in front of PATH.
 # shellcheck disable=SC2086 # $extra is split into NAME=VALUE words on purpose
 run() {
-  local name="$1" f="$2" mode=() extra="${extra:-}"
+  local name="$1" f="$2" mode extra="${extra:-}"
+  mode=()
   shift 2
   [ -n "$f" ] && [ -s "$f/latest" ] || { echo "FAIL fixture for '$name' was not created"; exit 1; }
   home="$tmp/$name/home"
@@ -104,7 +106,7 @@ run() {
     VAULT_FAKE_GH_DIR="$f" VAULT_FAKE_GH_LOG="$log" \
     VAULT_INSTALL_TEST_ALLOWED_SIGNERS="${signers_override-$test_signers}" \
     ${mode[@]+"${mode[@]}"} $extra \
-    bash "$install" "$@" 2>&1)" || rc=$?
+    "$BASH" "$install" "$@" 2>&1)" || rc=$?
 }
 
 check() { # check <description> <command...>

@@ -53,7 +53,7 @@ run() {
   : > "$log"
   rc=0
   out="$(printf '%s\n' "$answer" | env PATH="$shim:$PATH" VAULT_FAKE_GH_DIR="$f" VAULT_FAKE_GH_LOG="$log" \
-    ${auth_fail:+VAULT_FAKE_GH_AUTH_FAIL=1} bash "$r/scripts/sign-release.sh" "$@" 2>&1)" || rc=$?
+    ${auth_fail:+VAULT_FAKE_GH_AUTH_FAIL=1} "$BASH" "$r/scripts/sign-release.sh" "$@" 2>&1)" || rc=$?
 }
 
 check() {
