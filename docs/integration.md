@@ -29,7 +29,85 @@ can declare another app's origin. The pin keeps apps apart and catches
 misconfiguration; protection against a malicious page rests on the user
 checking the app, origin, relay host and code on the phone before approving.
 
-## 2. Pair
+## 2. Running the relay
+
+Pairing needs a relay: a WebSocket rendezvous at `<relay_origin>/mailbox/<32
+hex>` that pairs the browser with the vault and forwards their frames. The
+relay is untrusted. Everything it carries is Noise ciphertext between the
+browser and the vault (end to end, with the SAS check on both sides); it cannot
+read or change data or impersonate either side. What it controls is
+availability, and that is what its limits and origin allowlist protect.
+
+You can provide it in one of two ways.
+
+**A. Run `vault-relay`** (the `vault-mailbox` crate's binary, or the image from
+`Dockerfile.relay`) behind a TLS-terminating reverse proxy:
+
+```sh
+vault-relay --listen 127.0.0.1:8080 --allow-origin https://my-app.example --trust-proxy
+# or, with the image:
+docker run -p 127.0.0.1:8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://my-app.example IMAGE --trust-proxy
+```
+
+- `--allow-origin` (repeatable; or `VAULT_RELAY_ALLOW_ORIGIN`, comma-separated)
+  is required: list the page origin of every app that pairs through this relay,
+  that is the `origin` you pass to `pair`. The relay refuses to start without
+  one (exit status 2) and rejects values that break the origin rules of section
+  1 (`https`, `http` only for loopback, no path, query or fragment); values are
+  stored in canonical form. A browser whose `Origin` is not listed gets HTTP
+  403. Clients that send no `Origin` (native vaults, `vault-dev`) are always
+  admitted. There is no "allow any origin" mode: an open relay lets any website
+  hold mailboxes and use up the waiting-mailbox cap, which blocks pairing for
+  your users.
+- TLS is required: browsers and vaults use `wss://` (the `relay_origin` is
+  `https://...`, which maps to `wss://`). Plain `ws://` is accepted only for
+  loopback hosts, for local development. `vault-relay` itself speaks plain HTTP,
+  so terminate TLS in front of it. A `relay_origin` may include a base path
+  (`https://example.com/relay` becomes `wss://example.com/relay/mailbox/<id>`)
+  if your proxy strips it before forwarding.
+- `--trust-proxy` makes the relay take the client address from the first
+  `X-Forwarded-For` hop. Behind a proxy you need it, or every user shares the
+  proxy's address and its per-address limit (`--max-per-ip`, default 8 open
+  mailbox connections). Set it only when the proxy overwrites that header (for
+  example nginx `proxy_set_header X-Forwarded-For $remote_addr;`); otherwise a
+  client can pick its own address and evade the limit. Without a proxy, leave it
+  off.
+- The proxy must pass the WebSocket upgrade (`Upgrade`/`Connection` headers)
+  and must keep idle WebSockets open for longer than the 30 s keepalive
+  interval (nginx's default `proxy_read_timeout` of 60 s is enough; the relay's
+  own `--idle-timeout-s` defaults to 120 s).
+- Connection limits (defaults): `--max-per-ip 8` and `--max-total 64` open
+  mailbox connections (each pairing uses two: browser and vault), `--max-waiting
+  32` unpaired mailboxes, `--max-connections 256` HTTP connections including
+  not-yet-upgraded ones, unpaired mailboxes close after `--pair-timeout-s 60`,
+  and `--stall-timeout-s 60` cuts connections that make no progress. Size them
+  for your number of concurrent users. `GET /healthz` answers `ok` for health
+  checks.
+
+**B. Mount the mailbox in your own server**, as signal-web does. Build
+`vault-mailbox` with `default-features = false`, create one
+`vault_mailbox::Mailboxes::new(MailboxConfig { allowed_origins: vec![...], .. })`
+and route `GET /mailbox/<id>` to
+
+```rust
+mailboxes.handle_from(id, req, Some(peer_ip)).await
+```
+
+where `peer_ip` is the TCP peer address (the relay replaces it with the first
+`X-Forwarded-For` hop only if you set `trust_proxy`). Serve the connection with
+hyper's upgrades enabled (`serve_connection(..).with_upgrades()`), and call
+`mailboxes.shutdown()` when your server stops so open mailboxes close cleanly
+(1001). In a `MailboxConfig` built in code, `allowed_origins` defaults to empty,
+which admits **no** browser origin (only Origin-less native clients): list your
+app's origin, in canonical form (`vault_proto::binding::normalize_origin`),
+since the relay compares it byte for byte with the browser's `Origin` header.
+The same TLS, proxy and limit notes as in A apply; `MailboxConfig`'s fields
+match the flags above.
+
+Either way, pass the relay's public `https://` origin to `pair` as
+`relay_origin` (section 3).
+
+## 3. Pair
 
 ```rust
 use std::rc::Rc;
@@ -70,7 +148,7 @@ your account there; an `Err(text)` closes the session with that text.
 `on_deactivate` runs after the session ended, before `Closed`: stop anything
 that uses the store.
 
-## 3. What the UI must show
+## 4. What the UI must show
 
 | State | Show |
 |---|---|
@@ -97,7 +175,7 @@ Rules:
 - Keep `on_activate` read-only: no writes and no commit there, so a cancel
   never leaves new data behind. Write only after `Active`.
 
-## 4. Commit before you acknowledge or transmit
+## 5. Commit before you acknowledge or transmit
 
 Anything derived from state must be durable in the vault before it leaves the
 app. Call `backend.flush_commit().await` and only then acknowledge a message
@@ -110,7 +188,7 @@ again, and it is lost. If a commit fails the backend is dead and
 `flush_commit` returns `ClientError::CommitFailed`: treat the writes as not
 durable, do not acknowledge or transmit, and let the session close.
 
-## 5. Handling `Closed(reason)`
+## 6. Handling `Closed(reason)`
 
 `reason.to_string()` gives the text in the second column.
 
@@ -130,9 +208,9 @@ durable, do not acknowledge or transmit, and let the session close.
 | `Failed(text)` | the text | Your `on_activate` hook returned an error. |
 
 Every `Closed` drops the cache and buffered writes. Unsaved changes are lost;
-that is why section 4 matters.
+that is why section 5 matters.
 
-## 6. Unlink and `Clear`
+## 7. Unlink and `Clear`
 
 "Unlink" in an app is `backend.clear()` followed by `flush_commit()`. Because a
 vault is bound to one app and origin, this erases that app's data in the vault
@@ -140,7 +218,7 @@ and nothing else. Replicas receive the empty state at the next replication, but
 older replica snapshots keep the old data until the replica's own retention
 expires them. The vault does not control that retention; tell users.
 
-## 7. Depend on a pinned revision
+## 8. Depend on a pinned revision
 
 `vault-client` is a git dependency; always pin an exact commit, never a branch
 or tag:
