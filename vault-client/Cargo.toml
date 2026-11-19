@@ -1,0 +1,47 @@
+[package]
+name = "vault-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "App/browser side of the vault protocol: pairing session, Noise request channel and a RAM write-back RemoteBackend"
+
+[features]
+# No default transport: pick `wasm` (browser WebSocket) or `native` (tokio-tungstenite).
+default = []
+wasm = ["dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+native = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+
+[dependencies]
+vault-proto = { path = "../vault-proto" }
+thiserror.workspace = true
+async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+zeroize = "1"
+# Backs `SystemRng`; on wasm32 it needs `js` (browser crypto.getRandomValues), below.
+getrandom = "0.2"
+# `wasm`: the browser WebSocket mailbox transport and a `setTimeout` clock.
+js-sys = { version = "0.3.107", optional = true }
+wasm-bindgen = { version = "0.2.130", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["BinaryType", "CloseEvent", "Event", "MessageEvent", "WebSocket"] }
+# `native`: a tokio-tungstenite mailbox client and a tokio clock.
+tokio = { version = "1", optional = true, features = ["time"] }
+tokio-tungstenite = { version = "0.30", optional = true, default-features = false, features = ["connect"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["sink"] }
+
+# getrandom 0.2 (SystemRng here, snow's default resolver in vault-proto) needs `js`
+# to build for wasm32-unknown-unknown.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+# The tests use the native transport and clock.
+vault-client = { path = ".", features = ["native"] }
+vault-server = { path = "../vault-server", default-features = false }
+vault-mailbox = { path = "../vault-mailbox" }
+vault-container = { path = "../vault-container", default-features = false }
+async-trait = "0.1"
+futures = { version = "0.3", features = ["executor"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+zeroize = "1"
