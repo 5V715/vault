@@ -31,6 +31,10 @@ tracing = "0.1"
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
 
+[[test]]
+name = "mailbox"
+required-features = ["server"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }

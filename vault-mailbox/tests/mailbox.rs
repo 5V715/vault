@@ -444,3 +444,60 @@ async fn serves_only_healthz_and_mailbox() {
     // A plain GET to a valid mailbox id is not a websocket upgrade.
     assert_eq!(plain_get(&r, &format!("/mailbox/{ID}")).await, 400);
 }
+
+#[tokio::test]
+async fn accept_cap_refuses_excess_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let r = start(MailboxConfig {
+        max_connections: 2,
+        ..cfg()
+    })
+    .await;
+    // Two idle connections hold both slots.
+    let c1 = TcpStream::connect(r.addr).await.unwrap();
+    let _c2 = TcpStream::connect(r.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // A third is not served while the cap is reached...
+    let mut c3 = TcpStream::connect(r.addr).await.unwrap();
+    c3.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), c3.read(&mut buf))
+            .await
+            .is_err(),
+        "third connection was served beyond the cap"
+    );
+    // ...and is served as soon as a slot frees up.
+    drop(c1);
+    let n = tokio::time::timeout(Duration::from_secs(3), c3.read(&mut buf))
+        .await
+        .expect("not served after a slot freed")
+        .unwrap();
+    assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+}
+
+#[tokio::test]
+async fn stalled_connection_is_cut() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let r = start(MailboxConfig {
+        static_timeout: Duration::from_millis(300),
+        ..cfg()
+    })
+    .await;
+    let mut c = TcpStream::connect(r.addr).await.unwrap();
+    c.write_all(b"GET /healthz HTT").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(3), c.read(&mut buf))
+        .await
+        .expect("stalled connection was not cut")
+        .unwrap_or(0);
+    assert_eq!(n, 0);
+    // An upgraded mailbox is not subject to the stall cut.
+    let mut a = join(&r, ID).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut b = join(&r, ID).await.unwrap();
+    a.send(bin(b"still here")).await.unwrap();
+    assert_eq!(next_bin(&mut b).await, b"still here");
+}

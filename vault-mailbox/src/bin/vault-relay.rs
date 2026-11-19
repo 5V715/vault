@@ -37,6 +37,12 @@ struct Args {
     /// Maximum open mailbox connections in total.
     #[arg(long, default_value_t = MailboxConfig::default().max_total)]
     max_total: usize,
+    /// Maximum concurrent HTTP connections (including not yet upgraded ones).
+    #[arg(long, default_value_t = MailboxConfig::default().max_connections)]
+    max_connections: usize,
+    /// Seconds without any read or write progress before a plain HTTP connection is cut.
+    #[arg(long, default_value_t = MailboxConfig::default().static_timeout.as_secs())]
+    stall_timeout_s: u64,
     /// Take the client address from the first X-Forwarded-For hop (only behind a
     /// reverse proxy that overwrites that header).
     #[arg(long)]
@@ -60,6 +66,8 @@ async fn main() {
         max_per_ip: args.max_per_ip,
         max_total: args.max_total,
         trust_proxy: args.trust_proxy,
+        max_connections: args.max_connections,
+        static_timeout: Duration::from_secs(args.stall_timeout_s),
     };
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(l) => l,

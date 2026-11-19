@@ -8,7 +8,7 @@ Counts are from `cargo test -p <crate> -- --list` in both repositories (unit, in
 | container -> vault-container | 147 | 147 | 0 |
 | vault-proto -> vault-proto | 23 | 23 | 0 |
 | vault-server -> vault-server | 37 | 37 | 0 |
-| relay (mailbox tests only) -> vault-mailbox | 17 | 18 | 0 |
+| relay (mailbox tests only) -> vault-mailbox | 17 | 20 | 0 |
 
 Test binaries: `unittests src/...` are the unit tests inside the crate, `tests/*.rs` are integration test files, `doc` are doc tests. Doc-test paths are shown as in signal-web (`container/src/...` is `vault-container/src/...` here).
 
@@ -16,8 +16,8 @@ Test binaries: `unittests src/...` are the unit tests inside the crate, `tests/*
 
 `relay/tests/mailbox.rs` (17 tests) moved to `vault-mailbox/tests/mailbox.rs`, retargeted at an in-process
 `vault_mailbox::serve`. Two tests that exercised the tunnel are retargeted at mailbox-only limits:
-`limits_shared_with_tunnel` -> `per_ip_limit`, `total_limit_shared` -> `total_limit`. One test is new
-(`serves_only_healthz_and_mailbox`). The vault-server integration tests (`tests/session.rs`, `tests/vault_dev.rs`)
+`limits_shared_with_tunnel` -> `per_ip_limit`, `total_limit_shared` -> `total_limit`. Three tests are new
+(`serves_only_healthz_and_mailbox`, `accept_cap_refuses_excess_connections`, `stalled_connection_is_cut`). The vault-server integration tests (`tests/session.rs`, `tests/vault_dev.rs`)
 now start the same in-process relay instead of signal-web's `relay`; their assertions are unchanged.
 
 ## Tests
@@ -249,3 +249,5 @@ now start the same in-process relay instead of signal-web's `relay`; their asser
 | `unpaired_expires_after_60s` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
 | `waiting_client_close_is_echoed` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
 | `waiting_mailboxes_capped` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
+| `accept_cap_refuses_excess_connections` | `tests/mailbox.rs` | new | `vault-mailbox` |
+| `stalled_connection_is_cut` | `tests/mailbox.rs` | new | `vault-mailbox` |

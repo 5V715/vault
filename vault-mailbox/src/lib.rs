@@ -10,6 +10,8 @@
 
 mod pipe;
 #[cfg(feature = "server")]
+mod progress;
+#[cfg(feature = "server")]
 mod serve;
 
 use std::collections::HashMap;
@@ -51,6 +53,14 @@ pub struct MailboxConfig {
     /// Use the first `X-Forwarded-For` hop as the client address for the per-IP
     /// limit. Only enable behind a reverse proxy that OVERWRITES that header.
     pub trust_proxy: bool,
+    /// `serve` only: maximum concurrent HTTP connections, accepted or not yet
+    /// upgraded (a slot is taken before `accept`, so excess clients wait in the
+    /// kernel backlog).
+    pub max_connections: usize,
+    /// `serve` only: a connection is cut after this long without any read or write
+    /// progress (bounds slow-loris style pre-handshake connections; an upgraded
+    /// mailbox has its own idle timeout).
+    pub static_timeout: Duration,
 }
 
 impl Default for MailboxConfig {
@@ -64,6 +74,8 @@ impl Default for MailboxConfig {
             max_per_ip: 8,
             max_total: 64,
             trust_proxy: false,
+            max_connections: 256,
+            static_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -219,8 +231,10 @@ impl Mailboxes {
         switching_protocols(&key)
     }
 
-    /// Close every open mailbox with 1001 and refuse nothing else; call before
-    /// dropping the server so clients see a clean close.
+    /// Close every open mailbox with 1001; call before dropping the server so
+    /// clients see a clean close. One-way: the stop signal stays set, so a
+    /// `Mailboxes` used after `shutdown` closes new pipes immediately. Create a
+    /// fresh `Mailboxes` to serve again.
     pub fn shutdown(&self) {
         self.inner.stop.send_replace(true);
     }
