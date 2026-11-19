@@ -520,3 +520,112 @@ async fn restore_probes_source_conditional_writes() {
     .await
     .unwrap();
 }
+
+const PRE_V1: &str = "unsupported container format (created before vault v1)";
+
+/// Copies the pre-v1 fixture (written by the code from before the split, see its
+/// README) into `dir`, with its secrets file as `.vaultctl`.
+fn pre_v1_dir(dir: &Path) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pre-v1");
+    std::fs::create_dir_all(dir.join("seg")).unwrap();
+    std::fs::copy(src.join("header"), dir.join("header")).unwrap();
+    std::fs::copy(src.join("manifest"), dir.join("manifest")).unwrap();
+    std::fs::copy(src.join("vaultctl-secrets"), dir.join(".vaultctl")).unwrap();
+    for e in std::fs::read_dir(src.join("seg")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), dir.join("seg").join(e.file_name())).unwrap();
+    }
+}
+
+/// Every command on a directory from before the split names the format, not a
+/// recovery key typo or a wrong passphrase, and changes nothing.
+#[test]
+fn vaultctl_pre_v1_dir_reports_unsupported_format() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path().join("old");
+    pre_v1_dir(&d);
+    let before: Vec<_> = ["header", "manifest", ".vaultctl"]
+        .iter()
+        .map(|n| std::fs::read(d.join(n)).unwrap())
+        .collect();
+    for args in [
+        vec!["info"],
+        vec!["get", "greeting"],
+        vec!["scan", ""],
+        vec!["put", "k", "v"],
+        vec!["commit"],
+        vec!["replicate"],
+        vec!["replica", "list"],
+    ] {
+        // The fixture's own passphrase, and a wrong one: the header is checked first.
+        for pass in ["fixture-passphrase", "not it"] {
+            let mut a = vec!["--dir", d.to_str().unwrap()];
+            a.extend_from_slice(&args);
+            let o = ctl(pass, &[], "", &a);
+            assert_eq!(o.code, 1, "{args:?}: {}{}", o.stdout, o.stderr);
+            assert!(o.stderr.contains(PRE_V1), "{args:?}: {}", o.stderr);
+            assert!(!o.stderr.contains("checksum"), "{args:?}: {}", o.stderr);
+        }
+    }
+    let after: Vec<_> = ["header", "manifest", ".vaultctl"]
+        .iter()
+        .map(|n| std::fs::read(d.join(n)).unwrap())
+        .collect();
+    assert_eq!(before, after);
+}
+
+/// `restore` from a replica holding a pre-split container reports the format
+/// before it parses the (old) recovery key, and creates nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vaultctl_restore_from_pre_v1_replica_reports_unsupported_format() {
+    use vault_container::backend::{ContainerBackend, LocalBackend, WebDavBackend, WebDavConfig};
+    let dav = mock_webdav::MockWebDav::start(mock_webdav::Mode::Enforce);
+    let b = WebDavBackend::new(WebDavConfig {
+        base_url: dav.base_url(),
+        username: mock_webdav::USER.into(),
+        password: zeroize::Zeroizing::new(mock_webdav::PASSWORD.into()),
+        allow_insecure_http: false,
+        extra_root_ca_pem: None,
+    })
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let old = tmp.path().join("old");
+    pre_v1_dir(&old);
+    let local = LocalBackend::open(&old).await.unwrap();
+    let mut names = vec!["header".to_string(), "manifest".to_string()];
+    names.extend(local.list("seg/").await.unwrap());
+    for n in names {
+        let (data, _) = local.get(&n).await.unwrap().unwrap();
+        b.put_if_absent(&n, &data).await.unwrap();
+    }
+    let url = dav.base_url();
+    let base = tmp.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let r = base.join("restored");
+        // The recovery key printed by the old code (fixture README).
+        let old_key =
+            "LDVL-GV7F-BKGR-V24N-MYYQ-CNT2-GDDI-2UCY-AAS6-OD7D-FI7O-2RO6-RJ5E-IEJS-MFBP-OKFJ";
+        let o = run(
+            &r,
+            &[
+                ("VAULTCTL_WEBDAV_PASSWORD", mock_webdav::PASSWORD),
+                ("VAULTCTL_RECOVERY_KEY", old_key),
+            ],
+            &[
+                "restore",
+                "webdav",
+                "--id",
+                "dav",
+                "--url",
+                &url,
+                "--username",
+                mock_webdav::USER,
+            ],
+        );
+        assert_eq!(o.code, 1, "{}{}", o.stdout, o.stderr);
+        assert!(o.stderr.contains(PRE_V1), "{}", o.stderr);
+        assert!(!r.exists());
+    })
+    .await
+    .unwrap();
+}

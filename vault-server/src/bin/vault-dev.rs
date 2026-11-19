@@ -33,7 +33,7 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use rand::RngCore;
 use vault_container::backend::LocalBackend;
-use vault_container::engine::Container;
+use vault_container::engine::{Container, check_header};
 use vault_container::secrets::{load_secrets, save_sealed, save_secrets, unseal};
 use vault_container::{Error as ContainerError, RecoveryKey};
 use vault_proto::PairOffer;
@@ -164,6 +164,13 @@ fn save_high_water(
 
 async fn serve(a: ServeArgs) -> R<()> {
     let offer = PairOffer::from_qr(a.pair.trim()).map_err(|e| format!("bad pairing text: {e}"))?;
+    // The header first: a container from before the split must say so, not fail
+    // on its (old-format) recovery key, a passphrase or the relay.
+    // Read as a plain file (nothing is created in the directory); a missing header
+    // is left to the open below.
+    if let Ok(bytes) = std::fs::read(a.dir.join("header")) {
+        check_header(&bytes).map_err(|e| format!("cannot open container: {e}"))?;
+    }
     let pass = read_passphrase(&a)?;
     let mut secrets = load_secrets(&a.dir, &pass).map_err(|e| match e {
         ContainerError::BadSecrets => "wrong passphrase (or not a vaultctl directory)".to_string(),

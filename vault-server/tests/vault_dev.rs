@@ -521,3 +521,38 @@ async fn wrong_app_pairing_text_is_refused_without_a_prompt() {
         assert!(!err.contains("Type 'y "), "no prompt: {err}");
     }
 }
+
+/// A directory written by the code from before the split (the pre-v1 fixture of
+/// `vault-container`, see its README) is refused with the format error, before the
+/// relay is dialled and before the stored recovery key is used.
+#[tokio::test(flavor = "multi_thread")]
+async fn vault_dev_pre_v1_dir_reports_unsupported_format() {
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../vault-container/tests/fixtures/pre-v1");
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    std::fs::create_dir(d.join("seg")).unwrap();
+    std::fs::copy(src.join("header"), d.join("header")).unwrap();
+    std::fs::copy(src.join("manifest"), d.join("manifest")).unwrap();
+    std::fs::copy(src.join("vaultctl-secrets"), d.join(".vaultctl")).unwrap();
+    for e in std::fs::read_dir(src.join("seg")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), d.join("seg").join(e.file_name())).unwrap();
+    }
+    let relay = relay().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let o = offer(&relay, 7);
+    for pass in ["fixture-passphrase", "not it"] {
+        let mut v = spawn_vault(d, pass, &o.text, &tmp.path().join("pw"));
+        let st = v.exit().await;
+        let err = v.err.lock().unwrap().clone();
+        assert_eq!(st.code(), Some(1), "{err}");
+        assert!(
+            err.contains("unsupported container format (created before vault v1)"),
+            "{err}"
+        );
+        assert!(!err.contains("checksum"), "{err}");
+        assert!(!err.contains("Connecting"), "relay not dialled: {err}");
+    }
+    assert!(!d.join(".vault-dev-identity").exists());
+}

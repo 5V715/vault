@@ -24,7 +24,7 @@ use rand::RngCore;
 use vault_container::backend::{
     ContainerBackend, LocalBackend, S3Backend, S3Config, WebDavBackend, WebDavConfig,
 };
-use vault_container::engine::Container;
+use vault_container::engine::{Container, check_format, check_header};
 use vault_container::replicate::{
     ObservedMark, ReplicaId, ReplicaOutcome, ReplicaSet, ReplicaState, restore,
 };
@@ -427,6 +427,15 @@ async fn connect(cfg: &ReplicaCfg, probe: bool) -> R<Arc<dyn ContainerBackend>> 
     }
 }
 
+/// Checks the format of `dir/header` if there is one (read as a plain file, so
+/// nothing is created in `dir`); a missing header is left to the open.
+fn check_local_format(dir: &Path) -> R<()> {
+    match std::fs::read(dir.join("header")) {
+        Ok(bytes) => Ok(check_header(&bytes)?),
+        Err(_) => Ok(()),
+    }
+}
+
 struct Opened {
     c: Container<LocalBackend>,
     secrets: Secrets,
@@ -435,6 +444,9 @@ struct Opened {
 }
 
 async fn open(dir: &Path) -> R<Opened> {
+    // The header first: a container from before the split must say so, not fail
+    // later on its (old-format) recovery key or a passphrase prompt.
+    check_local_format(dir)?;
     let pass = passphrase(false)?;
     let secrets = load_secrets(dir, &pass)?;
     let rk = RecoveryKey::parse(&secrets.recovery_key)?;
@@ -724,11 +736,18 @@ async fn cmd_restore(dir: &Path, recovery_key: Option<String>, from: Kind) -> R<
         Some(k) => Zeroizing::new(k),
         None => env_or_prompt(ENV_RECOVERY_KEY, "Recovery key: ")?,
     };
-    let rk = RecoveryKey::parse(&rk_text)?;
     let entry = kind_to_entry(&from, &[])?;
     let pass = passphrase(true)?;
     // The source stays configured as a replica: probe it as `replica add` does.
     let source = connect(&entry.cfg, true).await?;
+    // A source from before the split reports the format before its (old-format)
+    // recovery key is parsed; an unreadable or missing header is left to `restore`.
+    if let Err(e @ (Error::PreV1Container | Error::UnsupportedFormatVersion(_))) =
+        check_format(source.as_ref()).await
+    {
+        return Err(e.into());
+    }
+    let rk = RecoveryKey::parse(&rk_text)?;
     let rid = ReplicaId(entry.id.clone());
 
     // Everything is built in a sibling staging directory and moved into place only after

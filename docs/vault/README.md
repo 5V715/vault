@@ -241,7 +241,10 @@ from it (see `docs/protocol/vault.md`, "Known answers").
   format version N`. A header without the marker is not a v1 container; if its
   first byte is `1` (the layout before the split: `version || postcard(body)`, no
   marker) it is refused as `unsupported container format (created before vault
-  v1)`. The binding must be valid and in canonical form (`docs/protocol/vault.md`,
+  v1)`. `vaultctl` (every command, and `restore` for the source replica) and
+  `vault-dev` check the header before they read the passphrase-protected secrets
+  or parse a recovery key, so an old directory reports this error rather than a
+  recovery key checksum mismatch. The binding must be valid and in canonical form (`docs/protocol/vault.md`,
   "App binding"). The header is plaintext; the manifest carries the same wrapped
   CRK and binding under its `auth_tag`, and opening (and restore) refuse a header
   that does not match its manifest.

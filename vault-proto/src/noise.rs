@@ -206,18 +206,36 @@ impl Cipher for ZChaChaPoly {
 fn prologue(offer: &PairOffer) -> Result<Vec<u8>> {
     crate::binding::validate_app_id(&offer.app_id).map_err(|_| NoiseError::Handshake)?;
     crate::binding::validate_origin(&offer.origin).map_err(|_| NoiseError::Handshake)?;
-    let mut p = Vec::with_capacity(
-        PROLOGUE_LABEL.len() + 1 + 4 + offer.app_id.len() + offer.origin.len() + 16 + 32,
-    );
+    encode_prologue(
+        offer.version,
+        &offer.app_id,
+        &offer.origin,
+        &offer.mailbox_id,
+        &offer.browser_eph_pub,
+    )
+}
+
+/// The prologue bytes, without validating the fields. The length prefixes keep
+/// the boundary between `app_id` and `origin`: two different splits of the same
+/// bytes give different prologues.
+fn encode_prologue(
+    version: u8,
+    app_id: &str,
+    origin: &str,
+    mailbox_id: &[u8; 16],
+    browser_eph_pub: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let mut p =
+        Vec::with_capacity(PROLOGUE_LABEL.len() + 1 + 4 + app_id.len() + origin.len() + 16 + 32);
     p.extend_from_slice(PROLOGUE_LABEL);
-    p.push(offer.version);
-    for field in [&offer.app_id, &offer.origin] {
+    p.push(version);
+    for field in [app_id, origin] {
         let len = u16::try_from(field.len()).map_err(|_| NoiseError::Handshake)?;
         p.extend_from_slice(&len.to_be_bytes());
         p.extend_from_slice(field.as_bytes());
     }
-    p.extend_from_slice(&offer.mailbox_id);
-    p.extend_from_slice(&offer.browser_eph_pub);
+    p.extend_from_slice(mailbox_id);
+    p.extend_from_slice(browser_eph_pub);
     Ok(p)
 }
 
@@ -714,6 +732,16 @@ mod tests {
     fn prologue_binds_app_and_origin() {
         let (b, vault) = (secret(1), secret(2));
         let offer = offer_for(&b, 7);
+        // Length prefixes keep field boundaries: the same bytes split differently
+        // between app_id and origin give different prologues, so the handshake
+        // fails. (Validation alone already rules such pairs out, as app ids
+        // cannot contain `:` or `/`; this pins the encoding itself.)
+        let (m, k) = (offer.mailbox_id, offer.browser_eph_pub);
+        let split_a = encode_prologue(1, "ab", "chttps://x.example", &m, &k).unwrap();
+        let split_b = encode_prologue(1, "a", "bchttps://x.example", &m, &k).unwrap();
+        assert_ne!(split_a, split_b);
+        assert!(handshake_with_prologues(b, vault, &split_a, &split_b).is_err());
+        assert!(handshake_with_prologues(b, vault, &split_a, &split_a).is_ok());
         // Layout: label, version, u16be-length-prefixed app_id and origin, mailbox, key.
         let mut want = b"vault/v1\x01\x00\x08test-app\x00\x13https://app.example".to_vec();
         want.extend_from_slice(&[7; 16]);
@@ -753,17 +781,6 @@ mod tests {
                 "{other:?}"
             );
         }
-        // Length prefixes keep field boundaries: moving bytes between app_id and
-        // origin cannot produce the same prologue.
-        let a = PairOffer {
-            app_id: "ab".into(),
-            ..offer.clone()
-        };
-        let c = PairOffer {
-            app_id: "a".into(),
-            ..offer.clone()
-        };
-        assert_ne!(prologue(&a).unwrap(), prologue(&c).unwrap());
         // An invalid binding never reaches the handshake.
         let bad = PairOffer {
             origin: "https://app.example/".into(),
@@ -774,6 +791,36 @@ mod tests {
             NoiseError::Handshake
         );
         assert_eq!(Initiator::new(&bad, b).unwrap_err(), NoiseError::Handshake);
+    }
+
+    /// XX handshake with explicit prologues on each side (no offer checks).
+    fn handshake_with_prologues(
+        browser: [u8; 32],
+        vault: [u8; 32],
+        browser_prologue: &[u8],
+        vault_prologue: &[u8],
+    ) -> Result<()> {
+        let build = |secret: &[u8; 32], prologue: &[u8], initiator: bool| {
+            let b =
+                Builder::with_resolver(NOISE_PATTERN.parse().unwrap(), Box::new(ZeroizingResolver))
+                    .prologue(prologue)
+                    .local_private_key(secret);
+            if initiator {
+                b.build_initiator()
+            } else {
+                b.build_responder()
+            }
+            .unwrap()
+        };
+        let mut i = build(&browser, browser_prologue, true);
+        let mut r = build(&vault, vault_prologue, false);
+        let m1 = write(&mut i)?;
+        read(&mut r, &m1)?;
+        let m2 = write(&mut r)?;
+        read(&mut i, &m2)?;
+        let m3 = write(&mut i)?;
+        read(&mut r, &m3)?;
+        Ok(())
     }
 
     /// Browser uses `browser_offer`, vault uses `vault_offer`.

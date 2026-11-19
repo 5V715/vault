@@ -820,7 +820,21 @@ impl<B: ContainerBackend> Container<B> {
     }
 }
 
-async fn read_header<B: ContainerBackend>(backend: &B) -> Result<HeaderBody> {
+/// Reads and checks the `header` object only (marker, format version, layout,
+/// binding), without any key. Tools call it before they touch stored keys, so a
+/// container from before the split reports [`Error::PreV1Container`] (and an
+/// unknown version [`Error::UnsupportedFormatVersion`]) rather than a key error.
+pub async fn check_format<B: ContainerBackend + ?Sized>(backend: &B) -> Result<()> {
+    read_header(backend).await.map(|_| ())
+}
+
+/// [`check_format`] on the bytes of a `header` object already read (for example
+/// from a local container directory, without opening it as a backend).
+pub fn check_header(bytes: &[u8]) -> Result<()> {
+    decode_header(bytes).map(|_| ())
+}
+
+async fn read_header<B: ContainerBackend + ?Sized>(backend: &B) -> Result<HeaderBody> {
     match backend.get(HEADER).await? {
         Some((bytes, _)) => decode_header(&bytes),
         None => Err(Error::Format("no container header".into())),
