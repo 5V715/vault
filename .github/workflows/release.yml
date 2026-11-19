@@ -3,7 +3,8 @@ name: release
 # A tag `vX.Y.Z` builds vaultctl, vault-dev and vault-relay for every target and
 # creates a DRAFT release holding the archives and SHA256SUMS. A draft is never
 # installable: the owner reviews SHA256SUMS, signs it offline (scripts/sign-release.sh)
-# and only then publishes. This workflow never signs and never publishes.
+# and only then publishes. This workflow never signs and never publishes. The archive
+# packaging is deterministic; the compiled binaries are not claimed to be reproducible.
 
 on:
   push:
@@ -16,9 +17,6 @@ env:
   CARGO_TERM_COLOR: never
   # Strip symbols from the release binaries (cheap size win, no effect on behaviour).
   CARGO_PROFILE_RELEASE_STRIP: 'true'
-  # Same pins as Dockerfile.relay.
-  CARGO_ZIGBUILD_VERSION: 0.24.1
-  ZIGLANG_VERSION: 0.16.0
 
 jobs:
   # Refuses to build until the owner has committed a real release key.
@@ -27,7 +25,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
       - name: tag looks like a version
         id: version
         shell: bash
@@ -53,21 +53,25 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true }
           # macos-13 (the Intel runner the design named) is retired; macos-15-intel is its successor.
           - { target: x86_64-apple-darwin, os: macos-15-intel, zig: false }
-          - { target: aarch64-apple-darwin, os: macos-14, zig: false }
+          - { target: aarch64-apple-darwin, os: macos-15, zig: false }
           - { target: x86_64-pc-windows-msvc, os: windows-latest, zig: false }
     steps:
-      - uses: actions/checkout@v4
-      - name: toolchain
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: toolchain (exact version from rust-toolchain.toml)
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: scripts/setup-rust.sh "$TARGET"
+      - name: cargo-zigbuild and zig (pinned versions and hashes)
+        if: matrix.zig
         shell: bash
         run: |
           set -euo pipefail
-          rustup target add "${{ matrix.target }}"
-          rustc --version
-          cargo --version
-      - name: cargo-zigbuild (pinned, as in Dockerfile.relay)
-        if: matrix.zig
-        shell: bash
-        run: python3 -m pip install --user "cargo-zigbuild==${CARGO_ZIGBUILD_VERSION}" "ziglang==${ZIGLANG_VERSION}"
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install --require-hashes --only-binary :all: -r tools/release-requirements.txt
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
       - name: build
         shell: bash
         env:
@@ -91,10 +95,13 @@ jobs:
           # Archive timestamps come from the tagged commit, so reruns agree.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
-          python3 -I scripts/package.py --version "$VERSION" --target "$TARGET" \
+          # Git Bash on Windows has `python`, not necessarily `python3`.
+          py=python3
+          if [ "$RUNNER_OS" = Windows ]; then py=python; fi
+          "$py" -I scripts/package.py --version "$VERSION" --target "$TARGET" \
             --bin-dir "target/$TARGET/release" --out dist
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: archive-${{ matrix.target }}
           path: dist/*
@@ -106,7 +113,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: archive-*
           path: dist
@@ -126,7 +133,7 @@ jobs:
             "vault-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
           )
           # Exactly the five archives, nothing else.
-          [ "$(LC_ALL=C ls | tr '\n' ' ')" = "${expected[*]} " ] || { echo "::error::unexpected files:"; ls -l; exit 1; }
+          [ "$(printf '%s\n' * | LC_ALL=C sort | tr '\n' ' ')" = "${expected[*]} " ] || { echo "::error::unexpected files:"; ls -l; exit 1; }
           LC_ALL=C sha256sum "${expected[@]}" > SHA256SUMS
           cat SHA256SUMS
       - name: create the draft release

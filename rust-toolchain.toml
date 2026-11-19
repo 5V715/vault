@@ -1,0 +1,5 @@
+# Exact compiler for local builds, CI and the release binaries. Bump deliberately.
+[toolchain]
+channel = "1.97.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

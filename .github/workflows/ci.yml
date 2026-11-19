@@ -14,7 +14,13 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: toolchain (exact version from rust-toolchain.toml)
+        run: scripts/setup-rust.sh
+      - name: release workflow refuses the placeholder key
+        run: scripts/test/check_key_test.sh
       - name: fmt, clippy, test
         shell: bash
         run: |
@@ -35,27 +41,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-14]
+        os: [windows-latest, macos-15]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: toolchain (exact version from rust-toolchain.toml)
+        shell: bash
+        run: scripts/setup-rust.sh
       - name: build and test the binaries' crates
         shell: bash
         run: |
           set -eo pipefail
           set -x
           cargo build --locked -p vault-container -p vault-server -p vault-mailbox
-          cargo test --locked -p vault-container -p vault-server -p vault-mailbox
+          # --no-fail-fast: one failing test binary must not hide the rest.
+          cargo test --locked --no-fail-fast -p vault-container -p vault-server -p vault-mailbox
 
   wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: toolchain (exact version from rust-toolchain.toml)
+        run: scripts/setup-rust.sh wasm32-unknown-unknown
       - name: build vault-proto and vault-client for wasm
         shell: bash
         run: |
           set -eo pipefail
           set -x
-          rustup target add wasm32-unknown-unknown
           # getrandom 0.2 (via snow's default resolver) gets its `js` feature from
           # vault-proto's wasm32 target dependency, so no extra flags are needed.
           cargo build -p vault-proto --locked --target wasm32-unknown-unknown
@@ -69,8 +84,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: build and run image
         shell: bash
         run: |
@@ -105,7 +122,7 @@ jobs:
             set -ex
             docker buildx build -f Dockerfile.relay --progress=plain --platform linux/arm64,linux/arm/v7 --output type=cacheonly .
           } 2>&1 | tee -a logs/relay-image.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: log-relay-image

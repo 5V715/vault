@@ -982,11 +982,21 @@ async fn ping_is_answered_in_every_state() {
     assert_eq!(expect_response(&mut b, open).await, ResponseBody::Approved);
     assert_eq!(b.call(RequestBody::Ping).await, ResponseBody::Ok);
     // Pings keep the connection alive but do not count as activity.
+    let started = tokio::time::Instant::now();
     let ended_idle = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match b.call_any(RequestBody::Ping).await {
                 Some(VaultMessage::Response(r)) => assert_eq!(r.body, ResponseBody::Ok),
-                Some(VaultMessage::Notice(n)) => return n,
+                Some(VaultMessage::Notice(n)) => return Some(n),
+                // The pings straddle the idle deadline, so one is sent just as the vault
+                // ends the session and closes. On Windows, data sent to a connection that
+                // is being closed makes the peer reset it, and a reset discards what the
+                // client has not read yet, i.e. the notice (CI run 44560647812). The close
+                // must still not come before the idle timeout, and the vault's own end
+                // reason is asserted below. On Unix the notice is always delivered.
+                None if cfg!(windows) && started.elapsed() >= Duration::from_millis(450) => {
+                    return None;
+                }
                 None => panic!("closed without notice"),
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -994,12 +1004,14 @@ async fn ping_is_answered_in_every_state() {
     })
     .await
     .expect("pings must not reset the idle timeout");
-    assert_eq!(
-        ended_idle,
-        Notice::SessionTerminated {
-            reason: "idle".into()
-        }
-    );
+    if let Some(n) = ended_idle {
+        assert_eq!(
+            n,
+            Notice::SessionTerminated {
+                reason: "idle".into()
+            }
+        );
+    }
     assert_eq!(ended(h).await, EndReason::IdleTimeout);
 }
 
