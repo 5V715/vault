@@ -14,6 +14,9 @@ Crates:
 - `vault-mailbox`: the relay mailbox (`Mailboxes::handle` pairs two WebSocket clients
   and pipes Noise frames) and the `vault-relay` binary; `Dockerfile.relay` builds a
   scratch image of it.
+- `vault-client`: the app/browser side (pairing session with the two-sided code check,
+  Noise request channel, RAM write-back `RemoteBackend`); feature `wasm` for the browser
+  WebSocket, `native` for a tokio-tungstenite client. Compiles for `wasm32-unknown-unknown`.
 
 Docs: `docs/vault/README.md` (container and CLI), `docs/protocol/vault.md` (wire
 protocol), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from).

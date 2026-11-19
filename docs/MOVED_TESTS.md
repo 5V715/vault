@@ -9,6 +9,7 @@ Counts are from `cargo test -p <crate> -- --list` in both repositories (unit, in
 | vault-proto -> vault-proto | 23 | 23 | 0 |
 | vault-server -> vault-server | 37 | 37 | 0 |
 | relay (mailbox tests only) -> vault-mailbox | 17 | 20 | 0 |
+| core (vault client tests only) -> vault-client | 15 moved, 7 stay | 21 | 0 |
 
 Test binaries: `unittests src/...` are the unit tests inside the crate, `tests/*.rs` are integration test files, `doc` are doc tests. Doc-test paths are shown as in signal-web (`container/src/...` is `vault-container/src/...` here).
 
@@ -19,6 +20,40 @@ Test binaries: `unittests src/...` are the unit tests inside the crate, `tests/*
 `limits_shared_with_tunnel` -> `per_ip_limit`, `total_limit_shared` -> `total_limit`. Three tests are new
 (`serves_only_healthz_and_mailbox`, `accept_cap_refuses_excess_connections`, `stalled_connection_is_cut`). The vault-server integration tests (`tests/session.rs`, `tests/vault_dev.rs`)
 now start the same in-process relay instead of signal-web's `relay`; their assertions are unchanged.
+
+## Vault client tests
+
+The app/browser side of the protocol moved out of signal-web's `core` crate (`core/src/remote/`,
+the pairing lifecycle in `core/src/client.rs`, the mailbox part of `core/src/wasm/transport.rs`)
+into `vault-client`. 15 tests moved: the 7 channel/backend tests of `core/src/remote/tests.rs` and the
+zeroize guard of `core/src/remote/backend.rs` drive the crate-internal channel, so they stay unit tests
+(`vault-client/src/tests.rs`, `vault-client/src/backend.rs`); the 7 Signal-free pairing tests of
+`core/src/client/tests/vault.rs` moved to `vault-client/tests/session.rs` and use the public
+`VaultSession` API instead of `Client::pair_with`. Where the originals checked "nothing works" through
+Signal calls (`conversations()`, `connect()`, `is_linked()`), the moved tests check
+`VaultSession::backend()` is `None` (and that the store answers once Active); the asserted close reasons
+are compared as `CloseReason` values and, where the original compared text, also as their text. Error
+assertions use `ClientError` (`denied_pairing_is_an_error`: `ClientError::Denied`, previously
+`CoreError::Protocol`; `a_failed_commit_kills_the_backend` additionally checks
+`ClientError::CommitFailed`). The harness (in-process relay mailbox and vault) is
+`vault-client/tests/common/mod.rs`, shared with the unit tests; frames sent are counted by a wrapping
+`MailboxFactory` instead of a thread-local in the transport.
+
+6 tests are new: `error::tests::texts_are_stable`, `transport::tests::mailbox_urls` (unit), and
+`lock_discards_the_backend_and_reports_locked`, `activate_runs_before_active_and_deactivate_before_closed`,
+`failed_activation_closes_with_the_hosts_reason`, `pair_rejects_bad_device_names_and_relay_urls`
+(`tests/session.rs`).
+
+These Signal-dependent vault tests stay in signal-web (`core/src/client/tests/vault.rs`), running
+against the signal-web adapter over `vault-client`:
+
+- `link_and_receive_through_vault`
+- `ack_only_after_vault_commit`
+- `drop_mid_session_discards_pending_and_redelivers`
+- `cache_dropped_on_lock`
+- `no_local_persistence`
+- `commit_failure_prevents_send`
+- `concurrent_send_during_receive_does_not_commit_partial_envelope`
 
 ## Tests
 
@@ -251,3 +286,31 @@ now start the same in-process relay instead of signal-web's `relay`; their asser
 | `waiting_mailboxes_capped` | `tests/mailbox.rs` | `relay` | `vault-mailbox` |
 | `accept_cap_refuses_excess_connections` | `tests/mailbox.rs` | new | `vault-mailbox` |
 | `stalled_connection_is_cut` | `tests/mailbox.rs` | new | `vault-mailbox` |
+| `remote::tests::writes_are_buffered_until_commit_and_then_visible_to_a_new_session` -> `tests::writes_are_buffered_until_commit_and_then_visible_to_a_new_session` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::tests::uncommitted_writes_are_lost_with_the_session` -> `tests::uncommitted_writes_are_lost_with_the_session` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::tests::scan_merges_the_overlay_and_put_if_absent_is_correct` -> `tests::scan_merges_the_overlay_and_put_if_absent_is_correct` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::tests::clear_removes_everything_after_commit` -> `tests::clear_removes_everything_after_commit` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::tests::a_failed_commit_kills_the_backend` -> `tests::a_failed_commit_kills_the_backend` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::tests::requests_before_approval_not_sent` -> `tests::requests_before_approval_not_sent` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::tests::denied_pairing_is_an_error` -> `tests::denied_pairing_is_an_error` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `remote::backend::zeroize_tests::cache_values_are_zeroizing` -> `backend::zeroize_tests::cache_values_are_zeroizing` | `unittests src/lib.rs` | `core` | `vault-client` |
+| `client::tests::vault::nothing_is_accepted_before_approval_and_denial_closes` -> `nothing_is_accepted_before_approval_and_denial_closes` | `tests/session.rs` | `core` | `vault-client` |
+| `client::tests::vault::active_requires_local_sas_confirmation` -> `active_requires_local_sas_confirmation` | `tests/session.rs` | `core` | `vault-client` |
+| `client::tests::vault::confirmation_before_vault_approval_also_works` -> `confirmation_before_vault_approval_also_works` | `tests/session.rs` | `core` | `vault-client` |
+| `client::tests::vault::confirm_before_code_shown_is_refused` -> `confirm_before_code_shown_is_refused` | `tests/session.rs` | `core` | `vault-client` |
+| `client::tests::vault::cancel_aborts_with_denied` -> `cancel_aborts_with_denied` | `tests/session.rs` | `core` | `vault-client` |
+| `client::tests::vault::impostor_vault_with_qr_text_cannot_reach_active_without_confirmation` -> `impostor_vault_with_qr_text_cannot_reach_active_without_confirmation` | `tests/session.rs` | `core` | `vault-client` |
+| `client::tests::vault::ping_keeps_session_alive` -> `ping_keeps_session_alive` | `tests/session.rs` | `core` | `vault-client` |
+| `error::tests::texts_are_stable` | `unittests src/lib.rs` | new | `vault-client` |
+| `transport::tests::mailbox_urls` | `unittests src/lib.rs` | new | `vault-client` |
+| `lock_discards_the_backend_and_reports_locked` | `tests/session.rs` | new | `vault-client` |
+| `activate_runs_before_active_and_deactivate_before_closed` | `tests/session.rs` | new | `vault-client` |
+| `failed_activation_closes_with_the_hosts_reason` | `tests/session.rs` | new | `vault-client` |
+| `pair_rejects_bad_device_names_and_relay_urls` | `tests/session.rs` | new | `vault-client` |
+| `client::tests::vault::link_and_receive_through_vault` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
+| `client::tests::vault::ack_only_after_vault_commit` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
+| `client::tests::vault::drop_mid_session_discards_pending_and_redelivers` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
+| `client::tests::vault::cache_dropped_on_lock` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
+| `client::tests::vault::no_local_persistence` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
+| `client::tests::vault::commit_failure_prevents_send` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |
+| `client::tests::vault::concurrent_send_during_receive_does_not_commit_partial_envelope` | `core/src/client/tests/vault.rs` | `core` | stays in signal-web (needs Signal) |

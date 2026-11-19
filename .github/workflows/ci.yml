@@ -22,13 +22,15 @@ jobs:
           set -x
           cargo fmt --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          # The browser drivers (feature `wasm`) also type-check on the host.
+          cargo clippy -p vault-client --all-targets --features wasm,native --locked -- -D warnings
           cargo test --workspace --locked
 
   wasm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build vault-proto for wasm
+      - name: build vault-proto and vault-client for wasm
         shell: bash
         run: |
           set -eo pipefail
@@ -37,6 +39,8 @@ jobs:
           # getrandom 0.2 (via snow's default resolver) gets its `js` feature from
           # vault-proto's wasm32 target dependency, so no extra flags are needed.
           cargo build -p vault-proto --locked --target wasm32-unknown-unknown
+          # vault-client gets getrandom's `js` the same way; no tokio in this build.
+          cargo build -p vault-client --target wasm32-unknown-unknown --features wasm --locked
 
   # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
   # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN

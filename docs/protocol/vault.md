@@ -106,8 +106,9 @@ ends the old one, which receives `Notice::SessionTerminated`.
 
 ## Browser client behaviour
 
-Implemented by the browser-side client of the embedding app (a write-back
-`RemoteBackend` over the vault's key-value interface, plus the pairing lifecycle);
+Implemented by the `vault-client` crate, which the embedding app wraps (a write-back
+`RemoteBackend` over the vault's key-value interface, plus the pairing lifecycle
+`VaultSession`);
 the browser connects to `{relay origin}/mailbox/<hex>` with
 its own WebSocket.
 
