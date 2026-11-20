@@ -1577,3 +1577,89 @@ async fn open_time_binding_mismatch_denies() {
     assert!(s.is_locked());
     assert_eq!(s.active_session(), None);
 }
+
+// ---------- host hooks: observer, manifest key, forced compaction ----------
+
+#[derive(Default)]
+struct Recorder {
+    approved: Mutex<Vec<u64>>,
+    marks: Mutex<Vec<vault_container::engine::HighWater>>,
+}
+
+impl vault_server::SessionObserver for Recorder {
+    fn approved(&self, session: u64) {
+        self.approved.lock().unwrap().push(session);
+    }
+    fn high_water(&self, hw: vault_container::engine::HighWater) {
+        self.marks.lock().unwrap().push(hw);
+    }
+}
+
+fn observed(rec: &Arc<Recorder>, base: ServerConfig) -> ServerConfig {
+    ServerConfig {
+        observer: Some(vault_server::Observer(rec.clone())),
+        ..base
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn observer_sees_approval_and_every_new_manifest() {
+    let relay = relay().await;
+    let rec = Arc::new(Recorder::default());
+    let s = server(Auto::new(true), observed(&rec, policy(2, 1.0, usize::MAX))).await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    assert_eq!(*rec.approved.lock().unwrap(), vec![h.id()]);
+    commit_keys(&mut b, distinct(2)).await;
+    {
+        let marks = rec.marks.lock().unwrap();
+        assert_eq!(marks.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2]);
+    }
+    assert_eq!(
+        *rec.marks.lock().unwrap().last().unwrap(),
+        s.high_water().await.unwrap()
+    );
+    close(&mut b, h).await;
+    // Compaction at session end is a new manifest too.
+    let hw = s.high_water().await.unwrap();
+    assert_eq!(hw.seq, 3);
+    assert_eq!(*rec.marks.lock().unwrap().last().unwrap(), hw);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manifest_key_only_while_unlocked() {
+    let (backend, crk) = locked_backend().await;
+    let want = crk.subkeys().manifest;
+    let s = VaultServer::new(
+        Container::open_with_crk(backend.clone(), crk, None)
+            .await
+            .unwrap(),
+        Auto::new(true),
+        ServerConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(s.manifest_key().await.unwrap()[..], want[..]);
+    s.lock().await;
+    assert!(s.manifest_key().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_now_ignores_policy_but_not_sessions() {
+    let relay = relay().await;
+    let rec = Arc::new(Recorder::default());
+    // A policy that never compacts on its own.
+    let s = server(
+        Auto::new(true),
+        observed(&rec, policy(usize::MAX, 2.0, usize::MAX)),
+    )
+    .await;
+    let (mut b, h) = open(&s, &relay, "A").await;
+    commit_keys(&mut b, distinct(3)).await;
+    assert_eq!(s.compact_now().await.unwrap(), None, "a session is active");
+    close(&mut b, h).await;
+    assert_eq!(s.container_stats().await.unwrap().segments, 3);
+    let seq = s.compact_now().await.unwrap().expect("compacted");
+    assert_eq!(s.container_stats().await.unwrap().segments, 1);
+    assert_eq!(rec.marks.lock().unwrap().last().unwrap().seq, seq);
+    s.lock().await;
+    assert_eq!(s.compact_now().await.unwrap(), None, "locked");
+}

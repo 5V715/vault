@@ -432,6 +432,7 @@ async fn drive(
         return e.into();
     }
     tracing::info!(session = id, "vault session: approved");
+    inner.notify_approved(id);
 
     // Active.
     let deadline = Instant::now() + cfg.session_timeout;
@@ -596,6 +597,9 @@ async fn handle(inner: &Inner, id: u64, body: RequestBody) -> ResponseBody {
     }
     let r = apply(c, &body).await;
     wipe_request(body);
+    if matches!(r, ResponseBody::Committed { .. }) {
+        inner.notify_high_water(c.high_water());
+    }
     r
 }
 

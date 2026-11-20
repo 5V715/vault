@@ -134,6 +134,30 @@ impl CompactionPolicy {
     }
 }
 
+/// Host hooks for events the host persists or shows (on Android: the
+/// high-water file and the session notification).
+///
+/// Both methods are called synchronously from the session machinery, the
+/// high-water one under the container lock: implementations must return
+/// quickly and never block (hand the event to a channel or a task).
+pub trait SessionObserver: Send + Sync {
+    /// Session `session` was answered `Approved` and is now the active one.
+    fn approved(&self, _session: u64) {}
+    /// A new manifest was written (a commit or a compaction): the mark to
+    /// persist and pass to the next unlock.
+    fn high_water(&self, _hw: HighWater) {}
+}
+
+/// A [`SessionObserver`] in a [`ServerConfig`].
+#[derive(Clone)]
+pub struct Observer(pub Arc<dyn SessionObserver>);
+
+impl std::fmt::Debug for Observer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Observer")
+    }
+}
+
 /// Server settings.
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -153,6 +177,8 @@ pub struct ServerConfig {
     pub extra_ca_pem: Option<Vec<u8>>,
     /// When to compact the container between sessions.
     pub compaction: CompactionPolicy,
+    /// Host hooks (approval, new high-water marks); `None` for none.
+    pub observer: Option<Observer>,
 }
 
 impl Default for ServerConfig {
@@ -165,6 +191,7 @@ impl Default for ServerConfig {
             send_timeout: Duration::from_secs(60),
             extra_ca_pem: None,
             compaction: CompactionPolicy::default(),
+            observer: None,
         }
     }
 }
@@ -379,6 +406,20 @@ impl Inner {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Report a new manifest mark to the host's observer, if any.
+    pub(crate) fn notify_high_water(&self, hw: HighWater) {
+        if let Some(o) = &self.config.observer {
+            o.0.high_water(hw);
+        }
+    }
+
+    /// Report an approved session to the host's observer, if any.
+    pub(crate) fn notify_approved(&self, id: u64) {
+        if let Some(o) = &self.config.observer {
+            o.0.approved(id);
+        }
+    }
+
     /// Install `c` as the open container (the caller holds the `container` lock).
     pub(crate) fn install(&self, slot: &mut Option<VaultContainer>, c: VaultContainer) {
         *self.binding() = binding_of(&c);
@@ -452,6 +493,11 @@ pub fn relay_host(url: &str) -> &str {
 pub(crate) async fn compact_if_needed(
     inner: &Inner,
 ) -> Result<Option<u64>, vault_container::Error> {
+    compact(inner, false).await
+}
+
+/// [`compact_if_needed`]; with `force`, whatever the policy says.
+async fn compact(inner: &Inner, force: bool) -> Result<Option<u64>, vault_container::Error> {
     let mut guard = inner.container.lock().await;
     let Some(c) = guard.as_mut() else {
         return Ok(None);
@@ -460,10 +506,11 @@ pub(crate) async fn compact_if_needed(
         return Ok(None);
     }
     let st = c.stats();
-    if !inner.config.compaction.due(&st) {
+    if !force && !inner.config.compaction.due(&st) {
         return Ok(None);
     }
     let seq = c.compact().await?;
+    inner.notify_high_water(c.high_water());
     tracing::info!(
         segments_before = st.segments,
         seq,
@@ -702,6 +749,27 @@ impl VaultServer {
     /// Returns the new manifest seq if it compacted.
     pub async fn compact_if_needed(&self) -> Result<Option<u64>, vault_container::Error> {
         compact_if_needed(&self.inner).await
+    }
+
+    /// Compact now, whatever the policy says (the user's "compact now"), but
+    /// only while the vault is unlocked, no session is active and nothing is
+    /// staged. Returns the new manifest seq, or `None` if it did not run.
+    pub async fn compact_now(&self) -> Result<Option<u64>, vault_container::Error> {
+        compact(&self.inner, true).await
+    }
+
+    /// The manifest key (`Subkeys::manifest`) of the open container, or `None`
+    /// while locked. With it alone a holder can replicate the sealed container
+    /// (read `seq` and segment ids, copy objects) but neither read vault data
+    /// nor forge a manifest. A secret: seal it (Android: under the background
+    /// Keystore key) and drop this copy.
+    pub async fn manifest_key(&self) -> Option<Zeroizing<[u8; 32]>> {
+        self.inner
+            .container
+            .lock()
+            .await
+            .as_ref()
+            .map(|c| c.crk().subkeys().manifest)
     }
 
     /// The container's app binding, `(app_id, origin)` (while locked, as read
