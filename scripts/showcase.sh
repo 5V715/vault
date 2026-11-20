@@ -8,11 +8,19 @@
 #
 # Local demo only: the page is a --dev build (it has the "Copy pairing text" button) on
 # localhost, and the vault is a throwaway one under .showcase/.
+#
+# With --lan the page and the relay are served over https/wss on the laptop's LAN IP for
+# a phone on the home network, with a certificate from a local CA (scripts/lan-cert.sh,
+# kept in DIR/ca). The page is then the QR-only release build (--dev keeps the button).
 set -uo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WEB_PORT=8080
+WEB_PORT=""
 RELAY_PORT=8787
+LAN=0
+LAN_IP=""
+LAN_IP_GIVEN=0
+DEV=0
 DIR=""
 RESET=0
 YES=0
@@ -33,10 +41,22 @@ Builds the vault binaries, vault-web and the to-do example, creates a demo vault
 starts the relay and the page server, then pairs a browser with the vault.
 
 Options:
-  --web-port N      port of the page (default 8080); open it as http://localhost:N
+  --lan             serve on this computer's LAN IP for a phone on the home network:
+                    https page (port 8443) and wss relay (8787) on all interfaces, with
+                    a certificate from a local CA in DIR/ca that you install on your
+                    devices once (the script prints the steps and its fingerprint). The
+                    page is the QR-only release build; the phone's vault app pairs.
+  --lan-ip IP       with --lan: use this IPv4 address instead of the detected one
+                    (any address; detection only accepts 10/8, 172.16/12, 192.168/16
+                    and 100.64/10)
+  --dev             with --lan: keep the "Copy pairing text" button and pair with a
+                    demo vault (vault-dev) here instead of a phone
+  --web-port N      port of the page (default 8080, with --lan 8443); open it as
+                    http://localhost:N (with --lan: https://<LAN IP>:N)
   --relay-port N    port of the relay (default 8787)
   --dir DIR         demo directory (default .showcase in the repository, git-ignored)
-  --reset           delete the demo vault, passphrase, page and logs first (asks y/N)
+  --reset           delete the demo vault, passphrase, page and logs first (asks y/N;
+                    the local CA in DIR/ca is kept: delete that directory yourself)
   --yes             do not ask (with --reset)
   --install-deps    install a missing wasm32 target and wasm-bindgen-cli (never done
                     without this flag)
@@ -73,6 +93,9 @@ while [ $# -gt 0 ]; do
     --relay-port) need_value "$1" $#; port_arg "$1" "$2"; RELAY_PORT="$2"; shift 2 ;;
     --dir) need_value "$1" $#; [ -n "$2" ] || usage_error "--dir must not be empty"; DIR="$2"; shift 2 ;;
     --pair) need_value "$1" $#; PAIR="$2"; shift 2 ;;
+    --lan) LAN=1; shift ;;
+    --lan-ip) need_value "$1" $#; LAN_IP="$2"; LAN_IP_GIVEN=1; shift 2 ;;
+    --dev) DEV=1; shift ;;
     --reset) RESET=1; shift ;;
     --yes) YES=1; shift ;;
     --install-deps) INSTALL_DEPS=1; shift ;;
@@ -81,12 +104,90 @@ while [ $# -gt 0 ]; do
     *) usage_error "unknown option $1" ;;
   esac
 done
+# ---- IPv4 addresses (for --lan) -----------------------------------------------------------
+is_ipv4() { # four decimal octets 0-255, no leading zeros
+  local IFS=. o n=0
+  case "$1" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+  # shellcheck disable=SC2086  # split on dots on purpose
+  set -- $1
+  [ $# = 4 ] || return 1
+  for o in "$@"; do
+    case "$o" in 0) ;; 0*) return 1 ;; esac
+    [ "${#o}" -le 3 ] && [ "$o" -le 255 ] || return 1
+    n=$((n + 1))
+  done
+  [ "$n" = 4 ]
+}
+ip_int() {
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $1
+  echo $((($1 << 24) + ($2 << 16) + ($3 << 8) + $4))
+}
+in_cidr() { # in_cidr <ip> <net/len>
+  local m=$(((0xFFFFFFFF << (32 - ${2#*/})) & 0xFFFFFFFF))
+  [ $(($(ip_int "$1") & m)) = $(($(ip_int "${2%/*}") & m)) ]
+}
+# A home-network address: RFC 1918 or carrier-grade NAT (100.64/10).
+is_lan_ip() {
+  local c
+  for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+    in_cidr "$1" "$c" && return 0
+  done
+  return 1
+}
+# The primary IPv4 address: the source of the route to the internet (no packet is sent).
+detect_lan_ip() {
+  local iface
+  case "$(uname -s 2> /dev/null)" in
+    Darwin)
+      iface="$(route -n get default 2> /dev/null | awk '$1 == "interface:" { print $2; exit }')"
+      [ -n "$iface" ] && ipconfig getifaddr "$iface" 2> /dev/null
+      ;;
+    *)
+      ip -4 route get 1.1.1.1 2> /dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+      ;;
+  esac
+}
+
+[ "$LAN" = 1 ] || [ "$LAN_IP_GIVEN" = 0 ] || usage_error "--lan-ip needs --lan"
+if [ "$LAN_IP_GIVEN" = 1 ]; then
+  is_ipv4 "$LAN_IP" || usage_error "--lan-ip: not an IPv4 address: $LAN_IP"
+fi
+if [ -z "$WEB_PORT" ]; then
+  if [ "$LAN" = 1 ]; then WEB_PORT=8443; else WEB_PORT=8080; fi
+fi
 [ "$WEB_PORT" != "$RELAY_PORT" ] || usage_error "--web-port and --relay-port must differ"
+
+if [ "$LAN" = 1 ]; then
+  if [ "$LAN_IP_GIVEN" = 0 ]; then
+    LAN_IP="$(detect_lan_ip | head -n1 | tr -d '[:space:]')"
+    if ! is_ipv4 "$LAN_IP"; then
+      die "cannot detect this computer's LAN IPv4 address: give it with --lan-ip <IP> (see: ip -4 addr, or ipconfig getifaddr en0 on macOS)"
+    fi
+    is_lan_ip "$LAN_IP" ||
+      die "the detected address $LAN_IP is not a home-network address (10/8, 172.16/12, 192.168/16, 100.64/10): connect to your LAN, or give the right one with --lan-ip <IP>"
+  fi
+fi
 
 if [ -z "$DIR" ]; then DIR="$repo/.showcase"; fi
 case "$DIR" in /*) ;; *) DIR="$PWD/$DIR" ;; esac
-WEB_ORIGIN="http://localhost:$WEB_PORT"
-RELAY_ORIGIN="http://127.0.0.1:$RELAY_PORT"
+if [ "$LAN" = 1 ]; then
+  WEB_ORIGIN="https://$LAN_IP:$WEB_PORT"
+  RELAY_ORIGIN="wss://$LAN_IP:$RELAY_PORT"
+  CA_DIR="$DIR/ca"
+  LEAF="$CA_DIR/leaf-$LAN_IP.pem"
+  LEAF_KEY="$CA_DIR/leaf-$LAN_IP.key"
+  # A demo vault on this computer only with --dev; otherwise the phone is the vault.
+  LOCAL_VAULT=$DEV
+  BIND=0.0.0.0
+else
+  WEB_ORIGIN="http://localhost:$WEB_PORT"
+  RELAY_ORIGIN="http://127.0.0.1:$RELAY_PORT"
+  LOCAL_VAULT=1
+  BIND=127.0.0.1
+fi
 if [ "$NO_BUILD" = 1 ]; then BIN="${VAULT_BIN_DIR:-$repo/target/release}"; else BIN="$repo/target/release"; fi
 
 # ---- cleanup: no orphans ----------------------------------------------------------------
@@ -188,6 +289,9 @@ preflight() {
     esac
   fi
   have curl || problem "curl not found" "install curl with your package manager (apt install curl, brew install curl)"
+  if [ "$LAN" = 1 ]; then
+    have openssl || problem "openssl not found (--lan makes its certificates with it)" "install openssl with your package manager (apt install openssl, brew install openssl)"
+  fi
   if ! have node; then
     problem "Node.js not found (22 or newer is needed)" "install Node.js 22+: https://nodejs.org/ (or: nvm install 22, brew install node@22)"
   else
@@ -266,7 +370,11 @@ if [ "$NO_BUILD" != 1 ]; then
   step "building vault-web"
   (cd "$repo/vault-web/js" && npm ci && npm run build && npm run build:wasm) || die "vault-web build failed"
 fi
-step "building the to-do example (dev build for the relay at $RELAY_ORIGIN)"
+if [ "$LAN" = 1 ] && [ "$DEV" != 1 ]; then
+  step "building the to-do example (release build for the relay at $RELAY_ORIGIN)"
+else
+  step "building the to-do example (dev build for the relay at $RELAY_ORIGIN)"
+fi
 if [ "$NO_BUILD" != 1 ] || [ ! -d "$repo/examples/todo/node_modules" ]; then
   (cd "$repo/examples/todo" && npm ci) || die "npm ci failed in examples/todo"
 fi
@@ -276,16 +384,34 @@ if [ ! -e "$DIR" ]; then
   printf '%s\n' "$MARKER_TEXT" > "$DIR/$MARKER" || die "cannot write $DIR/$MARKER"
 fi
 mkdir -p "$DIR/logs" || die "cannot create $DIR/logs"
-node "$repo/examples/todo/build.mjs" --relay "$RELAY_ORIGIN" --dev --out "$DIR/web" || die "building the page failed"
+if [ "$LAN" = 1 ]; then
+  step "local CA and certificate for $LAN_IP (in $CA_DIR)"
+  /bin/bash "$repo/scripts/lan-cert.sh" --dir "$CA_DIR" --ip "$LAN_IP" || die "cannot set up the local CA (see above)"
+  [ -f "$LEAF" ] && [ -f "$LEAF_KEY" ] || die "lan-cert.sh did not leave a certificate for $LAN_IP in $CA_DIR"
+  if is_lan_ip "$LAN_IP"; then :; else
+    err "note: $LAN_IP is not a private LAN address; a phone on your home network may not reach it."
+  fi
+  if [ "$DEV" = 1 ]; then
+    node "$repo/examples/todo/build.mjs" --relay "$RELAY_ORIGIN" --page-origin "$WEB_ORIGIN" --dev --out "$DIR/web" ||
+      die "building the page failed"
+  else
+    node "$repo/examples/todo/build.mjs" --relay "$RELAY_ORIGIN" --page-origin "$WEB_ORIGIN" --out "$DIR/web" ||
+      die "building the page failed"
+  fi
+else
+  node "$repo/examples/todo/build.mjs" --relay "$RELAY_ORIGIN" --dev --out "$DIR/web" || die "building the page failed"
+fi
 
 # ---- demo vault -------------------------------------------------------------------------
 # The passphrase is a random file with mode 0600. It reaches vaultctl through the
 # environment and vault-dev as a file; it is never an argument and never printed.
-if [ -e "$DIR/vault" ]; then
+if [ "$LOCAL_VAULT" != 1 ]; then
+  : # --lan without --dev: the phone's vault app is the vault
+elif [ -e "$DIR/vault" ]; then
   [ -s "$DIR/passphrase" ] || die "$DIR/vault exists but its passphrase file is missing: use --reset to start over"
   bound="$(cat "$DIR/origin" 2> /dev/null || true)"
   [ -n "$bound" ] || die "$DIR/origin is missing: use --reset to start over"
-  [ "$bound" = "$WEB_ORIGIN" ] || die "the demo vault is bound to $bound; use --web-port to match it, or --reset"
+  [ "$bound" = "$WEB_ORIGIN" ] || die "the demo vault is bound to $bound, not $WEB_ORIGIN; use the same mode, IP and --web-port, or --reset"
   step "using the existing demo vault in $DIR/vault"
 else
   if [ ! -s "$DIR/passphrase" ]; then
@@ -306,6 +432,8 @@ fi
 # ---- start the relay and the page server -----------------------------------------------
 # A server counts as up only when the process we started is alive, its log says it is
 # listening (so it, and not another program on the port, owns the port), and the URL answers.
+# With --lan the URL is the https one on the LAN IP, checked against the local CA (so the
+# certificate is checked too) but connected through 127.0.0.1 (the servers bind 0.0.0.0).
 wait_for() { # wait_for <name> <pid> <url> <log> <listening-text>
   local i
   for i in $(seq 1 150); do
@@ -314,7 +442,7 @@ wait_for() { # wait_for <name> <pid> <url> <log> <listening-text>
       tail -n 20 "$4" >&2
       return 1
     fi
-    if grep -q "$5" "$4" 2> /dev/null && curl -fsS -o /dev/null --max-time 2 "$3" 2> /dev/null; then
+    if grep -q "$5" "$4" 2> /dev/null && probe "$3"; then
       sleep 0.2
       kill -0 "$2" 2> /dev/null && return 0
     fi
@@ -325,18 +453,109 @@ wait_for() { # wait_for <name> <pid> <url> <log> <listening-text>
   return 1
 }
 
-step "starting the relay on 127.0.0.1:$RELAY_PORT (logs: $DIR/logs/relay.log)"
-"$BIN/vault-relay" --listen "127.0.0.1:$RELAY_PORT" --allow-origin "$WEB_ORIGIN" > "$DIR/logs/relay.log" 2>&1 < /dev/null &
-RELAY_PID=$!
-step "serving the page on 127.0.0.1:$WEB_PORT (logs: $DIR/logs/web.log)"
-node "$repo/examples/todo/serve.mjs" --port "$WEB_PORT" --dir "$DIR/web" > "$DIR/logs/web.log" 2>&1 < /dev/null &
-WEB_PID=$!
+probe() { # probe <url>
+  if [ "$LAN" = 1 ]; then
+    local hp="${1#https://}"
+    hp="${hp%%/*}"
+    curl -fsS -o /dev/null --max-time 2 --cacert "$CA_DIR/ca.pem" --connect-to "$hp:127.0.0.1:${hp##*:}" "$1" 2> /dev/null
+  else
+    curl -fsS -o /dev/null --max-time 2 "$1" 2> /dev/null
+  fi
+}
 
-wait_for "the relay" "$RELAY_PID" "http://127.0.0.1:$RELAY_PORT/healthz" "$DIR/logs/relay.log" "listening" || exit 1
-wait_for "the page server" "$WEB_PID" "http://127.0.0.1:$WEB_PORT/" "$DIR/logs/web.log" "serving" || exit 1
+if [ "$LAN" = 1 ]; then
+  step "starting the relay (wss) on $BIND:$RELAY_PORT (logs: $DIR/logs/relay.log)"
+  "$BIN/vault-relay" --listen "$BIND:$RELAY_PORT" --allow-origin "$WEB_ORIGIN" --tls-cert "$LEAF" --tls-key "$LEAF_KEY" \
+    > "$DIR/logs/relay.log" 2>&1 < /dev/null &
+  RELAY_PID=$!
+  step "serving the page (https) on $BIND:$WEB_PORT (logs: $DIR/logs/web.log)"
+  node "$repo/examples/todo/serve.mjs" --port "$WEB_PORT" --dir "$DIR/web" --host "$BIND" --tls-cert "$LEAF" --tls-key "$LEAF_KEY" \
+    > "$DIR/logs/web.log" 2>&1 < /dev/null &
+  WEB_PID=$!
+  wait_for "the relay" "$RELAY_PID" "https://$LAN_IP:$RELAY_PORT/healthz" "$DIR/logs/relay.log" "listening" || exit 1
+  wait_for "the page server" "$WEB_PID" "$WEB_ORIGIN/" "$DIR/logs/web.log" "serving" || exit 1
+else
+  step "starting the relay on 127.0.0.1:$RELAY_PORT (logs: $DIR/logs/relay.log)"
+  "$BIN/vault-relay" --listen "127.0.0.1:$RELAY_PORT" --allow-origin "$WEB_ORIGIN" > "$DIR/logs/relay.log" 2>&1 < /dev/null &
+  RELAY_PID=$!
+  step "serving the page on 127.0.0.1:$WEB_PORT (logs: $DIR/logs/web.log)"
+  node "$repo/examples/todo/serve.mjs" --port "$WEB_PORT" --dir "$DIR/web" > "$DIR/logs/web.log" 2>&1 < /dev/null &
+  WEB_PID=$!
+  wait_for "the relay" "$RELAY_PID" "http://127.0.0.1:$RELAY_PORT/healthz" "$DIR/logs/relay.log" "listening" || exit 1
+  wait_for "the page server" "$WEB_PID" "http://127.0.0.1:$WEB_PORT/" "$DIR/logs/web.log" "serving" || exit 1
+fi
+
+# ---- LAN: how to trust the CA -------------------------------------------------------------
+lan_banner() {
+  local fp os scope limit
+  fp="$(openssl x509 -noout -fingerprint -sha256 -in "$CA_DIR/ca.pem" 2> /dev/null | sed 's/^[^=]*=//')"
+  os="$(uname -s 2> /dev/null)"
+  scope="$(cat "$CA_DIR/ca.scope" 2> /dev/null || true)"
+  case "$scope" in
+    '' | any) limit="The CA is not name-constrained (this openssl cannot do it): remove it from your devices after the demo." ;;
+    *) limit="The CA can only vouch for $scope and localhost; its key stays in $CA_DIR." ;;
+  esac
+  cat << EOF
+
+  The to-do page:  $WEB_ORIGIN   (relay: $RELAY_ORIGIN)
+
+  Trust the local CA once on each device that opens the page or runs the vault:
+    CA file:      $CA_DIR/ca.pem
+    SHA-256:      $fp
+  Compare this fingerprint with the one your device shows before you trust it.
+  $limit
+
+  Android phone (the vault app): copy ca.pem to the phone, then Settings -> Security
+    -> Encryption & credentials -> Install a certificate -> CA certificate (the path
+    differs a little by vendor; search Settings for "CA certificate"). The vault app
+    trusts user-installed CAs only in its debug build; a release build will not connect.
+EOF
+  if [ "$os" = Darwin ]; then
+    cat << EOF
+  This Mac's browser: Safari and Chrome use the keychain:
+      security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db '$CA_DIR/ca.pem'
+    Firefox: Settings -> Privacy & Security -> Certificates -> View Certificates ->
+    Authorities -> Import (tick "identify websites").
+EOF
+  else
+    cat << EOF
+  This computer's browser (Linux): Chrome/Chromium: Settings -> Privacy and security ->
+    Security -> Manage certificates -> Authorities -> Import (tick "identify websites").
+    Firefox: Settings -> Privacy & Security -> Certificates -> View Certificates ->
+    Authorities -> Import (tick "identify websites").
+EOF
+  fi
+  cat << EOF
+  Remove the CA from your devices when you are done with the demo.
+
+  The phone's vault must be bound to this page:
+      vaultctl init --app $APP --origin $WEB_ORIGIN
+
+  Both ports ($WEB_PORT and $RELAY_PORT) listen on every interface of this computer. If a
+  host firewall blocks them, allow them from your home network only (for example:
+  sudo ufw allow from <your LAN>/24 to any port $WEB_PORT,$RELAY_PORT proto tcp), never
+  forward them from your router, and stop the demo with Ctrl-C when you are done.
+EOF
+}
+
+if [ "$LAN" = 1 ]; then lan_banner; fi
 
 if [ "$CHECK" = 1 ]; then
   step "check ok: the relay answers on /healthz and the page on /"
+  exit 0
+fi
+
+if [ "$LAN" = 1 ] && [ "$DEV" != 1 ]; then
+  cat << EOF
+
+  Ready. On this computer (or any device on your LAN that trusts the CA) open
+  $WEB_ORIGIN, click "Connect to vault" and scan the QR code with the vault app on
+  your phone. Compare the codes on both screens before you approve.
+
+  Press Enter or Ctrl-C to stop.
+EOF
+  ans=""
+  read -r ans || true
   exit 0
 fi
 
@@ -345,7 +564,7 @@ cat << EOF
 
   Ready.
 
-  1. Open $WEB_ORIGIN in your browser (use "localhost", not 127.0.0.1).
+  1. Open $WEB_ORIGIN in your browser$([ "$LAN" = 1 ] || printf ' (use "localhost", not 127.0.0.1)').
   2. Click "Connect to vault", then "Copy pairing text".
   3. Paste the text below. vault-dev prints a 6-digit code and a prompt number such
      as [#1]. If the code is the same as the one in the browser, answer
@@ -353,7 +572,7 @@ cat << EOF
 
   The pairing text is valid for about 60 seconds and is a secret while the QR is shown.
   The "Copy pairing text" button exists only in this development build, which is for
-  local demos only. Do not expose these ports. Stop everything with Ctrl-C.
+  local demos only. $([ "$LAN" = 1 ] && printf 'Keep these ports inside your home network.' || printf 'Do not expose these ports.') Stop everything with Ctrl-C.
 
 EOF
 
@@ -379,7 +598,11 @@ while :; do
       ;;
   esac
   rc=0
-  "$BIN/vault-dev" serve --dir "$DIR/vault" --pair "$text" --passphrase-file "$DIR/passphrase" || rc=$?
+  if [ "$LAN" = 1 ]; then
+    "$BIN/vault-dev" serve --dir "$DIR/vault" --pair "$text" --passphrase-file "$DIR/passphrase" --ca-file "$CA_DIR/ca.pem" || rc=$?
+  else
+    "$BIN/vault-dev" serve --dir "$DIR/vault" --pair "$text" --passphrase-file "$DIR/passphrase" || rc=$?
+  fi
   say "The vault session ended (exit $rc)."
   [ "$once" = 1 ] && exit "$rc"
   printf 'Pair again? [Y/n] '
