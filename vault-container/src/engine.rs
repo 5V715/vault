@@ -834,6 +834,14 @@ pub fn check_header(bytes: &[u8]) -> Result<()> {
     decode_header(bytes).map(|_| ())
 }
 
+/// The app binding from the plaintext `header` object alone, without any key
+/// (so a locked vault can refuse a wrong app before anything is unlocked).
+/// Not authenticated by itself: opening the container checks that the
+/// manifest, which the root key authenticates, carries the same binding.
+pub async fn read_binding<B: ContainerBackend + ?Sized>(backend: &B) -> Result<Binding> {
+    read_header(backend).await.map(|h| h.binding)
+}
+
 async fn read_header<B: ContainerBackend + ?Sized>(backend: &B) -> Result<HeaderBody> {
     match backend.get(HEADER).await? {
         Some((bytes, _)) => decode_header(&bytes),
@@ -942,6 +950,22 @@ mod tests {
         let mut expect = state;
         expect[0].1 = b"new".to_vec();
         assert_eq!(c.scan_prefix(b""), expect);
+    }
+
+    /// The binding is readable from the header alone: no key, no manifest read.
+    #[tokio::test]
+    async fn binding_readable_from_header_without_key() {
+        let backend = MemoryBackend::new();
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(2);
+        Container::create_with(backend.clone(), bind(), &mut rng)
+            .await
+            .unwrap();
+        backend.delete(MANIFEST).await.unwrap();
+        assert_eq!(read_binding(&backend).await.unwrap(), bind());
+        assert!(matches!(
+            read_binding(&MemoryBackend::new()).await,
+            Err(Error::Format(_))
+        ));
     }
 
     #[test]
