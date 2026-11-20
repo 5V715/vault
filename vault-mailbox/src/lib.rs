@@ -62,8 +62,11 @@ pub struct MailboxConfig {
     pub max_per_ip: usize,
     /// Maximum open mailbox connections in total.
     pub max_total: usize,
-    /// Use the first `X-Forwarded-For` hop as the client address for the per-IP
-    /// limit. Only enable behind a reverse proxy that OVERWRITES that header.
+    /// Use the rightmost `X-Forwarded-For` entry (appended by the one reverse proxy
+    /// in front) as the client address for the per-IP limit, when the TCP peer is
+    /// a loopback or private address (that proxy). Exactly one proxy hop is
+    /// supported: behind a chain (CDN, then proxy) the rightmost entry is the
+    /// previous hop, not the client.
     pub trust_proxy: bool,
     /// `serve` only: maximum concurrent HTTP connections, accepted or not yet
     /// upgraded (a slot is taken before `accept`, so excess clients wait in the
@@ -198,7 +201,8 @@ impl Mailboxes {
     }
 
     /// Like [`Mailboxes::handle`], with the TCP peer address of the connection
-    /// (replaced by the first `X-Forwarded-For` hop when `trust_proxy` is set).
+    /// (replaced by the rightmost `X-Forwarded-For` entry when `trust_proxy` is set
+    /// and the peer is a loopback or private address).
     pub async fn handle_from(
         &self,
         id: &str,
@@ -257,17 +261,39 @@ impl Mailboxes {
     }
 }
 
+/// The address the per-IP limit counts. With `trust_proxy`, the RIGHTMOST
+/// `X-Forwarded-For` entry (the one the proxy directly in front appended; every
+/// entry to its left is whatever the client sent), and only when the TCP peer is
+/// a loopback or private address (that proxy on the host or a container network).
+/// A public peer reached the relay directly, so its header is ignored; so is the
+/// header when the peer is unknown. An unparseable rightmost entry falls back to
+/// the peer.
 fn client_ip(cfg: &MailboxConfig, h: &hyper::HeaderMap, peer: Option<IpAddr>) -> Option<IpAddr> {
-    if cfg.trust_proxy
-        && let Some(ip) = h
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok())
-    {
-        return Some(ip);
+    if !cfg.trust_proxy || !peer.is_some_and(is_proxy_peer) {
+        return peer;
     }
-    peer
+    let last = h
+        .get_all("x-forwarded-for")
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok());
+    last.or(peer)
+}
+
+/// Loopback, RFC 1918 or IPv6 unique-local (fc00::/7): where a reverse proxy on
+/// the same host or container network connects from.
+fn is_proxy_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_private();
+            }
+            v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 /// Validate WebSocket upgrade headers and the Origin allowlist; returns the
@@ -306,4 +332,108 @@ fn ws_handshake(
         return Err((StatusCode::FORBIDDEN, "origin not allowed"));
     }
     Ok(key)
+}
+
+#[cfg(test)]
+mod xff_tests {
+    use super::*;
+
+    fn cfg(trust: bool) -> MailboxConfig {
+        MailboxConfig {
+            trust_proxy: trust,
+            ..Default::default()
+        }
+    }
+
+    fn headers(xff: &[&str]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for v in xff {
+            h.append("x-forwarded-for", v.parse().unwrap());
+        }
+        h
+    }
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    const PROXY: &str = "172.18.0.2";
+
+    #[test]
+    fn xff_rightmost_hop_used() {
+        let c = cfg(true);
+        assert_eq!(
+            client_ip(&c, &headers(&["203.0.113.7"]), ip(PROXY)),
+            ip("203.0.113.7")
+        );
+        assert_eq!(
+            client_ip(&c, &headers(&["198.51.100.1, 203.0.113.7"]), ip(PROXY)),
+            ip("203.0.113.7")
+        );
+        // Several header lines: the last entry of the last line.
+        assert_eq!(
+            client_ip(&c, &headers(&["198.51.100.1", "203.0.113.7"]), ip(PROXY)),
+            ip("203.0.113.7")
+        );
+        assert_eq!(
+            client_ip(&c, &headers(&["2001:db8::7"]), ip("::1")),
+            ip("2001:db8::7")
+        );
+        for peer in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.2",
+            "172.31.255.1",
+            "fd00::1",
+            "::1",
+        ] {
+            assert_eq!(
+                client_ip(&c, &headers(&["203.0.113.7"]), ip(peer)),
+                ip("203.0.113.7"),
+                "{peer}"
+            );
+        }
+        // Without --trust-proxy the header is never read.
+        assert_eq!(
+            client_ip(&cfg(false), &headers(&["203.0.113.7"]), ip(PROXY)),
+            ip(PROXY)
+        );
+    }
+
+    #[test]
+    fn xff_spoofed_leftmost_ignored() {
+        let c = cfg(true);
+        for spoof in ["1.2.3.4", "9.9.9.9", "not-an-ip", ""] {
+            let v = format!("{spoof}, 203.0.113.7");
+            assert_eq!(
+                client_ip(&c, &headers(&[&v]), ip(PROXY)),
+                ip("203.0.113.7"),
+                "{v}"
+            );
+        }
+        // An unparseable rightmost entry falls back to the peer, never to a left one.
+        assert_eq!(
+            client_ip(&c, &headers(&["1.2.3.4, garbage"]), ip(PROXY)),
+            ip(PROXY)
+        );
+        assert_eq!(
+            client_ip(&c, &headers(&["1.2.3.4, "]), ip(PROXY)),
+            ip(PROXY)
+        );
+    }
+
+    #[test]
+    fn xff_ignored_from_untrusted_peer() {
+        let c = cfg(true);
+        // A public peer reached the relay directly: its header is its own claim.
+        for peer in ["203.0.113.9", "8.8.8.8", "2001:db8::9", "100.64.0.1"] {
+            assert_eq!(
+                client_ip(&c, &headers(&["198.51.100.1"]), ip(peer)),
+                ip(peer),
+                "{peer}"
+            );
+        }
+        // No peer address known (`Mailboxes::handle`): the header is not trusted either.
+        assert_eq!(client_ip(&c, &headers(&["198.51.100.1"]), None), None);
+    }
 }

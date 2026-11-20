@@ -470,3 +470,44 @@ async fn stalled_connection_is_cut() {
     a.send(bin(b"still here")).await.unwrap();
     assert_eq!(next_bin(&mut b).await, b"still here");
 }
+
+async fn join_with_xff(r: &Relay, id: &str, xff: &str) -> Result<Ws, tungstenite::Error> {
+    use tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{}/mailbox/{id}", r.addr)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("x-forwarded-for", xff.parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.map(|(w, _)| w)
+}
+
+/// Behind the proxy (a loopback peer here) the per-IP limit keys on the entry the
+/// proxy appended (rightmost), so changing the client-supplied left part does
+/// not buy more connections.
+#[tokio::test]
+async fn xff_spoofed_leftmost_does_not_bypass_per_ip_limit() {
+    let r = start(MailboxConfig {
+        max_per_ip: 1,
+        trust_proxy: true,
+        ..cfg()
+    })
+    .await;
+    let _a = join_with_xff(&r, ID, "1.1.1.1, 203.0.113.7").await.unwrap();
+    let e = join_with_xff(
+        &r,
+        "11111111111111111111111111111111",
+        "2.2.2.2, 203.0.113.7",
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(http_status(e), 429);
+    // Another real client (another rightmost entry) still gets in.
+    let _b = join_with_xff(
+        &r,
+        "22222222222222222222222222222222",
+        "1.1.1.1, 203.0.113.8",
+    )
+    .await
+    .unwrap();
+}

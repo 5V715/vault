@@ -70,8 +70,10 @@ struct Args {
     /// PEM private key for `--tls-cert`. Keep it readable by the relay only (0600).
     #[arg(long, value_name = "PEM", env = TLS_KEY_ENV, value_parser = tls_key_path)]
     tls_key: Option<PathBuf>,
-    /// Take the client address from the first X-Forwarded-For hop (only behind a
-    /// reverse proxy that overwrites that header).
+    /// Behind one reverse proxy: count the per-IP limit on the rightmost
+    /// X-Forwarded-For entry (the one that proxy appended), honoured only when the
+    /// connection comes from a loopback or private address (the proxy). Exactly
+    /// one proxy hop; see docs/deploy-todo-demo.md.
     #[arg(long)]
     trust_proxy: bool,
     /// Also serve this directory's files (GET/HEAD, read-only, no listings) on
