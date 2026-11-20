@@ -1536,3 +1536,44 @@ async fn lock_during_approval_wins() {
     assert_eq!(s.high_water().await, None);
     assert_eq!(s.active_session(), None);
 }
+
+/// The header (read without a key) names this app, but the authenticated
+/// manifest does not: opening refuses, the browser is denied, nothing unlocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_time_binding_mismatch_denies() {
+    let relay = relay().await;
+    // A container really bound to another app ...
+    let backend: SharedBackend = Arc::new(MemoryBackend::new());
+    let (c, rk) = Container::create(backend.clone(), "other-app", ORIGIN)
+        .await
+        .unwrap();
+    drop(c);
+    let (_, crk) = Container::open_with_recovery(backend.clone(), &rk, None)
+        .await
+        .unwrap();
+    // ... whose header is replaced by one that names `APP`.
+    let (donor, _) = locked_backend().await;
+    let (forged, _) = donor.get("header").await.unwrap().unwrap();
+    let (_, etag) = backend.get("header").await.unwrap().unwrap();
+    assert!(matches!(
+        backend
+            .put_if_match("header", &forged, &etag)
+            .await
+            .unwrap(),
+        PutOutcome::Written(_)
+    ));
+    let approver = Unlocker::new(crk_material(crk), false);
+    let s = locked_server(backend, approver.clone()).await;
+    assert_eq!(s.binding(), (APP.to_string(), ORIGIN.to_string()));
+    let (mut b, h) = pair(&s, &relay).await;
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: "A".into(),
+        })
+        .await;
+    assert_eq!(r, ResponseBody::Denied);
+    assert_eq!(ended(h).await, EndReason::UnlockFailed);
+    assert_eq!(approver.seen().len(), 1);
+    assert!(s.is_locked());
+    assert_eq!(s.active_session(), None);
+}
