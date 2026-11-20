@@ -794,6 +794,27 @@ t_lan_ca_scoped_to_ip() {
   check "$n: a certificate for another LAN host fails on the name constraints" $? "$v"
 }
 
+# A CA from the intermediate commits (d9a3a1a..4c8f39e) was scoped to a whole private
+# range (ca.scope e.g. 192.168.0.0/16). It must not be reused even though the range
+# contains the IP: only an exactly-/32 (or "any", no constraints) CA is.
+t_lan_old_range_ca_replaced() {
+  local n=lan_oldrange r b ca
+  r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
+  pickports; ca="$tmp/$n/demo/ca"
+  lan $n "$r" "$b" --lan-ip 127.0.0.1
+  check "$n: first run" "$rc" "$out"
+  printf '127.0.0.0/8\n' > "$ca/ca.scope"
+  cp "$ca/ca.pem" "$tmp/$n/ca.before"
+  lan $n "$r" "$b" --lan-ip 127.0.0.1
+  { [ "$rc" = 0 ] && ! cmp -s "$tmp/$n/ca.before" "$ca/ca.pem" && has "Making a NEW CA" &&
+    ! has "reusing the local CA" && [ "$(cat "$ca/ca.scope")" = 127.0.0.1/32 ]; }
+  check "$n: a range-scoped CA is replaced by a /32 one, loudly" $? "rc=$rc $out"
+  cp "$ca/ca.pem" "$tmp/$n/ca.before"
+  lan $n "$r" "$b" --lan-ip 127.0.0.1
+  { [ "$rc" = 0 ] && cmp -s "$tmp/$n/ca.before" "$ca/ca.pem" && has "reusing the local CA"; }
+  check "$n: the new /32 CA is reused" $? "rc=$rc $out"
+}
+
 t_lan_empty_fingerprint_fails() {
   local n=lan_nofp r b real
   r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
@@ -824,7 +845,7 @@ t_lan_preflight() {
 for t in help args preflight check_flow reset reset_refuses_unmarked_dir reset_refuses_home_and_root busy_port pair \
   cleanup_signal lan_ca_created_once_and_reused lan_ca_key_private lan_refuses_wide_key_perms \
   lan_ip_detection_and_override lan_prints_fingerprint_and_trust_steps lan_without_name_constraints lan_preflight \
-  lan_ca_scoped_to_ip lan_empty_fingerprint_fails; do
+  lan_ca_scoped_to_ip lan_empty_fingerprint_fails lan_old_range_ca_replaced; do
   want "$t" && "t_$t"
 done
 

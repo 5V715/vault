@@ -61,19 +61,8 @@ is_ipv4() {
   done
   [ "$n" = 4 ]
 }
-ip_int() { # ip_int <a.b.c.d>
-  local IFS=.
-  # shellcheck disable=SC2086
-  set -- $1
-  echo $((($1 << 24) + ($2 << 16) + ($3 << 8) + $4))
-}
 int_ip() { echo "$((($1 >> 24) & 255)).$((($1 >> 16) & 255)).$((($1 >> 8) & 255)).$(($1 & 255))"; }
 mask_int() { [ "$1" = 0 ] && echo 0 || echo $(((0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF)); }
-in_cidr() { # in_cidr <ip> <net/len>
-  local m
-  m="$(mask_int "${2#*/}")"
-  [ $(($(ip_int "$1") & m)) = $(($(ip_int "${2%/*}") & m)) ]
-}
 # The range the CA is constrained to for this IP: the IP alone.
 scope_for() { echo "$1/32"; }
 
@@ -188,9 +177,11 @@ else
     err "the CA in $DIR expires within 30 days: making a new one."
     err "  Install the new CA on your devices and remove the old one."
     make_ca "$scope"
-  elif [ "$have_scope" != any ] && ! { [ -n "$have_scope" ] && in_cidr "$IP" "$have_scope"; }; then
+  elif [ "$have_scope" != any ] && [ "$have_scope" != "$IP/32" ]; then
+    # Only a CA scoped to exactly this IP is reused: also a range-scoped CA from an
+    # earlier version (e.g. 192.168.0.0/16) that contains the IP is replaced.
     err ""
-    err "*** The IP changed: the CA in $DIR only vouches for ${have_scope:-another address}, not $IP."
+    err "*** The CA in $DIR vouches for ${have_scope:-an unknown scope}, not exactly $IP/32."
     err "*** Making a NEW CA: re-install the CA on your phone (and browsers), remove the old one."
     err "*** A DHCP reservation for this computer in your router keeps the IP (and the CA) stable."
     err ""
