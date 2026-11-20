@@ -369,6 +369,16 @@ async fn drive(
     // uncommitted writes, then end the old session.
     let old = 'activate: {
         let mut guard = inner.container.lock().await;
+        // `lock()` drains the session map under the container lock: if it ran
+        // after the user's answer, this session is over and the lock wins.
+        // Nothing is opened or installed and `Approved` is never sent; the
+        // material is dropped (zeroized) unused.
+        if !inner.state().sessions.contains_key(&id) {
+            drop(guard);
+            drop(material);
+            let _ = send_notice(ch, Notice::Locked).await;
+            return EndReason::Locked;
+        }
         if guard.is_none() {
             // Locked: open the container with the approval's material, now.
             let c = match inner.open_with(material).await {

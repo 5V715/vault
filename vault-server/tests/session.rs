@@ -1487,3 +1487,52 @@ async fn mailbox_taken_reported_to_approver() {
     assert_eq!(s.active_session(), None);
     assert!(s.session_log().is_empty());
 }
+
+/// Approves with unlock material, but calls `lock()` itself just before it
+/// returns: the lock lands after the user's answer and before the session takes
+/// the container lock (the session polls `ctl` before the approval, so the
+/// queued `Terminate` is not seen first).
+struct LockingApprover {
+    server: std::sync::OnceLock<VaultServer>,
+    material: Mutex<Option<UnlockMaterial>>,
+}
+
+#[async_trait::async_trait]
+impl Approver for LockingApprover {
+    async fn approve(&self, _: &ApprovalRequest<'_>) -> ApprovalDecision {
+        self.server.get().unwrap().lock().await;
+        match self.material.lock().unwrap().take() {
+            Some(m) => ApprovalDecision::Approve(m),
+            None => ApprovalDecision::Deny,
+        }
+    }
+}
+
+/// A `lock()` that races an approval wins: nothing is unlocked or installed,
+/// and the browser never gets `Approved`.
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_during_approval_wins() {
+    let relay = relay().await;
+    let (backend, crk) = locked_backend().await;
+    let approver = Arc::new(LockingApprover {
+        server: std::sync::OnceLock::new(),
+        material: Mutex::new(Some(crk_material(crk))),
+    });
+    let s = locked_server(backend, approver.clone()).await;
+    approver.server.set(s.clone()).unwrap();
+    let (mut b, h) = pair(&s, &relay).await;
+    let r = b
+        .call_any(RequestBody::OpenSession {
+            device_name: "A".into(),
+        })
+        .await;
+    assert_eq!(r, Some(VaultMessage::Notice(Notice::Locked)));
+    assert_eq!(ended(h).await, EndReason::Locked);
+    assert!(approver.material.lock().unwrap().is_none());
+    assert!(
+        s.is_locked(),
+        "lock() returned, so the vault must stay locked"
+    );
+    assert_eq!(s.high_water().await, None);
+    assert_eq!(s.active_session(), None);
+}
