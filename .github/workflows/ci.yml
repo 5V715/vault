@@ -63,8 +63,18 @@ jobs:
         run: |
           set -euo pipefail
           set -x
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          # `yes` ends with SIGPIPE once sdkmanager stops reading: not a failure.
+          (yes || true) | "$sdk" --licenses > /dev/null
+          # The pinned NDK must be offered by the runner's SDK repository.
+          "$sdk" --list > /tmp/sdk-list.txt
+          grep -E "^ *ndk;" /tmp/sdk-list.txt | sort -u
+          grep -qE "^ *ndk;$NDK_VERSION( |\|)" /tmp/sdk-list.txt
+          "$sdk" --install "ndk;$NDK_VERSION" > /dev/null
+          ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
+          grep '^Pkg.Revision' "$ndk/source.properties"
+          grep -q "^Pkg.Revision *= *$NDK_VERSION" "$ndk/source.properties"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
           cargo install --locked cargo-ndk --version "$CARGO_NDK_VERSION"
       - name: cross build (arm64-v8a, armeabi-v7a, x86_64; minSdk 30) and bindings
         shell: bash
