@@ -233,6 +233,9 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<T
 
 struct Browser {
     ws: Ws,
+    /// How long `recv` waits for the next message: a liveness bound only (no
+    /// test relies on it expiring), `T` unless a test moves a lot of data.
+    patience: Duration,
     noise: Session,
     chunker: Chunker,
     reasm: Reassembler,
@@ -268,7 +271,7 @@ impl Browser {
 
     /// Next vault message, or `None` once the connection ends.
     async fn recv(&mut self) -> Option<VaultMessage> {
-        tokio::time::timeout(T, async {
+        tokio::time::timeout(self.patience, async {
             loop {
                 match self.ws.next().await {
                     Some(Ok(Message::Binary(b))) => {
@@ -348,6 +351,7 @@ async fn pair_hooked(
     (
         Browser {
             ws,
+            patience: T,
             noise,
             chunker: Chunker::new(),
             reasm: Reassembler::new(),
@@ -755,6 +759,10 @@ async fn large_value_chunked_roundtrip() {
     let relay = relay().await;
     let s = server(Auto::new(true), ServerConfig::default()).await;
     let (mut b, _h) = open(&s, &relay, "A").await;
+    // 8 MiB through Noise, the relay and the container in a debug build: slow CI
+    // runners (windows-latest) need far more than T per answer. Only liveness is
+    // at stake here; the answers' order and content are still checked exactly.
+    b.patience = Duration::from_secs(180);
     let big: Vec<u8> = (0..8 * 1024 * 1024)
         .map(|i: usize| (i % 251) as u8)
         .collect();
@@ -1205,12 +1213,12 @@ async fn binding_rechecked_after_handshake() {
         }
     };
     let (mut b, h) = pair_hooked(&s, &relay, swap).await;
-    let r = b
-        .call_any(RequestBody::OpenSession {
-            device_name: "A".into(),
-        })
-        .await;
-    assert_eq!(r, Some(VaultMessage::Notice(Notice::WrongApp)));
+    // The vault sends the notice right after the handshake, unasked, and closes.
+    // Nothing is sent first: a request racing that close would arrive at a socket
+    // that is being dropped with unread data, and the resulting TCP reset makes
+    // Windows discard the notice before the test reads it (the old flake).
+    assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::WrongApp)));
+    b.expect_closed().await;
     assert_eq!(ended(h).await, EndReason::WrongApp);
     assert!(approver.calls().is_empty(), "approver must not be asked");
     assert_eq!(s.active_session(), None);
