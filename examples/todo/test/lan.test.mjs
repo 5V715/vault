@@ -25,13 +25,17 @@ import { TodoApp } from "../.test-build/app.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const caDir = process.env.TODO_LAN_CA_DIR;
-if (!caDir || !process.env.NODE_EXTRA_CA_CERTS) {
+const wrongDir = process.env.TODO_LAN_WRONG_DIR;
+if (!caDir || !wrongDir || !process.env.NODE_EXTRA_CA_CERTS) {
   throw new Error("run this through test/lan-run.mjs (npm run test:lan): it makes the CA and trusts it");
 }
 const CA = join(caDir, "ca.pem");
 const IP = "127.0.0.1";
 const WRONG_IP = "127.0.0.2";
-const leaf = (ip) => ({ cert: join(caDir, `leaf-${ip}.pem`), key: join(caDir, `leaf-${ip}.key`) });
+const leaf = (ip) => {
+  const d = ip === WRONG_IP ? wrongDir : caDir;
+  return { cert: join(d, `leaf-${ip}.pem`), key: join(d, `leaf-${ip}.key`) };
+};
 
 // Fails with a build hint if the wasm package is missing.
 const { pair } = await import("vault-web/node");
@@ -234,12 +238,14 @@ describe("todo e2e, LAN mode", () => {
   });
 
   test("lan_wrong_ip_cert_refused", T, async () => {
-    // The same CA, but the relay presents the certificate for another IP.
+    // The relay presents a certificate for another IP, signed with the same CA key. The
+    // CA is name-constrained to 127.0.0.1/32, so the chain itself is refused: this
+    // also proves the constraints are in force for Node (OpenSSL) and vault-dev (webpki).
     const pageOrigin = `https://${IP}:${await freePort()}`;
     const wrong = await startTlsRelay(WRONG_IP, pageOrigin);
     try {
       await assert.rejects(get(`https://${wrong.addr}/healthz`), (e) => {
-        assert.equal(e.code, "ERR_TLS_CERT_ALTNAME_INVALID", `${e.code}: ${e.message}`);
+        assert.match(e.message, /permitted subtree violation/, `${e.code}: ${e.message}`);
         return true;
       });
 
@@ -261,7 +267,7 @@ describe("todo e2e, LAN mode", () => {
         const vd = h.serveVault(vault, offer.text, ["--ca-file", CA]);
         const st = await vd.exit();
         assert.notEqual(st.code, 0, vd.text());
-        assert.match(vd.text(), /cannot reach the relay/);
+        assert.match(vd.text(), /cannot reach the relay: relay: TLS failure: .*NameConstraintViolation/);
         assert.doesNotMatch(vd.text(), /Connected\./);
         assert.ok(!vd.hasPrompted(), "the vault never asks the user");
         await session.lock();
