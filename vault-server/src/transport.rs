@@ -110,7 +110,13 @@ fn relay_error(e: &tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error as E;
     match e {
         E::Http(r) => format!("relay refused: HTTP {}", r.status().as_u16()),
-        E::Io(e) => format!("connect failed: {}", e.kind()),
+        // rustls reports a rejected certificate as an InvalidData io::Error around
+        // its own error: name it (e.g. a CA that is not trusted, or a certificate
+        // for another address). Its text holds no secrets.
+        E::Io(e) => match e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()) {
+            Some(t) => format!("TLS failure: {t}"),
+            None => format!("connect failed: {}", e.kind()),
+        },
         E::Tls(_) => "TLS failure".into(),
         _ => "websocket handshake failed".into(),
     }
@@ -248,6 +254,25 @@ impl Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rejected relay certificate is named as such (with rustls' reason), not as
+    /// a bare "invalid data": the user has to know to fix the CA or the address.
+    #[test]
+    fn relay_error_names_certificate_problems() {
+        use rustls::{CertificateError, Error as TlsError};
+        use tokio_tungstenite::tungstenite::Error as E;
+        let io = |e: TlsError| E::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        let m = relay_error(&io(TlsError::InvalidCertificate(
+            CertificateError::NotValidForName,
+        )));
+        assert!(m.contains("TLS"), "{m}");
+        assert!(m.to_lowercase().contains("certificate"), "{m}");
+        assert!(m.contains("NotValidForName"), "{m}");
+        let m = relay_error(&E::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert_eq!(m, "connect failed: connection refused");
+    }
 
     fn offer(url: &str) -> PairOffer {
         PairOffer {
