@@ -1,0 +1,153 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: MIT
+#
+# vault-todo-demo: the release to-do page (examples/todo) served by vault-relay
+# next to its /mailbox relay, on one port, multi-arch:
+#   linux/amd64, linux/arm64, linux/arm/v7
+#
+#   docker buildx build -f Dockerfile.todo-demo --platform linux/arm64,linux/arm/v7 -t IMAGE .
+#
+# Run it behind a TLS-terminating reverse proxy (docs/deploy-todo-demo.md has
+# Traefik and Caddy examples), with the origin the proxy serves the page at:
+#
+#   docker run --read-only -p 8080:8080 -e PUBLIC_ORIGIN=https://todo.example IMAGE --trust-proxy
+#
+# PUBLIC_ORIGIN is required (the container exits at once with status 2 and says
+# why otherwise). It is the relay's browser-origin allowlist (unless
+# VAULT_RELAY_ALLOW_ORIGIN or --allow-origin is given) and the page's CSP; the
+# relay is wss://<same host>/mailbox unless RELAY_ORIGIN names another one. The
+# page learns the relay from /config.json, which vault-relay writes from that.
+#
+# Every RUN stage executes on the build host ($BUILDPLATFORM): vault-relay is
+# cross-compiled to a static musl binary with cargo-zigbuild (as in
+# Dockerfile.relay), and the page (wasm + JS) is platform independent, so it is
+# built once. The final stage is `scratch`: no shell, no package manager, the
+# binary and the page files only; it runs as UID 65532 and writes nothing, so a
+# read-only root filesystem works.
+#
+# Pins: the Rust compiler is the one in rust-toolchain.toml; cargo-zigbuild and
+# zig are pinned by version and sha256 (tools/release-requirements.txt);
+# wasm-bindgen-cli is the version of the wasm-bindgen crate in Cargo.lock,
+# installed with its own lockfile (--locked); Rust crates come from Cargo.lock
+# (--locked) and npm packages from the package-lock.json files (npm ci, no
+# install scripts). The base images are build arguments: pass them by digest
+# (rust:1-bookworm@sha256:..., node:22-bookworm-slim@sha256:...) for a fully
+# pinned build.
+
+ARG RUST_IMAGE=rust:1-bookworm
+ARG NODE_IMAGE=node:22-bookworm-slim
+
+# ---- rust: the exact compiler from rust-toolchain.toml, as the default (the file
+# itself is removed again, so rustup does not add its rustfmt/clippy components)
+FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS rust
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV CARGO_TERM_COLOR=never
+WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN channel="$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)" \
+ && [[ "$channel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+ && rustup toolchain install "$channel" --profile minimal --no-self-update \
+ && rustup default "$channel" \
+ && rm rust-toolchain.toml \
+ && rustc --version \
+ && test "$(rustc --version | cut -d' ' -f2)" = "$channel"
+
+# ---- relay toolchain: zig + cargo-zigbuild, sources limited to vault-mailbox and
+# vault-proto (as Dockerfile.relay)
+FROM rust AS relay-toolchain
+COPY tools/release-requirements.txt /tmp/release-requirements.txt
+# Distro packages track bookworm security updates (not pinned).
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-venv file \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/zig \
+ && /opt/zig/bin/pip install --no-cache-dir --require-hashes --only-binary :all: -r /tmp/release-requirements.txt
+ENV PATH="/opt/zig/bin:${PATH}" \
+    CARGO_PROFILE_RELEASE_STRIP=true \
+    CARGO_PROFILE_RELEASE_LTO=true \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+COPY Cargo.toml Cargo.lock ./
+COPY vault-mailbox vault-mailbox
+COPY vault-proto vault-proto
+RUN sed -i 's#^members = .*#members = ["vault-mailbox", "vault-proto"]#' Cargo.toml \
+ && grep -q '^members = \["vault-mailbox", "vault-proto"\]$' Cargo.toml \
+ && cargo fetch
+
+# ---- vault-relay, cross-compiled for $TARGETPLATFORM
+FROM relay-toolchain AS relay
+ARG TARGETPLATFORM
+RUN --mount=type=cache,target=/src/target,id=vault-todo-relay-target-${TARGETPLATFORM},sharing=locked \
+    set -eu; \
+    case "${TARGETPLATFORM}" in \
+      linux/amd64)  target=x86_64-unknown-linux-musl ;; \
+      linux/arm64)  target=aarch64-unknown-linux-musl ;; \
+      linux/arm/v7) target=armv7-unknown-linux-musleabihf ;; \
+      *) echo "unsupported TARGETPLATFORM ${TARGETPLATFORM} (see the header of this Dockerfile)" >&2; exit 1 ;; \
+    esac; \
+    rustup target add "$target"; \
+    cargo zigbuild --offline --release -p vault-mailbox --bin vault-relay --target "$target"; \
+    install -m 0755 "target/$target/release/vault-relay" /vault-relay; \
+    file /vault-relay > /tmp/file.txt; cat /tmp/file.txt; grep -Eq 'statically linked|static-pie linked' /tmp/file.txt
+
+# ---- the vault-web wasm (--target web), built once for every platform
+FROM rust AS wasm
+RUN rustup target add wasm32-unknown-unknown
+COPY Cargo.lock ./
+# wasm-bindgen-cli must equal the wasm-bindgen crate in Cargo.lock (the glue and
+# the wasm must match); vault-web/js/build.mjs checks the same.
+RUN v="$(awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/version = |"/, ""); print }' Cargo.lock)" \
+ && [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+ && cargo install --locked wasm-bindgen-cli --version "$v" \
+ && test "$(wasm-bindgen --version | cut -d' ' -f2)" = "$v"
+COPY Cargo.toml ./
+COPY vault-container vault-container
+COPY vault-proto vault-proto
+COPY vault-server vault-server
+COPY vault-mailbox vault-mailbox
+COPY vault-client vault-client
+COPY vault-web vault-web
+# The steps of vault-web/js/build.mjs for the web target only.
+RUN cargo build -p vault-web --release --locked --target wasm32-unknown-unknown \
+ && mkdir -p /pkg/web \
+ && wasm-bindgen --target web --out-dir /pkg/web target/wasm32-unknown-unknown/release/vault_web.wasm \
+ && printf '{\n  "type": "module"\n}\n' > /pkg/web/package.json \
+ && ls -l /pkg/web
+
+# ---- the page: vault-web/js, then examples/todo with --runtime-config
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS page
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV NODE_ENV=production \
+    npm_config_fund=false \
+    npm_config_audit=false \
+    npm_config_update_notifier=false
+WORKDIR /src
+COPY vault-web/js vault-web/js
+COPY --from=wasm /pkg/web vault-web/js/pkg/web
+WORKDIR /src/vault-web/js
+# --include=dev: the TypeScript compiler and esbuild are devDependencies.
+RUN npm ci --ignore-scripts --include=dev \
+ && npm run build
+COPY examples/todo /src/examples/todo
+WORKDIR /src/examples/todo
+RUN npm ci --ignore-scripts --include=dev \
+ && node build.mjs --runtime-config --out /out/todo \
+ && rm /out/todo/.build.json \
+ && ls -la /out/todo \
+ && ! grep -q 'Content-Security-Policy' /out/todo/index.html
+
+# ---- final image: vault-relay and the page, nothing else
+FROM scratch
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="vault-todo-demo" \
+      org.opencontainers.image.description="The vault to-do example page with its relay (vault-relay --static-dir)" \
+      org.opencontainers.image.source="https://github.com/5V715/vault" \
+      org.opencontainers.image.url="https://github.com/5V715/vault" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
+COPY --from=relay /vault-relay /vault-relay
+COPY --from=page /out/todo /srv/todo
+USER 65532:65532
+EXPOSE 8080
+# PUBLIC_ORIGIN has no default: without it the container exits with status 2.
+ENTRYPOINT ["/vault-relay", "--static-dir", "/srv/todo"]
