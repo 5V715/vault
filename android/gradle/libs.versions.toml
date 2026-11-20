@@ -6,7 +6,9 @@
 agp = "9.5.1"
 kotlin = "2.4.21"
 minSdk = "30"
-compileSdk = "37"
+# The SDK platform package `platforms;android-<compileSdk>` (major.minor: since
+# API 37 the SDK repository names platforms with a minor level, e.g. 37.0).
+compileSdk = "37.0"
 targetSdk = "37"
 buildTools = "36.0.0"
 ndk = "30.0.16248370"

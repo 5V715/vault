@@ -18,7 +18,11 @@ plugins {
 
 android {
     namespace = "dev.vault.ffi"
-    compileSdk = libs.versions.compileSdk.get().toInt()
+    // `platforms;android-37.0`: AGP 9's minor-API form of the pinned compileSdk.
+    val (compileMajor, compileMinor) = libs.versions.compileSdk.get().split('.').map(String::toInt)
+    compileSdk {
+        version = release(compileMajor) { minorApiLevel = compileMinor }
+    }
     ndkVersion = libs.versions.ndk.get()
 
     defaultConfig {

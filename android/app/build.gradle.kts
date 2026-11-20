@@ -9,7 +9,11 @@ android {
     // installed (updates must match it and the signing key); settle it before
     // the first release.
     namespace = "dev.vault.android"
-    compileSdk = libs.versions.compileSdk.get().toInt()
+    // `platforms;android-37.0`: AGP 9's minor-API form of the pinned compileSdk.
+    val (compileMajor, compileMinor) = libs.versions.compileSdk.get().split('.').map(String::toInt)
+    compileSdk {
+        version = release(compileMajor) { minorApiLevel = compileMinor }
+    }
     buildToolsVersion = libs.versions.buildTools.get()
 
     defaultConfig {

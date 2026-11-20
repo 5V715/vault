@@ -28,7 +28,7 @@ runs:
         pins = {
             "NDK_VERSION": (v["ndk"], r"\d+\.\d+\.\d+"),
             "CARGO_NDK_VERSION": (v["cargoNdk"], r"\d+\.\d+\.\d+"),
-            "ANDROID_COMPILE_SDK": (v["compileSdk"], r"\d+(\.\d+)?"),
+            "ANDROID_COMPILE_SDK": (v["compileSdk"], r"\d+\.\d+"),
             "ANDROID_BUILD_TOOLS": (v["buildTools"], r"\d+\.\d+\.\d+"),
         }
         for k, (val, pat) in pins.items():
@@ -51,15 +51,27 @@ runs:
         (yes || true) | "$sdk" --licenses > /dev/null
         # The pinned packages must be offered by the runner's SDK repository.
         "$sdk" --list > /tmp/sdk-list.txt
-        grep -E "^ *ndk;" /tmp/sdk-list.txt | sort -u
+        # What the repository offers (data for choosing pins).
+        set +x
+        for pat in '^ *ndk;' '^ *build-tools;' '^ *platforms;android-3[0-9]' '^ *system-images;android-(30|36|37)[^ ]*;[^ ]*;x86_64'; do
+          echo "== offered: $pat"
+          grep -E "$pat" /tmp/sdk-list.txt | awk '{ print $1 }' | sort -uV || true
+        done
+        set -x
         pkgs=("ndk;$NDK_VERSION")
         if [ "$SDK_PACKAGES" = true ]; then
-          grep -E "^ *(platforms;android-|build-tools;)" /tmp/sdk-list.txt | sort -u | tail -n 20
           pkgs+=("platforms;android-$ANDROID_COMPILE_SDK" "build-tools;$ANDROID_BUILD_TOOLS")
         fi
+        missing=0
         for p in "${pkgs[@]}"; do
-          grep -qE "^ *${p//./\\.}( |\|)" /tmp/sdk-list.txt || { echo "sdkmanager does not offer $p" >&2; exit 1; }
+          if ! grep -qE "^ *${p//./\\.}( |\|)" /tmp/sdk-list.txt; then
+            # Close matches: the same package up to its first version dot.
+            near="$(grep -E "^ *${p%%.*}" /tmp/sdk-list.txt | awk '{ print $1 }' | sort -uV | tr '\n' ' ' || true)"
+            echo "::error::sdkmanager does not offer $p; close matches: ${near:-none}"
+            missing=1
+          fi
         done
+        [ "$missing" = 0 ]
         "$sdk" --install "${pkgs[@]}" > /dev/null
         ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
         grep '^Pkg.Revision' "$ndk/source.properties"
