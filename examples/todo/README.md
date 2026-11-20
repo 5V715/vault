@@ -71,6 +71,12 @@ and no clipboard access; you pair it by scanning the QR with your vault.
     with a `ws:` relay (mixed content, which browsers block) and a `wss:` relay
     for an `http` page are refused.
   - The wasm is bundled into `main.js` as bytes, so the page never fetches it.
+- `node build.mjs --runtime-config [--out dist]` is the build in the
+  `vault-todo-demo` image: no relay is compiled in, the page reads it from
+  `/config.json` at start, and there is no `<meta>` CSP. `vault-relay --static-dir`
+  serves it with the CSP header and writes `/config.json`. See
+  [`docs/deploy-todo-demo.md`](../../docs/deploy-todo-demo.md), which also has the
+  Traefik and Caddy setups for pairing a phone with a public instance.
 - `node serve.mjs [--port 8080] [--dir dist] [--host 127.0.0.1] [--tls-cert cert.pem --tls-key key.pem]`
   serves `dist` (over HTTPS with the certificate, as `scripts/showcase.sh --lan`
   does) with:

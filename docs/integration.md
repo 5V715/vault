@@ -66,6 +66,10 @@ docker run -p 127.0.0.1:8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://my-app.exa
   A `relay_origin` may include a base path
   (`https://example.com/relay` becomes `wss://example.com/relay/mailbox/<id>`)
   if your proxy strips it before forwarding.
+- `--static-dir DIR` (off by default) also serves a page's files read-only on the
+  same port, with the page's CSP and a `/config.json` naming the relay; it needs
+  `--public-origin` (`PUBLIC_ORIGIN`). The `vault-todo-demo` image uses it: see
+  [`deploy-todo-demo.md`](deploy-todo-demo.md).
 - `--tls-cert CERT.pem --tls-key KEY.pem` (or `VAULT_RELAY_TLS_CERT` and
   `VAULT_RELAY_TLS_KEY`, for containers) make the relay terminate TLS itself,
   for a LAN or a single host without a reverse proxy. The certificate file is a

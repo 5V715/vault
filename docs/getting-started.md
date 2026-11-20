@@ -187,6 +187,14 @@ The vault is bound to the exact origin, including the IP: if your IP changes, th
 moves to the new address, the phone needs the new CA, and the phone's vault has to be
 created for the new origin. A DHCP reservation avoids all of that.
 
+## Deploy it on a public host
+
+To pair a phone from anywhere, run the page and its relay as the `vault-todo-demo`
+image behind a TLS reverse proxy (Traefik or Caddy, with a Let's Encrypt certificate):
+see [`docs/deploy-todo-demo.md`](deploy-todo-demo.md). It ends with the same pairing
+steps: `vaultctl init --app vault-todo --origin https://todo.example`, open the page,
+scan the QR.
+
 ## Where the data lives
 
 Everything is under `.showcase/` in the repository (git-ignored), or `--dir`:
