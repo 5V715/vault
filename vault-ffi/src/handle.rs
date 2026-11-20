@@ -91,6 +91,26 @@ pub(crate) struct Shared {
     pub(crate) secrets: Arc<SecretCounts>,
 }
 
+/// Tell `l` about `state`. A listener error or panic is logged (without its
+/// text, which comes from the app) and otherwise ignored: the session goes on.
+fn notify(l: &Arc<dyn SessionListener>, id: u64, state: SessionStateFfi) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| l.on_state(id, state)));
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => tracing::warn!(session = id, "vault-ffi: session listener failed"),
+        Err(_) => tracing::warn!(session = id, "vault-ffi: session listener panicked"),
+    }
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -109,7 +129,7 @@ impl Shared {
     fn emit(&self, id: u64, state: SessionStateFfi) {
         let l = locked(&self.listeners).by_id.get(&id).cloned();
         if let Some(l) = l {
-            l.on_state(id, state);
+            notify(&l, id, state);
         }
     }
 }
@@ -131,10 +151,31 @@ impl Approver for Bridge {
             sas: req.sas.into(),
             mailbox_taken: req.mailbox_taken,
         };
-        let crk = match cb.approve(request).await {
-            ApprovalFfi::Deny => return ApprovalDecision::Deny,
-            // Into zeroizing memory before anything else happens.
-            ApprovalFfi::Approve { crk } => SecretBytes::new(crk, &self.0.secrets),
+        // In its own task, so that a panicking implementation cannot take the
+        // session (or `serve_offer`) down with it; dropping this future (the
+        // server's timeout) aborts the task and so cancels the Kotlin call.
+        let counts = self.0.secrets.clone();
+        let task = tokio::spawn(async move {
+            match cb.approve(request).await {
+                // Into zeroizing memory before anything else happens.
+                Ok(ApprovalFfi::Approve { crk }) => Some(SecretBytes::new(crk, &counts)),
+                Ok(ApprovalFfi::Deny) => None,
+                Err(_) => {
+                    // Kotlin threw (e.g. the activity died): a denial. The
+                    // error text is not logged (it comes from the app).
+                    tracing::warn!("vault-ffi: approver failed; denied");
+                    None
+                }
+            }
+        });
+        let _abort = AbortOnDrop(task.abort_handle());
+        let crk = match task.await {
+            Ok(Some(crk)) => crk,
+            Ok(None) => return ApprovalDecision::Deny,
+            Err(_) => {
+                tracing::warn!("vault-ffi: approver panicked; denied");
+                return ApprovalDecision::Deny;
+            }
         };
         if req.mailbox_taken {
             return ApprovalDecision::Deny;
@@ -368,7 +409,7 @@ impl VaultHandle {
                     l.approved_early.remove(&id)
                 };
                 if early {
-                    listener.on_state(id, SessionStateFfi::Active);
+                    notify(&listener, id, SessionStateFfi::Active);
                 }
                 let info = SessionInfo {
                     session_id: id,
@@ -379,7 +420,8 @@ impl VaultHandle {
                     let reason = h.finished().await;
                     let l = locked(&shared.listeners).by_id.remove(&id);
                     if let Some(l) = l {
-                        l.on_state(
+                        notify(
+                            &l,
                             id,
                             SessionStateFfi::Ended {
                                 reason: reason.into(),
@@ -412,7 +454,9 @@ impl VaultHandle {
     /// the manifest key (from K_bg). Each replica is synced independently;
     /// per-replica anti-rollback marks are kept in the saved state. Refused
     /// (`Busy`) while a session is active or another replication runs;
-    /// `WrongKey` if `manifest_key` does not open this vault's manifest.
+    /// `WrongKey` if `manifest_key` does not open this vault's manifest;
+    /// `RollbackDetected` (nothing pushed) if the local container is older
+    /// than, or forks from, the saved high-water mark.
     pub async fn replicate(
         self: Arc<Self>,
         manifest_key: Vec<u8>,
@@ -440,7 +484,28 @@ impl VaultHandle {
                 let Some((sealed, _)) = this.primary.get("manifest").await? else {
                     return Err(FfiError::storage("the vault has no manifest"));
                 };
-                vault_container::manifest::open(&sealed, &key)?;
+                let primary = vault_container::manifest::open(&sealed, &key)?;
+                // The anti-rollback floor: a primary older than, or forked
+                // from, the saved mark was rolled back; push nothing. (A
+                // primary ahead of the mark is normal: the mark trails
+                // commits. The floor is not raised here: the manifest key
+                // alone cannot authenticate a manifest.)
+                let Some(floor) = this.shared.state.get().high_water else {
+                    return Err(FfiError::HighWaterMissing {
+                        detail: "no saved high-water mark for this vault".into(),
+                    });
+                };
+                let hash = vault_container::manifest::hash(&sealed);
+                if primary.seq < floor.seq
+                    || (primary.seq == floor.seq && !bool::from(hash.ct_eq(&floor.hash)))
+                {
+                    return Err(FfiError::RollbackDetected {
+                        detail: format!(
+                            "the vault is at seq {}, the saved mark at seq {}",
+                            primary.seq, floor.seq
+                        ),
+                    });
+                }
                 let mut replicas = Vec::with_capacity(targets.len());
                 for t in targets {
                     if t.id.is_empty() {

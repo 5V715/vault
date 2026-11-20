@@ -34,11 +34,13 @@ impl Persisted {
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, FfiError> {
         match bytes.split_first() {
-            Some((&STATE_VERSION, body)) => {
-                postcard::from_bytes(body).map_err(|_| FfiError::Storage {
+            Some((&STATE_VERSION, body)) => match postcard::take_from_bytes(body) {
+                // Trailing bytes are damage too.
+                Ok((p, [])) => Ok(p),
+                _ => Err(FfiError::Storage {
                     detail: "the saved vault state is malformed".into(),
-                })
-            }
+                }),
+            },
             _ => Err(FfiError::Unsupported {
                 detail: "unknown vault state version".into(),
             }),
@@ -62,12 +64,18 @@ pub(crate) struct StateCell {
 }
 
 impl StateCell {
-    /// Loads the state from the store (an empty store is a fresh state).
-    pub(crate) fn load(store: Arc<dyn HighWaterStore>) -> Result<Arc<Self>, FfiError> {
-        let state = match store.load()? {
-            Some(b) => Persisted::decode(&b)?,
-            None => Persisted::default(),
+    /// Loads the state of an existing vault. Fails closed: no blob, or a blob
+    /// without a high-water mark, is [`FfiError::HighWaterMissing`] (create and
+    /// restore save the first mark before they return, so an existing vault
+    /// always has one); a damaged blob is an error too.
+    pub(crate) fn load_existing(store: Arc<dyn HighWaterStore>) -> Result<Arc<Self>, FfiError> {
+        let missing = || FfiError::HighWaterMissing {
+            detail: "no saved high-water mark for this vault".into(),
         };
+        let state = Persisted::decode(&store.load()?.ok_or_else(missing)?)?;
+        if state.high_water.is_none() {
+            return Err(missing());
+        }
         Ok(Self::with(store, state))
     }
 

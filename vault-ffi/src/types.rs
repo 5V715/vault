@@ -256,11 +256,12 @@ impl fmt::Debug for ApprovalFfi {
 ///
 /// Called for one prompt at a time. Rust cancels the call (the coroutine is
 /// cancelled) after the approval timeout or when the session ends; treat that
-/// as a denial. A request with `mailbox_taken` is a warning only.
+/// as a denial. A request with `mailbox_taken` is a warning only. Throwing
+/// (including `CancellationException`) is a denial.
 #[uniffi::export(with_foreign)]
 #[async_trait::async_trait]
 pub trait ApproverCallback: Send + Sync {
-    async fn approve(&self, request: ApprovalRequestFfi) -> ApprovalFfi;
+    async fn approve(&self, request: ApprovalRequestFfi) -> Result<ApprovalFfi, FfiError>;
 }
 
 /// Persists the vault's opaque state blob (high-water mark and per-replica
@@ -272,16 +273,20 @@ pub trait ApproverCallback: Send + Sync {
 /// for one vault.
 #[uniffi::export(with_foreign)]
 pub trait HighWaterStore: Send + Sync {
-    /// The last saved blob, or `None` if there is none yet.
+    /// The last saved blob, or `None` if there is none. `open` and
+    /// `rewrap_with_recovery_key` refuse `None` (`HighWaterMissing`): return it
+    /// only when nothing was ever saved, never to paper over a missing file or
+    /// a lost K_bg. Throw for anything that fails to unseal.
     fn load(&self) -> Result<Option<Vec<u8>>, FfiError>;
     fn save(&self, state: Vec<u8>) -> Result<(), FfiError>;
 }
 
 /// Session events (Kotlin: the foreground service and its notification).
-/// Called from Rust worker threads; return quickly.
+/// Called from Rust worker threads; return quickly. A thrown exception is
+/// logged (without its text) and ignored; the session goes on.
 #[uniffi::export(with_foreign)]
 pub trait SessionListener: Send + Sync {
-    fn on_state(&self, session_id: u64, state: SessionStateFfi);
+    fn on_state(&self, session_id: u64, state: SessionStateFfi) -> Result<(), FfiError>;
 }
 
 /// Result of [`crate::VaultFactory::create`].

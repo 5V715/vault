@@ -69,6 +69,10 @@ enum Mode {
     Approve(Vec<u8>),
     Deny,
     Hang,
+    /// Kotlin threw (an exception or a cancellation).
+    Throw,
+    /// The implementation panicked.
+    Panic,
 }
 
 struct TestApprover {
@@ -90,11 +94,15 @@ impl TestApprover {
 
 #[async_trait::async_trait]
 impl ApproverCallback for TestApprover {
-    async fn approve(&self, request: ApprovalRequestFfi) -> ApprovalFfi {
+    async fn approve(&self, request: ApprovalRequestFfi) -> Result<ApprovalFfi, FfiError> {
         self.requests.lock().unwrap().push(request);
         let answer = match &*self.mode.lock().unwrap() {
-            Mode::Approve(crk) => Some(ApprovalFfi::Approve { crk: crk.clone() }),
-            Mode::Deny => Some(ApprovalFfi::Deny),
+            Mode::Approve(crk) => Some(Ok(ApprovalFfi::Approve { crk: crk.clone() })),
+            Mode::Deny => Some(Ok(ApprovalFfi::Deny)),
+            Mode::Throw => Some(Err(FfiError::Callback {
+                detail: "kotlin threw".into(),
+            })),
+            Mode::Panic => panic!("approver bug"),
             Mode::Hang => None,
         };
         match answer {
@@ -107,11 +115,19 @@ impl ApproverCallback for TestApprover {
 #[derive(Default)]
 struct TestListener {
     events: Mutex<Vec<(u64, SessionStateFfi)>>,
+    /// Record, then fail like a throwing Kotlin listener.
+    fail: bool,
 }
 
 impl SessionListener for TestListener {
-    fn on_state(&self, session_id: u64, state: SessionStateFfi) {
+    fn on_state(&self, session_id: u64, state: SessionStateFfi) -> Result<(), FfiError> {
         self.events.lock().unwrap().push((session_id, state));
+        if self.fail {
+            return Err(FfiError::Callback {
+                detail: "listener threw".into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -672,10 +688,11 @@ async fn restore_from_local_replica() {
     let dir = tmp.path().join("v");
     let rep = tmp.path().join("replica");
     let f = factory();
-    let c = create(&f, &dir, &store()).await;
+    let st0 = store();
+    let c = create(&f, &dir, &st0).await;
     drop(c.handle);
     commit_direct(&dir, &c.crk, b"k", b"v").await;
-    let h = f.open(path_str(&dir), store()).await.unwrap();
+    let h = f.open(path_str(&dir), st0).await.unwrap();
     let source = || ReplicaTarget::Local {
         path: path_str(&rep),
     };
@@ -829,6 +846,8 @@ async fn errors_map_to_ffi_enum() {
             FfiError::WrongKey { .. } => "WrongKey",
             FfiError::Rollback { .. } => "Rollback",
             FfiError::Diverged { .. } => "Diverged",
+            FfiError::HighWaterMissing { .. } => "HighWaterMissing",
+            FfiError::RollbackDetected { .. } => "RollbackDetected",
             FfiError::BadOffer { .. } => "BadOffer",
             FfiError::Relay { .. } => "Relay",
             FfiError::Tls { .. } => "Tls",
@@ -1007,4 +1026,261 @@ async fn extra_ca_only_when_set() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!serve.is_finished(), "waiting for the browser's handshake");
     serve.abort();
+}
+
+// ---------- fix round 1: anti-rollback floor, fallible callbacks ----------
+
+fn saved_with(st: &MemStore, f: impl FnOnce(&mut Persisted)) {
+    let mut p = st.state();
+    f(&mut p);
+    st.save(p.encode().unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn open_without_high_water_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let f = factory();
+    let st = store();
+    drop(create(&f, &dir, &st).await.handle);
+    // No blob at all.
+    let r = f.open(path_str(&dir), store()).await;
+    assert!(matches!(r, Err(FfiError::HighWaterMissing { .. })), "{r:?}");
+    // A blob without a mark.
+    saved_with(&st, |p| p.high_water = None);
+    let r = f.open(path_str(&dir), st).await;
+    assert!(matches!(r, Err(FfiError::HighWaterMissing { .. })), "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrap_without_high_water_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let f = factory();
+    let c = create(&f, &dir, &store()).await;
+    drop(c.handle);
+    let r = f
+        .rewrap_with_recovery_key(path_str(&dir), c.recovery_key.clone(), store())
+        .await;
+    assert!(matches!(r, Err(FfiError::HighWaterMissing { .. })), "{r:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tampered_high_water_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let f = factory();
+    let st = store();
+    let c = create(&f, &dir, &st).await;
+    drop(c.handle);
+    let good = st.blob.lock().unwrap().clone().unwrap();
+    let mut bad_version = good.clone();
+    bad_version[0] ^= 0xff;
+    let mut truncated = good.clone();
+    truncated.truncate(good.len() - 1);
+    let mut trailing = good.clone();
+    trailing.push(0);
+    for blob in [bad_version, truncated, trailing, Vec::new()] {
+        let s = store();
+        s.save(blob).unwrap();
+        let r = f.open(path_str(&dir), s.clone()).await;
+        assert!(r.is_err(), "open accepted a damaged mark");
+        let r = f
+            .rewrap_with_recovery_key(path_str(&dir), c.recovery_key.clone(), s)
+            .await;
+        assert!(r.is_err(), "rewrap accepted a damaged mark");
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let t = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &t);
+        } else {
+            std::fs::copy(e.path(), t).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bg_replication_refuses_rollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let old = tmp.path().join("old");
+    let rep = tmp.path().join("replica");
+    let f = factory();
+    let st = store();
+    let c = create(&f, &dir, &st).await;
+    let mk = c.manifest_key.clone();
+    drop(c.handle);
+    let hw1 = commit_direct(&dir, &c.crk, b"k", b"1").await;
+    copy_dir(&dir, &old); // the attacker's snapshot at seq 1
+    let hw2 = commit_direct(&dir, &c.crk, b"k", b"2").await;
+    saved_with(&st, |p| p.high_water = Some(hw2));
+    let target = || NamedReplica {
+        id: "r1".into(),
+        target: ReplicaTarget::Local {
+            path: path_str(&rep),
+        },
+    };
+    let h = f.open(path_str(&dir), st.clone()).await.unwrap();
+    let res = h
+        .clone()
+        .replicate(mk.clone(), vec![target()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        res[0].outcome,
+        ReplicaOutcomeFfi::Synced { seq: 2, .. }
+    ));
+    drop(h);
+    let replica_manifest = || std::fs::read(rep.join("manifest")).unwrap();
+    let synced = replica_manifest();
+
+    // The primary is rolled back to seq 1, below the saved mark (seq 2).
+    std::fs::remove_dir_all(&dir).unwrap();
+    copy_dir(&old, &dir);
+    let h = f.open(path_str(&dir), st.clone()).await.unwrap();
+    let r = h.clone().replicate(mk.clone(), vec![target()]).await;
+    assert!(matches!(r, Err(FfiError::RollbackDetected { .. })), "{r:?}");
+    assert_eq!(replica_manifest(), synced, "nothing was pushed");
+    // Same seq as the mark but another manifest: a fork, refused too. (The
+    // handle reads the saved state when it is opened.)
+    drop(h);
+    saved_with(&st, |p| {
+        p.high_water = Some(HighWater {
+            seq: hw1.seq,
+            hash: [7; 32],
+        })
+    });
+    let h = f.open(path_str(&dir), st.clone()).await.unwrap();
+    let r = h.clone().replicate(mk.clone(), vec![target()]).await;
+    assert!(matches!(r, Err(FfiError::RollbackDetected { .. })), "{r:?}");
+    assert_eq!(replica_manifest(), synced);
+
+    // With a mark the primary does pass, a replica newer than the primary is
+    // reported diverged and left alone (existing behaviour).
+    drop(h);
+    saved_with(&st, |p| p.high_water = Some(hw1));
+    let h = f.open(path_str(&dir), st.clone()).await.unwrap();
+    let res = h.clone().replicate(mk, vec![target()]).await.unwrap();
+    assert!(
+        matches!(
+            res[0].outcome,
+            ReplicaOutcomeFfi::Diverged {
+                replica_seq: Some(2),
+                primary_seq: 1
+            }
+        ),
+        "{res:?}"
+    );
+    assert_eq!(replica_manifest(), synced);
+}
+
+/// A locked vault, a relay and one pairing whose approver behaves per `mode`.
+async fn pair_once(mode: Mode) -> (EndReasonFfi, CloseReason, bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = factory();
+    let c = create(&f, &tmp.path().join("v"), &store()).await;
+    let h = c.handle;
+    h.clone().lock().await;
+    let relay = relay().await;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = Arc::new(TestListener::default());
+            let (_s, seen, info) =
+                pair(&relay, &h, TestApprover::new(mode), listener.clone()).await;
+            info.unwrap();
+            let end = wait_ended(&listener).await;
+            (end, wait_closed(&seen).await, h.is_locked())
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approver_error_denies() {
+    let (end, closed, locked) = pair_once(Mode::Throw).await;
+    assert_eq!(end, EndReasonFfi::Denied);
+    assert_eq!(closed, CloseReason::Denied);
+    assert!(locked);
+
+    // On a taken mailbox the error still reports MailboxTaken.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = factory();
+    let h = create(&f, &tmp.path().join("v"), &store()).await.handle;
+    h.clone().lock().await;
+    let relay = relay().await;
+    let qr = vault_proto::noise::PairKeys::generate(
+        format!("http://{}", relay.addr),
+        [6; 16],
+        APP.into(),
+        ORIGIN.into(),
+    )
+    .unwrap()
+    .offer()
+    .to_qr()
+    .unwrap();
+    let url = format!("ws://{}/mailbox/{}", relay.addr, "06".repeat(16));
+    let _a = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let _b = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let approver = TestApprover::new(Mode::Throw);
+    let r = h
+        .clone()
+        .serve_offer(qr, approver.clone(), Arc::new(TestListener::default()))
+        .await;
+    assert!(matches!(r, Err(FfiError::MailboxTaken { .. })), "{r:?}");
+    assert_eq!(approver.requests().len(), 1);
+    assert!(h.is_locked());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approver_panic_denies() {
+    let (end, closed, locked) = pair_once(Mode::Panic).await;
+    assert_eq!(end, EndReasonFfi::Denied);
+    assert_eq!(closed, CloseReason::Denied);
+    assert!(locked);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listener_error_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = factory();
+    let c = create(&f, &tmp.path().join("v"), &store()).await;
+    let crk = c.crk.clone();
+    let h = c.handle;
+    h.clone().lock().await;
+    let relay = relay().await;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = Arc::new(TestListener {
+                fail: true,
+                ..TestListener::default()
+            });
+            let (session, seen, info) = pair(
+                &relay,
+                &h,
+                TestApprover::new(Mode::Approve(crk)),
+                listener.clone(),
+            )
+            .await;
+            let info = info.unwrap();
+            confirm_and_wait_active(&session, &seen).await;
+            eventually("active reported", || {
+                listener.events() == vec![(info.session_id, SessionStateFfi::Active)]
+            })
+            .await;
+            // The failing listener did not end the session: it still serves.
+            let b = session.backend().unwrap();
+            b.put(b"k", b"v").await.unwrap();
+            b.flush_commit().await.unwrap();
+            assert_eq!(h.active_session(), Some(info.session_id));
+            session.lock().await;
+            assert_eq!(wait_ended(&listener).await, EndReasonFfi::Closed);
+        })
+        .await;
 }

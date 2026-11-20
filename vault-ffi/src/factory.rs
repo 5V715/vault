@@ -229,7 +229,7 @@ impl VaultFactory {
         self.rt
             .run(async move {
                 let path = existing_vault(&dir)?;
-                let state = StateCell::load(store)?;
+                let state = StateCell::load_existing(store)?;
                 let backend: SharedBackend = Arc::new(LocalBackend::open(&path).await?);
                 this.build(backend, None, state).await
             })
@@ -322,7 +322,7 @@ impl VaultFactory {
             .run(async move {
                 let rk = parse_recovery_key(rk_text)?;
                 let path = existing_vault(&dir)?;
-                let state = StateCell::load(store)?;
+                let state = StateCell::load_existing(store)?;
                 let backend = LocalBackend::open(&path).await?;
                 let floor = state.get().high_water;
                 let (c, crk) = Container::open_with_recovery(backend, &rk, floor).await?;

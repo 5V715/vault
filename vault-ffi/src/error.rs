@@ -38,6 +38,15 @@ pub enum FfiError {
     /// The stored manifest is older than, or forks from, the high-water mark.
     #[error("rollback or fork detected")]
     Rollback { detail: String },
+    /// No saved anti-rollback state (or no mark in it) for an existing vault.
+    /// Only create and restore start without one. Offer restore from a
+    /// replica, or re-wrap after an explicit, user-confirmed recovery.
+    #[error("anti-rollback state missing: {detail}")]
+    HighWaterMissing { detail: String },
+    /// The local container is older than, or forks from, the saved mark:
+    /// it was rolled back. Nothing was replicated.
+    #[error("local vault rolled back: {detail}")]
+    RollbackDetected { detail: String },
     /// Replicas hold different valid manifests at the same seq.
     #[error("replicas diverged: {detail}")]
     Diverged { detail: String },
