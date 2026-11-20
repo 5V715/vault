@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Minimal accept loop: `GET /mailbox/<id>` and `GET /healthz`, nothing else.
+//! Minimal accept loop: `GET /mailbox/<id>` and `GET /healthz`, plus read-only
+//! static files when a [`StaticSite`] is given (off by default).
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -15,10 +16,20 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
-use crate::{Mailboxes, progress, text};
+use crate::{Mailboxes, StaticSite, progress, text};
+
+/// What [`serve_with`] serves besides the relay. The default is the plain relay.
+#[derive(Clone, Default)]
+pub struct ServeOptions {
+    /// Terminate TLS here (see [`crate::tls_server_config`]).
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Serve these files on every path that is not `/healthz` or `/mailbox/...`.
+    pub static_site: Option<Arc<StaticSite>>,
+}
 
 async fn route(
     mailboxes: Mailboxes,
+    static_site: Option<Arc<StaticSite>>,
     req: Request<Incoming>,
     peer: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -33,7 +44,10 @@ async fn route(
         (_, p) if p == "/healthz" || p.starts_with("/mailbox/") => {
             text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
-        _ => text(StatusCode::NOT_FOUND, "not found"),
+        (m, p) => match &static_site {
+            Some(site) => site.respond(m, p).await,
+            None => text(StatusCode::NOT_FOUND, "not found"),
+        },
     })
 }
 
@@ -59,7 +73,23 @@ pub async fn serve_tls(
     tls: Option<Arc<rustls::ServerConfig>>,
     shutdown: impl Future<Output = ()>,
 ) {
-    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
+    let opts = ServeOptions {
+        tls,
+        ..Default::default()
+    };
+    serve_with(listener, mailboxes, opts, shutdown).await
+}
+
+/// [`serve_tls`] plus, with [`ServeOptions::static_site`], read-only static files
+/// on the same port (the relay's own paths win).
+pub async fn serve_with(
+    listener: TcpListener,
+    mailboxes: Mailboxes,
+    opts: ServeOptions,
+    shutdown: impl Future<Output = ()>,
+) {
+    let acceptor = opts.tls.map(tokio_rustls::TlsAcceptor::from);
+    let static_site = opts.static_site;
     let stop = mailboxes.inner.stop.subscribe();
     let mut tasks = tokio::task::JoinSet::new();
     let static_timeout = mailboxes.inner.cfg.static_timeout;
@@ -85,6 +115,7 @@ pub async fn serve_tls(
         };
         while tasks.try_join_next().is_some() {}
         let mailboxes = mailboxes.clone();
+        let static_site = static_site.clone();
         let acceptor = acceptor.clone();
         let mut stop = stop.clone();
         tasks.spawn(async move {
@@ -94,7 +125,18 @@ pub async fn serve_tls(
             // counts too.
             let io = progress::Tracked::new(stream, progress.clone());
             match acceptor {
-                None => drive(io, mailboxes, peer, progress, static_timeout, stop).await,
+                None => {
+                    drive(
+                        io,
+                        mailboxes,
+                        static_site,
+                        peer,
+                        progress,
+                        static_timeout,
+                        stop,
+                    )
+                    .await
+                }
                 Some(acceptor) => {
                     let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io));
                     let tls = tokio::select! {
@@ -105,7 +147,16 @@ pub async fn serve_tls(
                         _ = progress.stalled(static_timeout) => return,
                         _ = stopped(&mut stop) => return,
                     };
-                    drive(tls, mailboxes, peer, progress, static_timeout, stop).await
+                    drive(
+                        tls,
+                        mailboxes,
+                        static_site,
+                        peer,
+                        progress,
+                        static_timeout,
+                        stop,
+                    )
+                    .await
                 }
             }
         });
@@ -137,6 +188,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 async fn drive<I>(
     io: I,
     mailboxes: Mailboxes,
+    static_site: Option<Arc<StaticSite>>,
     peer: SocketAddr,
     progress: progress::Progress,
     static_timeout: Duration,
@@ -144,7 +196,7 @@ async fn drive<I>(
 ) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let svc = service_fn(move |req| route(mailboxes.clone(), req, peer));
+    let svc = service_fn(move |req| route(mailboxes.clone(), static_site.clone(), req, peer));
     // header_read_timeout also closes keep-alive connections idle between requests.
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())

@@ -14,6 +14,8 @@ mod progress;
 #[cfg(feature = "server")]
 mod serve;
 #[cfg(feature = "server")]
+mod static_site;
+#[cfg(feature = "server")]
 mod tls;
 
 use std::collections::HashMap;
@@ -31,7 +33,9 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 pub use pipe::parse_id;
 #[cfg(feature = "server")]
-pub use serve::{serve, serve_tls};
+pub use serve::{ServeOptions, serve, serve_tls, serve_with};
+#[cfg(feature = "server")]
+pub use static_site::StaticSite;
 #[cfg(feature = "server")]
 pub use tls::tls_server_config;
 

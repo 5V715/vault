@@ -11,7 +11,7 @@ default = ["bin"]
 # `serve`: a small hyper accept loop (`GET /mailbox/<id>`, `GET /healthz`) used by
 # `vault-relay` and by tests. Embedders that mount `Mailboxes::handle` in their own
 # server build with `default-features = false`.
-server = ["tokio/net", "dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types"]
+server = ["tokio/net", "tokio/fs", "dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types"]
 bin = ["server", "dep:clap", "dep:tracing-subscriber", "dep:vault-proto", "tokio/rt-multi-thread", "tokio/signal"]
 
 [[bin]]
@@ -61,4 +61,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 [[test]]
 name = "relay_tls"
+required-features = ["bin"]
+
+[[test]]
+name = "static_dir"
 required-features = ["bin"]
