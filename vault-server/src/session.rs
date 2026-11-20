@@ -12,10 +12,11 @@ use vault_proto::msg::{MAX_ENTRIES_TOTAL, MAX_VALUE, VaultMessage};
 use vault_proto::{ErrorCode, Notice, ProtoError, Request, RequestBody, Response, ResponseBody};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::approver::effective;
 use crate::transport::{Channel, ChannelError};
 use crate::{
-    ApprovalRequest, EndReason, Inner, MAX_AWAITING_APPROVAL, Offered, SessionRecord, Terminate,
-    VaultContainer, now_ms,
+    ApprovalDecision, ApprovalRequest, EndReason, Inner, MAX_AWAITING_APPROVAL, Offered,
+    SessionRecord, Terminate, VaultContainer, now_ms,
 };
 
 /// How long a newly approved session waits for the replaced one to send its notice.
@@ -170,7 +171,7 @@ enum Ev<'a> {
     Ctl(Option<Terminate>),
     Msg(Result<Zeroizing<Vec<u8>>, ChannelError>),
     Permit(SemaphorePermit<'a>),
-    Approval(Option<bool>),
+    Approval(Option<ApprovalDecision>),
     Timeout,
     Idle,
 }
@@ -325,8 +326,11 @@ async fn drive(
         app_id: &offered.app_id,
         origin: &offered.origin,
         relay_host: &offered.relay_host,
+        mailbox_taken: false,
     };
-    let approve = timeout(cfg.approval_timeout, inner.approver.approve(&req));
+    let approve = timeout(cfg.approval_timeout, async {
+        effective(&req, inner.approver.approve(&req).await)
+    });
     tokio::pin!(approve);
     let approved = loop {
         let ev = tokio::select! {
@@ -348,36 +352,58 @@ async fn drive(
     };
     drop(permit);
     drop(slot);
-    match approved {
+    let material = match approved {
         None => {
             let _ = respond(ch, open_id, ResponseBody::Denied).await;
             return EndReason::ApprovalTimeout;
         }
-        Some(false) => {
+        Some(ApprovalDecision::Deny) => {
             let _ = respond(ch, open_id, ResponseBody::Denied).await;
             return EndReason::Denied;
         }
-        Some(true) => {}
-    }
+        Some(ApprovalDecision::Approve(m)) => m,
+    };
 
-    // Become the active session: atomically (under the container lock) take over
-    // and discard the old session's uncommitted writes, then end the old session.
-    let old = {
-        let mut c = inner.container.lock().await;
-        let Some(c) = c.as_mut() else {
-            let _ = send_notice(ch, Notice::Locked).await;
-            return EndReason::Locked;
+    // Become the active session: atomically (under the container lock) unlock
+    // the container if it is locked, take over and discard the old session's
+    // uncommitted writes, then end the old session.
+    let old = 'activate: {
+        let mut guard = inner.container.lock().await;
+        if guard.is_none() {
+            // Locked: open the container with the approval's material, now.
+            let c = match inner.open_with(material).await {
+                Ok(c) => c,
+                Err(e) => {
+                    drop(guard);
+                    tracing::warn!(session = id, error = %e, "vault unlock at approval failed");
+                    let _ = respond(ch, open_id, ResponseBody::Denied).await;
+                    return EndReason::UnlockFailed;
+                }
+            };
+            // The opened container's binding is the authenticated one (the
+            // manifest's): if the header changed since it was read, nothing is
+            // installed and the vault stays locked.
+            if !offered.matches(&crate::binding_of(&c)) {
+                break 'activate None;
+            }
+            inner.install(&mut guard, c);
+            tracing::info!(session = id, "vault unlocked by approval");
+        } else {
+            // Already unlocked: the material is not needed (dropped, zeroized).
+            drop(material);
+        }
+        let Some(c) = guard.as_mut() else {
+            break 'activate None;
         };
         // The user approved this offer, but the container may have been swapped
         // while the prompt was shown: never activate on another binding.
         if !offered.matches(&crate::binding_of(c)) {
-            None
-        } else {
-            c.discard_pending();
-            let mut st = inner.state();
-            let old = st.active.replace(id);
-            Some(old.and_then(|o| st.sessions.get(&o).cloned()))
+            break 'activate None;
         }
+        c.discard_pending();
+        let mut st = inner.state();
+        let old = st.active.replace(id);
+        Some(old.and_then(|o| st.sessions.get(&o).cloned()))
     };
     let Some(old) = old else {
         return wrong_app(ch, id).await;

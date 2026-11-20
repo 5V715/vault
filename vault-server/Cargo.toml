@@ -10,7 +10,7 @@ description = "Vault side of the vault protocol: relay mailbox, Noise responder,
 default = ["dev"]
 # The `vault-dev` laptop test vault (passphrase-sealed container directory, terminal
 # approver). Embedders (Android) build with `default-features = false`.
-dev = ["vault-container/cli", "dep:clap", "dep:rpassword", "dep:rand", "tokio/signal"]
+dev = ["vault-container/cli", "dep:clap", "dep:rpassword", "tokio/signal"]
 
 [[bin]]
 name = "vault-dev"
@@ -20,7 +20,8 @@ required-features = ["dev"]
 [dependencies]
 clap = { version = "4", features = ["derive"], optional = true }
 rpassword = { version = "7", optional = true }
-rand = { version = "0.9", optional = true }
+# OS RNG for the per-offer Noise static key.
+rand = "0.9"
 vault-proto = { path = "../vault-proto" }
 vault-container = { path = "../vault-container", default-features = false }
 thiserror.workspace = true

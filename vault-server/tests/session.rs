@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
+use vault_container::Crk;
 use vault_container::Result as CResult;
 use vault_container::backend::{ContainerBackend, Etag, MemoryBackend, PutOutcome};
 use vault_container::engine::Container;
@@ -20,10 +21,9 @@ use vault_proto::{
     Chunk, Chunker, ErrorCode, Notice, PairOffer, Reassembler, Request, RequestBody, ResponseBody,
 };
 use vault_server::{
-    ApprovalRequest, Approver, CompactionPolicy, EndReason, ServerConfig, ServerError,
-    SessionHandle, SharedBackend, VaultServer,
+    ApprovalDecision, ApprovalRequest, Approver, CompactionPolicy, EndReason, ServerConfig,
+    ServerError, SessionHandle, SharedBackend, UnlockMaterial, VaultServer,
 };
-use zeroize::Zeroizing;
 
 const T: Duration = Duration::from_secs(10);
 /// The binding of the test vaults.
@@ -79,7 +79,7 @@ impl Auto {
 
 #[async_trait::async_trait]
 impl Approver for Auto {
-    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> ApprovalDecision {
         self.calls
             .lock()
             .unwrap()
@@ -89,7 +89,7 @@ impl Approver for Auto {
             req.origin.into(),
             req.relay_host.into(),
         ));
-        self.answer
+        self.answer.into()
     }
 }
 
@@ -143,7 +143,7 @@ impl Drop for InFlight<'_> {
 
 #[async_trait::async_trait]
 impl Approver for Gate {
-    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> ApprovalDecision {
         let (device_name, sas) = (req.device_name, req.sas);
         let n = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         let _g = InFlight(&self.in_flight);
@@ -153,7 +153,7 @@ impl Approver for Gate {
             .unwrap()
             .push((device_name.into(), sas.into()));
         let mut rx = self.answers.lock().await;
-        rx.recv().await.unwrap_or(false)
+        rx.recv().await.unwrap_or(false).into()
     }
 }
 
@@ -162,7 +162,7 @@ struct Never;
 
 #[async_trait::async_trait]
 impl Approver for Never {
-    async fn approve(&self, _: &ApprovalRequest<'_>) -> bool {
+    async fn approve(&self, _: &ApprovalRequest<'_>) -> ApprovalDecision {
         std::future::pending().await
     }
 }
@@ -207,17 +207,13 @@ impl ContainerBackend for Failing {
 
 // ---------- server ----------
 
-fn vault_secret() -> Zeroizing<[u8; 32]> {
-    Zeroizing::new([42u8; 32])
-}
-
 async fn server_on(
     backend: SharedBackend,
     approver: Arc<dyn Approver>,
     config: ServerConfig,
 ) -> (VaultServer, vault_container::RecoveryKey) {
     let (c, rk) = Container::create(backend, APP, ORIGIN).await.unwrap();
-    let s = VaultServer::new(c, vault_secret(), approver, config).unwrap();
+    let s = VaultServer::new(c, approver, config).unwrap();
     (s, rk)
 }
 
@@ -324,7 +320,17 @@ async fn pair_hooked(
     relay: &Relay,
     between: impl std::future::Future<Output = ()>,
 ) -> (Browser, SessionHandle) {
-    let keys = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
+    pair_as(server, relay, APP, between).await
+}
+
+/// Like [`pair_hooked`], for an offer that declares `app`.
+async fn pair_as(
+    server: &VaultServer,
+    relay: &Relay,
+    app: &str,
+    between: impl std::future::Future<Output = ()>,
+) -> (Browser, SessionHandle) {
+    let keys = PairKeys::generate(relay.url(), mailbox_id(), app.into(), ORIGIN.into()).unwrap();
     let offer: PairOffer = keys.offer().clone();
     let (mut ws, _) = tokio_tungstenite::connect_async(format!(
         "ws://{}/mailbox/{}",
@@ -639,18 +645,23 @@ async fn lock_ends_session() {
     assert_eq!(ended(h).await, EndReason::Locked);
     assert_eq!(s.active_session(), None);
 
-    // No new sessions while locked.
-    let keys = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
-    assert!(matches!(
-        s.serve_offer(keys.offer().clone()).await,
-        Err(ServerError::Locked)
-    ));
+    // Pairing still works while locked, but an approval that brings no unlock
+    // material cannot unlock the vault: the browser is denied.
+    let (mut b, h) = pair(&s, &relay).await;
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: "A".into(),
+        })
+        .await;
+    assert_eq!(r, ResponseBody::Denied);
+    assert_eq!(ended(h).await, EndReason::UnlockFailed);
+    assert!(s.is_locked());
 
     // Unlock with a re-opened container: committed data survives, pending did not.
     let (c, _) = Container::open_with_recovery(backend, &rk, None)
         .await
         .unwrap();
-    s.unlock(c, vault_secret()).await;
+    s.unlock(c).await;
     let (mut b, _h) = open(&s, &relay, "A").await;
     assert_eq!(b.call(get(b"lost")).await, ResponseBody::Value(None));
     assert_eq!(
@@ -1188,7 +1199,7 @@ async fn compaction_never_folds_another_sessions_pending_writes() {
     );
 }
 
-/// A container with another binding, opened with the same static key.
+/// A container with another binding.
 async fn other_container() -> vault_server::VaultContainer {
     let backend: SharedBackend = Arc::new(MemoryBackend::new());
     Container::create(backend, "other-app", ORIGIN)
@@ -1209,7 +1220,7 @@ async fn binding_rechecked_after_handshake() {
         let s = s.clone();
         async move {
             s.lock().await;
-            s.unlock(other_container().await, vault_secret()).await;
+            s.unlock(other_container().await).await;
         }
     };
     let (mut b, h) = pair_hooked(&s, &relay, swap).await;
@@ -1231,7 +1242,7 @@ async fn binding_rechecked_before_prompt() {
     let approver = Auto::new(true);
     let s = server(approver.clone(), ServerConfig::default()).await;
     let (mut b, h) = pair(&s, &relay).await;
-    s.unlock(other_container().await, vault_secret()).await;
+    s.unlock(other_container().await).await;
     let r = b
         .call_any(RequestBody::OpenSession {
             device_name: "A".into(),
@@ -1252,9 +1263,227 @@ async fn binding_rechecked_before_approved() {
     let (mut b, h) = pair(&s, &relay).await;
     open_request(&mut b, "A").await;
     gate.wait_prompts(1).await;
-    s.unlock(other_container().await, vault_secret()).await;
+    s.unlock(other_container().await).await;
     gate.answer(true);
     assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::WrongApp)));
     assert_eq!(ended(h).await, EndReason::WrongApp);
     assert_eq!(s.active_session(), None);
+}
+
+// ---------- locked pairing ----------
+
+/// Approver for a locked vault: records each prompt (whether the server was
+/// still locked, mailbox-taken flag, SAS), waits for `go`, then approves with
+/// its unlock material (once) or denies when it has none left.
+struct Unlocker {
+    material: Mutex<Option<UnlockMaterial>>,
+    /// (mailbox_taken, sas) of each prompt.
+    seen: Mutex<Vec<(bool, String)>>,
+    go: tokio::sync::Semaphore,
+}
+
+impl Unlocker {
+    fn new(material: UnlockMaterial, gated: bool) -> Arc<Self> {
+        Arc::new(Self {
+            material: Mutex::new(Some(material)),
+            seen: Mutex::default(),
+            go: tokio::sync::Semaphore::new(if gated { 0 } else { 1 << 20 }),
+        })
+    }
+    fn seen(&self) -> Vec<(bool, String)> {
+        self.seen.lock().unwrap().clone()
+    }
+    async fn wait_seen(&self, n: usize) -> Vec<(bool, String)> {
+        tokio::time::timeout(T, async {
+            loop {
+                let p = self.seen();
+                if p.len() >= n {
+                    return p;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prompt did not appear")
+    }
+    fn material_taken(&self) -> bool {
+        self.material.lock().unwrap().is_none()
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for Unlocker {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> ApprovalDecision {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((req.mailbox_taken, req.sas.into()));
+        self.go.acquire().await.unwrap().forget();
+        match self.material.lock().unwrap().take() {
+            Some(m) => ApprovalDecision::Approve(m),
+            None => ApprovalDecision::Deny,
+        }
+    }
+}
+
+/// A fresh container (bound to `APP`) and its root key; the container itself
+/// is dropped, as on a phone where only the wrapped CRK is kept.
+async fn locked_backend() -> (SharedBackend, Crk) {
+    let backend: SharedBackend = Arc::new(MemoryBackend::new());
+    let (c, rk) = Container::create(backend.clone(), APP, ORIGIN)
+        .await
+        .unwrap();
+    drop(c);
+    let (_, crk) = Container::open_with_recovery(backend.clone(), &rk, None)
+        .await
+        .unwrap();
+    (backend, crk)
+}
+
+async fn locked_server(backend: SharedBackend, approver: Arc<dyn Approver>) -> VaultServer {
+    VaultServer::new_locked(backend, approver, ServerConfig::default())
+        .await
+        .unwrap()
+}
+
+fn crk_material(crk: Crk) -> UnlockMaterial {
+    UnlockMaterial::Crk {
+        crk,
+        high_water: None,
+    }
+}
+
+/// A locked vault runs the handshake (and so shows the code) without any key.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_offer_while_locked_shows_code() {
+    let relay = relay().await;
+    let (backend, crk) = locked_backend().await;
+    let approver = Unlocker::new(crk_material(crk), true);
+    let s = locked_server(backend, approver.clone()).await;
+    assert!(s.is_locked());
+    assert_eq!(s.binding(), (APP.to_string(), ORIGIN.to_string()));
+    // `pair` checks that the vault's code equals the browser's.
+    let (mut b, h) = pair(&s, &relay).await;
+    assert_eq!(h.sas().len(), 6);
+    assert!(s.is_locked());
+    open_request(&mut b, "A").await;
+    let seen = approver.wait_seen(1).await;
+    assert_eq!(seen, vec![(false, h.sas().to_string())]);
+    // The prompt is shown while the vault is still locked.
+    assert!(s.is_locked());
+    assert!(!approver.material_taken());
+}
+
+/// The approval unlocks the container (with the CRK the approver produced at
+/// that moment), and only then is `Approved` sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_unlocks_then_sends_approved() {
+    let relay = relay().await;
+    let (backend, crk) = locked_backend().await;
+    let approver = Unlocker::new(crk_material(crk), true);
+    let s = locked_server(backend.clone(), approver.clone()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    let id = open_request(&mut b, "A").await;
+    approver.wait_seen(1).await;
+    assert!(s.is_locked());
+    assert_eq!(s.high_water().await, None);
+    approver.go.add_permits(1);
+    assert_eq!(expect_response(&mut b, id).await, ResponseBody::Approved);
+    assert!(!s.is_locked());
+    assert_eq!(s.active_session(), Some(h.id()));
+    assert_eq!(b.call(put(b"k", b"v")).await, ResponseBody::Ok);
+    assert_eq!(
+        b.call(RequestBody::Commit).await,
+        ResponseBody::Committed { seq: 1 }
+    );
+    assert_eq!(s.high_water().await.map(|hw| hw.seq), Some(1));
+}
+
+/// Material that does not open the container: the browser is denied and the
+/// vault stays locked.
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_unlock_failure_denies() {
+    let relay = relay().await;
+    let (backend, _) = locked_backend().await;
+    // The root key of another container.
+    let (_, wrong) = locked_backend().await;
+    let approver = Unlocker::new(crk_material(wrong), false);
+    let s = locked_server(backend, approver.clone()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    let r = b
+        .call(RequestBody::OpenSession {
+            device_name: "A".into(),
+        })
+        .await;
+    assert_eq!(r, ResponseBody::Denied);
+    assert_eq!(ended(h).await, EndReason::UnlockFailed);
+    assert!(approver.material_taken());
+    assert!(s.is_locked());
+    assert_eq!(s.active_session(), None);
+    assert_eq!(s.high_water().await, None);
+}
+
+/// The binding check of a locked vault uses the plaintext header: a wrong app
+/// is refused before the approver is asked, and nothing is unlocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_app_checked_from_header_while_locked() {
+    let relay = relay().await;
+    let (backend, crk) = locked_backend().await;
+    let approver = Unlocker::new(crk_material(crk), false);
+    let s = locked_server(backend, approver.clone()).await;
+    let (mut b, h) = pair_as(&s, &relay, "other-app", async {}).await;
+    assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::WrongApp)));
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::WrongApp);
+    assert!(approver.seen().is_empty(), "approver must not be asked");
+    assert!(!approver.material_taken());
+    assert!(s.is_locked());
+}
+
+/// Every offer gets its own random Noise static key: nothing is pinned or reused.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_session_static_key_is_fresh() {
+    let relay = relay().await;
+    let s = server(Auto::new(false), ServerConfig::default()).await;
+    let (b1, _h1) = pair(&s, &relay).await;
+    let (b2, _h2) = pair(&s, &relay).await;
+    let (k1, k2) = (b1.noise.remote_static(), b2.noise.remote_static());
+    assert_ne!(k1, k2);
+    assert_ne!(k1, [0u8; 32]);
+    // Locked mode too.
+    let (backend, crk) = locked_backend().await;
+    let l = locked_server(backend, Unlocker::new(crk_material(crk), false)).await;
+    let (b3, _h3) = pair(&l, &relay).await;
+    let k3 = b3.noise.remote_static();
+    assert!(k3 != k1 && k3 != k2);
+}
+
+/// Mailbox already taken (HTTP 409): the approver is told so that it can warn,
+/// and an `Approve` it returns anyway is ignored: nothing is unlocked and the
+/// unlock material is dropped unused.
+#[tokio::test(flavor = "multi_thread")]
+async fn mailbox_taken_reported_to_approver() {
+    let relay = relay().await;
+    let (backend, crk) = locked_backend().await;
+    let approver = Unlocker::new(crk_material(crk), false);
+    let s = locked_server(backend, approver.clone()).await;
+    let keys = PairKeys::generate(relay.url(), mailbox_id(), APP.into(), ORIGIN.into()).unwrap();
+    let url = format!(
+        "ws://{}/mailbox/{}",
+        relay.addr,
+        hex(&keys.offer().mailbox_id)
+    );
+    // The browser and someone who read the pairing text hold both places.
+    let (_browser, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (_impostor, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let r = s.serve_offer(keys.offer().clone()).await;
+    assert!(matches!(r, Err(ServerError::MailboxTaken)), "{r:?}");
+    assert_eq!(approver.seen(), vec![(true, String::new())]);
+    assert!(approver.material_taken(), "the approver answered Approve");
+    assert!(
+        s.is_locked(),
+        "an Approve for a taken mailbox must not unlock"
+    );
+    assert_eq!(s.active_session(), None);
+    assert!(s.session_log().is_empty());
 }

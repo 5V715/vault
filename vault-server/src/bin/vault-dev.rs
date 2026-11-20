@@ -3,7 +3,7 @@
 //! `vault-dev`: a laptop-hosted test vault for the browser app, for use
 //! before the Android vault exists.
 //!
-//! `vault-dev serve --dir D --pair "<qr text>"` opens the container in `D` (created
+//! `vault-dev serve --dir D --pair "<qr text>"` serves the container in `D` (created
 //! with `vaultctl init --app <id> --origin <url>`), dials the relay named in the
 //! pairing text, runs the vault side of the pairing handshake and asks on the
 //! terminal whether to approve the browser (app id, origin, relay host, device
@@ -14,9 +14,13 @@
 //!
 //! The passphrase (the one given to `vaultctl init`) is prompted for without echo.
 //! For automation, `--passphrase-file PATH` (or, on Unix only, `--passphrase-fd N`)
-//! read it instead; it is never accepted on the command line or in the environment. The vault's
-//! long-term Noise key is kept in `D/.vault-dev-identity`, sealed under the same
-//! passphrase. Development only; see `docs/vault/README.md`.
+//! read it instead; it is never accepted on the command line or in the environment.
+//! The vault is served locked: the pairing handshake uses a fresh random Noise key
+//! per run and the container is opened (with the recovery key from the
+//! passphrase-sealed `D/.vaultctl`) only when the prompt is approved. A
+//! `D/.vault-dev-identity` file left by earlier versions is obsolete: it is ignored
+//! and may be deleted (no migration is needed). Development only; see
+//! `docs/vault/README.md`.
 //!
 //! When the session ends the container is compacted if the server's
 //! [`vault_server::CompactionPolicy`] thresholds are crossed, and the high-water
@@ -31,17 +35,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use rand::RngCore;
 use vault_container::backend::LocalBackend;
-use vault_container::engine::{Container, check_header};
-use vault_container::secrets::{load_secrets, save_sealed, save_secrets, unseal};
+use vault_container::engine::check_header;
+use vault_container::secrets::{load_secrets, save_secrets};
 use vault_container::{Error as ContainerError, RecoveryKey};
 use vault_proto::PairOffer;
-use vault_server::{ServerConfig, ServerError, SharedBackend, TerminalApprover, VaultServer};
+use vault_server::{
+    ServerConfig, ServerError, SharedBackend, TerminalApprover, UnlockMaterial, VaultServer,
+};
 use zeroize::Zeroizing;
-
-const IDENTITY_FILE: &str = ".vault-dev-identity";
-const IDENTITY_MAGIC: &[u8] = b"vault-dev-identity-v1";
 
 #[derive(Parser)]
 #[command(
@@ -128,40 +130,12 @@ fn read_secret_file(p: &Path) -> R<Zeroizing<String>> {
     Ok(s)
 }
 
-/// The vault's long-term Noise static key, created on first use.
-fn load_identity(dir: &Path, pass: &str) -> R<Zeroizing<[u8; 32]>> {
-    let path = dir.join(IDENTITY_FILE);
-    match std::fs::read(&path) {
-        Ok(blob) => {
-            let plain = unseal(IDENTITY_MAGIC, &blob, pass).map_err(|e| e.to_string())?;
-            let key: [u8; 32] = plain
-                .as_slice()
-                .try_into()
-                .map_err(|_| "corrupted vault-dev identity file".to_string())?;
-            Ok(Zeroizing::new(key))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut key = Zeroizing::new([0u8; 32]);
-            rand::rng().fill_bytes(&mut *key);
-            save_sealed(dir, IDENTITY_FILE, IDENTITY_MAGIC, &*key, pass)
-                .map_err(|e| format!("cannot write identity file: {e}"))?;
-            Ok(key)
-        }
-        Err(e) => err(format!("cannot read identity file: {e}")),
-    }
-}
-
-/// Printed when the mailbox was already taken: someone else may hold the pairing text.
-const MAILBOX_TAKEN_WARNING: &str = "\
-!!! WARNING !!!
-This pairing code was already used by another device: the relay mailbox is taken.
-Someone else may have read the pairing text and may be posing as your vault.
-Do NOT press \"Codes match\" in the browser. Press Cancel, close the tab and
-start over with a new code (and do not share the pairing text).";
-
 fn server_error(e: ServerError) -> String {
     match e {
-        ServerError::MailboxTaken => MAILBOX_TAKEN_WARNING.into(),
+        // The approver has printed the warning (`MAILBOX_TAKEN_WARNING`).
+        ServerError::MailboxTaken => {
+            "the relay mailbox is already taken (see the warning above)".into()
+        }
         ServerError::Relay(_) => format!("cannot reach the relay: {e}"),
         ServerError::Tls(m) => format!("--ca-file: {m}"),
         ServerError::BadOffer => "pairing text names a relay this vault will not use".into(),
@@ -202,18 +176,37 @@ async fn serve(a: ServeArgs) -> R<()> {
         ContainerError::BadSecrets => "wrong passphrase (or not a vaultctl directory)".to_string(),
         other => other.to_string(),
     })?;
-    let rk = RecoveryKey::parse(&secrets.recovery_key).map_err(|e| e.to_string())?;
+    // Checked now so that a damaged key is reported before anything is dialed;
+    // parsed again (and dropped) at each approval.
+    RecoveryKey::parse(&secrets.recovery_key).map_err(|e| e.to_string())?;
     let backend: SharedBackend = Arc::new(
         LocalBackend::open(&a.dir)
             .await
             .map_err(|e| format!("cannot open container: {e}"))?,
     );
-    let (container, _crk) = Container::open_with_recovery(backend, &rk, secrets.high_water)
-        .await
-        .map_err(|e| format!("cannot open container: {e}"))?;
-    let identity = load_identity(&a.dir, &pass)?;
+    // The container is opened only at approval, with these passphrase-derived secrets.
+    let unlock = {
+        let rk_text = Zeroizing::new(secrets.recovery_key.clone());
+        let high_water = secrets.high_water;
+        move || match RecoveryKey::parse(&rk_text) {
+            Ok(key) => UnlockMaterial::RecoveryKey { key, high_water },
+            Err(_) => UnlockMaterial::Unlocked,
+        }
+    };
+    let approver = Arc::new(TerminalApprover::new().with_unlock(unlock));
 
-    let (app_id, origin) = container.binding();
+    let config = ServerConfig {
+        extra_ca_pem: extra_ca,
+        ..ServerConfig::default()
+    };
+    let server = VaultServer::new_locked(backend, approver, config)
+        .await
+        .map_err(|e| match e {
+            ServerError::Container(e) => format!("cannot open container: {e}"),
+            other => server_error(other),
+        })?;
+
+    let (app_id, origin) = server.binding();
     let bound = offer.app_id == app_id && offer.origin == origin;
     if !bound {
         eprintln!(
@@ -225,18 +218,6 @@ async fn serve(a: ServeArgs) -> R<()> {
             offer.origin.escape_debug(),
         );
     }
-
-    let config = ServerConfig {
-        extra_ca_pem: extra_ca,
-        ..ServerConfig::default()
-    };
-    let server = VaultServer::new(
-        container,
-        identity,
-        Arc::new(TerminalApprover::new()),
-        config,
-    )
-    .map_err(server_error)?;
 
     eprintln!("Connecting to the relay...");
     let handle = server.serve_offer(offer).await.map_err(server_error)?;

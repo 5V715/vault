@@ -20,12 +20,13 @@ use vault_container::Result as CResult;
 use vault_container::backend::{ContainerBackend, Etag, MemoryBackend, PutOutcome};
 use vault_container::engine::Container;
 use vault_proto::PairOffer;
-use vault_server::{ApprovalRequest, Approver, ServerConfig, SharedBackend, VaultServer};
+use vault_server::{
+    ApprovalDecision, ApprovalRequest, Approver, ServerConfig, SharedBackend, VaultServer,
+};
 
 /// The binding of every test vault (and what test clients declare by default).
 pub const APP_ID: &str = "test-app";
 pub const ORIGIN: &str = "https://app.example";
-use zeroize::Zeroizing;
 
 /// Container backend whose writes can be held back or made to fail.
 #[derive(Default)]
@@ -89,7 +90,7 @@ impl TestApprover {
 
 #[async_trait::async_trait]
 impl Approver for TestApprover {
-    async fn approve(&self, req: &ApprovalRequest<'_>) -> bool {
+    async fn approve(&self, req: &ApprovalRequest<'_>) -> ApprovalDecision {
         self.calls
             .lock()
             .unwrap()
@@ -97,7 +98,7 @@ impl Approver for TestApprover {
         while self.hold.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        self.answer.load(Ordering::SeqCst)
+        self.answer.load(Ordering::SeqCst).into()
     }
 }
 
@@ -106,13 +107,7 @@ pub fn vault_server(rt: &tokio::runtime::Runtime, approver: Arc<TestApprover>) -
     rt.block_on(async move {
         let backend: SharedBackend = Arc::new(MemoryBackend::default());
         let (c, _rk) = Container::create(backend, APP_ID, ORIGIN).await.unwrap();
-        VaultServer::new(
-            c,
-            Zeroizing::new([7u8; 32]),
-            approver,
-            ServerConfig::default(),
-        )
-        .unwrap()
+        VaultServer::new(c, approver, ServerConfig::default()).unwrap()
     })
 }
 
@@ -159,8 +154,7 @@ impl Stack {
             let appr = approver.clone();
             rt.block_on(async move {
                 let (c, _rk) = Container::create(backend, APP_ID, ORIGIN).await.unwrap();
-                VaultServer::new(c, Zeroizing::new([42u8; 32]), appr, ServerConfig::default())
-                    .unwrap()
+                VaultServer::new(c, appr, ServerConfig::default()).unwrap()
             })
         };
         Self {

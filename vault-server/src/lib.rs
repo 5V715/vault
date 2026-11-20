@@ -2,21 +2,40 @@
 //! Vault side of the vault protocol (`docs/protocol/vault.md`).
 //!
 //! Given a scanned [`PairOffer`], [`VaultServer::serve_offer`] dials the relay
-//! mailbox, runs the Noise XX responder, then (in a spawned task) checks the
-//! offer's app id and origin against the container's binding, waits for the
-//! browser's `OpenSession`, asks the [`Approver`] (app, origin, relay host, device
-//! name, SAS) and serves `KvBackend`-style requests against the encrypted
-//! [`Container`].
+//! mailbox, runs the Noise XX responder with a fresh random static key, then (in
+//! a spawned task) checks the offer's app id and origin against the container's
+//! binding, waits for the browser's `OpenSession`, asks the [`Approver`] (app,
+//! origin, relay host, device name, SAS), unlocks the container if it is locked
+//! and serves `KvBackend`-style requests against the encrypted [`Container`].
+//!
+//! Two ways to run it:
+//! - **Locked pairing** ([`VaultServer::new_locked`], and after
+//!   [`VaultServer::lock`]): the server holds only the storage backend and the
+//!   binding read from the plaintext header. Pairing, the binding check and the
+//!   prompt need no key; the approver returns the [`UnlockMaterial`] (on Android
+//!   the CRK unwrapped by the biometric prompt) and the server opens the
+//!   container with it before it sends `Approved`. If it cannot open it, the
+//!   browser is denied ([`EndReason::UnlockFailed`]) and the vault stays locked.
+//! - **Unlocked** ([`VaultServer::new`], [`VaultServer::unlock`]): the container
+//!   is already open; an approval needs no material.
 //!
 //! Invariants:
+//! - The Noise static key is random per offer (OS RNG), held in `Zeroizing`
+//!   memory only while the handshake is set up, and never stored or reused. The
+//!   protocol does not pin it: the 6-digit code authenticates every session.
 //! - A session whose offer names another app or origin than the container is
 //!   bound to gets `Notice::WrongApp` right after the handshake and ends
 //!   ([`EndReason::WrongApp`]): before any request is read, before the approver
 //!   is asked and without touching the container. The binding is that of the
-//!   container installed at the time of each check: right after the handshake,
-//!   again immediately before the approver is asked and again (under the
-//!   container lock) before `Approved` is granted, so a `lock`/`unlock` that swaps
-//!   the container in between cannot let a mismatched offer through.
+//!   container installed (or, while locked, of its header) at the time of each
+//!   check: right after the handshake, again immediately before the approver is
+//!   asked and again (under the container lock, on the opened container) before
+//!   `Approved` is granted, so a `lock`/`unlock` that swaps the container in
+//!   between cannot let a mismatched offer through.
+//! - A taken mailbox (HTTP 409) is reported to the approver
+//!   ([`ApprovalRequest::mailbox_taken`]) as a warning; its answer is always a
+//!   denial and [`VaultServer::serve_offer`] fails with
+//!   [`ServerError::MailboxTaken`].
 //! - One approval prompt at a time (server-wide); at most
 //!   [`MAX_AWAITING_APPROVAL`] sessions wait for approval, further `OpenSession`s
 //!   are answered `Denied`. Each prompt's timeout starts when it is shown.
@@ -30,8 +49,9 @@
 //!   session that ends with uncommitted writes has them discarded (the browser
 //!   never got a `Committed` for them).
 //! - [`VaultServer::lock`] ends all sessions (`Notice::Locked`), discards pending
-//!   writes and drops the container and the static key; [`VaultServer::unlock`]
-//!   installs a re-opened container.
+//!   writes and drops the container (keeping its backend, binding and high-water
+//!   mark for locked pairing); [`VaultServer::unlock`] installs a re-opened
+//!   container.
 //! - After a session ends the container is compacted when
 //!   [`CompactionPolicy`] says so, and only while no session is active and
 //!   nothing is staged; never on a commit path.
@@ -42,17 +62,21 @@ mod session;
 mod transport;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, mpsc};
 use vault_container::backend::ContainerBackend;
-use vault_container::engine::Container;
+use vault_container::engine::{Container, HighWater};
 use vault_proto::PairOffer;
 use vault_proto::noise::Responder;
 use zeroize::Zeroizing;
 
-pub use approver::{ApprovalRequest, Approver, TerminalApprover};
+pub use approver::{
+    ApprovalDecision, ApprovalRequest, Approver, MAILBOX_TAKEN_WARNING, TerminalApprover,
+    UnlockMaterial,
+};
 
 /// Sessions that may wait for (or be in) user approval at the same time.
 pub const MAX_AWAITING_APPROVAL: usize = 2;
@@ -148,8 +172,12 @@ impl Default for ServerConfig {
 /// Errors from [`VaultServer::new`] and [`VaultServer::serve_offer`].
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    #[error("vault is locked")]
-    Locked,
+    /// The container header could not be read (locked pairing needs its binding).
+    #[error("container: {0}")]
+    Container(vault_container::Error),
+    /// The OS random generator failed (no static key for the handshake).
+    #[error("no randomness for the handshake key")]
+    Rng,
     #[error("pair offer is not usable")]
     BadOffer,
     #[error("relay: {0}")]
@@ -196,6 +224,9 @@ pub enum EndReason {
     /// The offer's app id or origin is not the container's binding
     /// (`Notice::WrongApp` was sent; nobody was asked).
     WrongApp,
+    /// The user approved, but the vault was locked and the approval's
+    /// [`UnlockMaterial`] did not open the container (the browser got `Denied`).
+    UnlockFailed,
 }
 
 impl EndReason {
@@ -214,6 +245,7 @@ impl EndReason {
             Self::Busy => "busy",
             Self::Internal => "internal error",
             Self::WrongApp => "wrong app",
+            Self::UnlockFailed => "unlock failed",
         }
     }
 }
@@ -307,9 +339,17 @@ impl Offered {
 pub(crate) struct Inner {
     /// `None` while locked. Lock order: `container`, then `state`.
     pub container: Mutex<Option<VaultContainer>>,
-    /// Binding of the installed container (kept while locked; not secret).
+    /// Binding of the installed container, or while locked of the backend's
+    /// header (not secret). Updated under the `container` lock.
     binding: StdMutex<BindingPair>,
-    static_secret: StdMutex<Option<Zeroizing<[u8; 32]>>>,
+    /// Storage of the container, for opening it at approval while locked.
+    /// Updated under the `container` lock.
+    backend: StdMutex<SharedBackend>,
+    /// Mirrors `container.is_none()` for the synchronous [`VaultServer::is_locked`].
+    locked: AtomicBool,
+    /// High-water mark of the last container this server dropped (on `lock`):
+    /// an unlock never accepts an older manifest, whatever the host passes.
+    last_high_water: StdMutex<Option<HighWater>>,
     pub approver: Arc<dyn Approver>,
     /// One approval prompt at a time.
     pub approval: tokio::sync::Semaphore,
@@ -325,13 +365,73 @@ impl Inner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn secret(&self) -> MutexGuard<'_, Option<Zeroizing<[u8; 32]>>> {
-        self.static_secret.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub(crate) fn binding(&self) -> MutexGuard<'_, BindingPair> {
         self.binding.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn backend(&self) -> MutexGuard<'_, SharedBackend> {
+        self.backend.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn last_high_water(&self) -> MutexGuard<'_, Option<HighWater>> {
+        self.last_high_water
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Install `c` as the open container (the caller holds the `container` lock).
+    pub(crate) fn install(&self, slot: &mut Option<VaultContainer>, c: VaultContainer) {
+        *self.binding() = binding_of(&c);
+        *self.backend() = c.backend().clone();
+        if let Some(mut old) = slot.replace(c) {
+            old.discard_pending();
+        }
+        self.locked.store(false, Ordering::SeqCst);
+    }
+
+    /// Open the container with an approval's material (the caller holds the
+    /// `container` lock and the vault is locked). The material is consumed and
+    /// dropped (zeroized) here, whatever the outcome.
+    pub(crate) async fn open_with(
+        &self,
+        material: UnlockMaterial,
+    ) -> Result<VaultContainer, vault_container::Error> {
+        let backend = self.backend().clone();
+        let floor = *self.last_high_water();
+        match material {
+            UnlockMaterial::Unlocked => Err(vault_container::Error::Unsupported(
+                "approval without unlock material on a locked vault".into(),
+            )),
+            UnlockMaterial::Crk { crk, high_water } => {
+                Container::open_with_crk(backend, crk, newer(high_water, floor)).await
+            }
+            UnlockMaterial::RecoveryKey { key, high_water } => {
+                Container::open_with_recovery(backend, &key, newer(high_water, floor))
+                    .await
+                    .map(|(c, _crk)| c)
+            }
+        }
+    }
+}
+
+/// The stricter of two high-water marks (the higher `seq`; on a tie the one
+/// this server saw itself).
+fn newer(host: Option<HighWater>, seen: Option<HighWater>) -> Option<HighWater> {
+    match (host, seen) {
+        (Some(h), Some(s)) if h.seq > s.seq => Some(h),
+        (_, Some(s)) => Some(s),
+        (h, None) => h,
+    }
+}
+
+/// A fresh Noise static key for one offer, from the OS RNG.
+fn fresh_static_key() -> Result<Zeroizing<[u8; 32]>, ServerError> {
+    use rand::TryRngCore;
+    let mut k = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut *k)
+        .map_err(|_| ServerError::Rng)?;
+    Ok(k)
 }
 
 pub(crate) fn binding_of(c: &VaultContainer) -> BindingPair {
@@ -392,20 +492,46 @@ impl std::fmt::Debug for VaultServer {
 }
 
 impl VaultServer {
-    /// `static_secret` is the vault's long-term Noise static private key.
+    /// An unlocked server: `container` is open and served as is.
     pub fn new(
         container: VaultContainer,
-        static_secret: Zeroizing<[u8; 32]>,
+        approver: Arc<dyn Approver>,
+        config: ServerConfig,
+    ) -> Result<Self, ServerError> {
+        let backend = container.backend().clone();
+        let binding = binding_of(&container);
+        Self::build(backend, binding, Some(container), approver, config)
+    }
+
+    /// A locked server for the container on `backend`: it pairs and checks the
+    /// binding (read from the plaintext header, no key needed) and opens the
+    /// container only when an approval brings the [`UnlockMaterial`].
+    pub async fn new_locked(
+        backend: SharedBackend,
+        approver: Arc<dyn Approver>,
+        config: ServerConfig,
+    ) -> Result<Self, ServerError> {
+        let b = vault_container::engine::read_binding(&*backend)
+            .await
+            .map_err(ServerError::Container)?;
+        Self::build(backend, (b.app_id, b.origin), None, approver, config)
+    }
+
+    fn build(
+        backend: SharedBackend,
+        binding: BindingPair,
+        container: Option<VaultContainer>,
         approver: Arc<dyn Approver>,
         config: ServerConfig,
     ) -> Result<Self, ServerError> {
         let tls = Arc::new(transport::tls_config(config.extra_ca_pem.as_deref())?);
-        let binding = binding_of(&container);
         Ok(Self {
             inner: Arc::new(Inner {
                 binding: StdMutex::new(binding),
-                container: Mutex::new(Some(container)),
-                static_secret: StdMutex::new(Some(static_secret)),
+                backend: StdMutex::new(backend),
+                locked: AtomicBool::new(container.is_none()),
+                last_high_water: StdMutex::new(None),
+                container: Mutex::new(container),
                 approver,
                 approval: tokio::sync::Semaphore::new(1),
                 awaiting: std::sync::atomic::AtomicUsize::new(0),
@@ -417,12 +543,20 @@ impl VaultServer {
     }
 
     /// Dial the offer's relay mailbox and run the Noise handshake (bounded by
-    /// `handshake_timeout`); on success the session continues in a spawned task
-    /// (binding check, approval, then serving) and its handle is returned.
+    /// `handshake_timeout`) with a fresh random static key; on success the
+    /// session continues in a spawned task (binding check, approval, unlock if
+    /// locked, then serving) and its handle is returned. Works whether or not the
+    /// vault is locked.
     ///
     /// An offer for another app or origin than the container's binding still
     /// gets the handshake, so that the browser learns why: the session then
     /// only sends `Notice::WrongApp` and ends with [`EndReason::WrongApp`].
+    ///
+    /// If the relay answers that the mailbox is taken (HTTP 409), the approver
+    /// is shown an [`ApprovalRequest`] with `mailbox_taken` set (and no code);
+    /// its answer is treated as a denial and this returns
+    /// [`ServerError::MailboxTaken`]. No session exists, so there is nobody to
+    /// send a notice to.
     pub async fn serve_offer(&self, offer: PairOffer) -> Result<SessionHandle, ServerError> {
         // The binding is not decided here: the session task checks it against the
         // container installed at each decision point (see `Offered::matches`).
@@ -432,9 +566,8 @@ impl VaultServer {
             relay_host: relay_host(&offer.relay_url).to_string(),
         };
         let responder = {
-            let secret = self.inner.secret();
-            let secret = secret.as_ref().ok_or(ServerError::Locked)?;
-            Responder::new(**secret, &offer).map_err(|_| ServerError::Handshake)?
+            let key = fresh_static_key()?;
+            Responder::new(*key, &offer).map_err(|_| ServerError::Handshake)?
         };
         let url = transport::mailbox_url(&offer)?;
         let tls = self.inner.tls.clone();
@@ -450,17 +583,20 @@ impl VaultServer {
             let noise = r.handle_msg3(&m3).map_err(|_| ServerError::Handshake)?;
             Ok::<_, ServerError>((ws, noise))
         };
-        let (ws, noise) = tokio::time::timeout(self.inner.config.handshake_timeout, handshake)
+        let (ws, noise) = match tokio::time::timeout(self.inner.config.handshake_timeout, handshake)
             .await
-            .map_err(|_| ServerError::Timeout)??;
+            .map_err(|_| ServerError::Timeout)?
+        {
+            Ok(x) => x,
+            Err(ServerError::MailboxTaken) => {
+                self.report_mailbox_taken(&offered).await;
+                return Err(ServerError::MailboxTaken);
+            }
+            Err(e) => return Err(e),
+        };
         let sas = noise.sas().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
         let id = {
-            // Re-check under the state lock so a concurrent `lock()` cannot miss us.
-            let secret = self.inner.secret();
-            if secret.is_none() {
-                return Err(ServerError::Locked);
-            }
             let mut st = self.inner.state();
             st.next_id += 1;
             let id = st.next_id;
@@ -480,13 +616,42 @@ impl VaultServer {
         Ok(SessionHandle { id, sas, task })
     }
 
+    /// Tell the approver (one prompt at a time, bounded by `approval_timeout`)
+    /// that the mailbox was taken. Whatever it answers is a denial.
+    async fn report_mailbox_taken(&self, offered: &Offered) {
+        tracing::warn!("vault pairing: relay mailbox already taken");
+        let cfg = &self.inner.config;
+        let req = ApprovalRequest {
+            device_name: "",
+            sas: "",
+            app_id: &offered.app_id,
+            origin: &offered.origin,
+            relay_host: &offered.relay_host,
+            mailbox_taken: true,
+        };
+        let shown = async {
+            let _permit = self.inner.approval.acquire().await.ok()?;
+            let d = self.inner.approver.approve(&req).await;
+            Some(approver::effective(&req, d))
+        };
+        // The answer is dropped: `effective` made it a denial, and any unlock
+        // material it carried is zeroized unused.
+        let _ = tokio::time::timeout(cfg.approval_timeout * 2, shown).await;
+    }
+
     /// End all sessions (`Notice::Locked`), discard uncommitted writes and drop
-    /// the container and the static key. Waits for in-flight requests to finish.
+    /// the container. Waits for in-flight requests to finish. The server stays
+    /// usable for locked pairing: the next approval must bring
+    /// [`UnlockMaterial`].
     pub async fn lock(&self) {
         let mut c = self.inner.container.lock().await;
         let taken = c.take();
+        self.inner.locked.store(true, Ordering::SeqCst);
+        if let Some(t) = &taken {
+            let mut hw = self.inner.last_high_water();
+            *hw = newer(Some(t.high_water()), *hw);
+        }
         let txs: Vec<_> = {
-            *self.inner.secret() = None;
             let mut st = self.inner.state();
             st.active = None;
             st.sessions.drain().map(|(_, tx)| tx).collect()
@@ -504,14 +669,11 @@ impl VaultServer {
         tracing::info!("vault locked");
     }
 
-    /// Install a re-opened container and the static key after [`VaultServer::lock`].
-    pub async fn unlock(&self, container: VaultContainer, static_secret: Zeroizing<[u8; 32]>) {
+    /// Install a re-opened container (after [`VaultServer::lock`], or in place
+    /// of the current one, whose uncommitted writes are discarded).
+    pub async fn unlock(&self, container: VaultContainer) {
         let mut c = self.inner.container.lock().await;
-        *self.inner.binding() = binding_of(&container);
-        if let Some(mut old) = c.replace(container) {
-            old.discard_pending();
-        }
-        *self.inner.secret() = Some(static_secret);
+        self.inner.install(&mut c, container);
         tracing::info!("vault unlocked");
     }
 
@@ -542,14 +704,16 @@ impl VaultServer {
         compact_if_needed(&self.inner).await
     }
 
-    /// The container's app binding, `(app_id, origin)`; offers for anything else
-    /// are refused with `Notice::WrongApp`.
+    /// The container's app binding, `(app_id, origin)` (while locked, as read
+    /// from its header); offers for anything else are refused with
+    /// `Notice::WrongApp`.
     pub fn binding(&self) -> (String, String) {
         self.inner.binding().clone()
     }
 
+    /// Whether no container is open (locked pairing).
     pub fn is_locked(&self) -> bool {
-        self.inner.secret().is_none()
+        self.inner.locked.load(Ordering::SeqCst)
     }
 
     /// Id of the approved session, if any.
