@@ -1,0 +1,55 @@
+[package]
+name = "vault-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "UniFFI facade over vault-container and vault-server for the Android vault app"
+publish = false
+
+[lib]
+# `cdylib` is what the Android app loads (and what uniffi-bindgen reads the
+# metadata from); `lib` serves the host tests and the bindgen binary.
+crate-type = ["cdylib", "lib"]
+name = "vault_ffi"
+
+[features]
+default = []
+# The `uniffi-bindgen` binary (generates the Kotlin bindings from the built
+# library in CI). Off by default so the Android library does not compile the
+# bindings generator.
+bindgen = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+# Pinned exactly: the generated Kotlin bindings must match this scaffolding.
+uniffi = { version = "=0.32.2", default-features = false }
+vault-container = { path = "../vault-container", default-features = false, features = ["raw-key-access"] }
+vault-server = { path = "../vault-server", default-features = false }
+vault-proto = { path = "../vault-proto" }
+thiserror.workspace = true
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+zeroize = "1"
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+rand = "0.9"
+data-encoding = "2"
+tracing = "0.1"
+subtle = "2"
+# Checks `extra_ca_pem` when the factory is built.
+rustls-pki-types = { version = "1", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
+vault-mailbox = { path = "../vault-mailbox" }
+vault-client = { path = "../vault-client", features = ["native"] }
+futures = { version = "0.3", features = ["executor"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
