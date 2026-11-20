@@ -77,6 +77,10 @@ struct ServeArgs {
     #[cfg(unix)]
     #[arg(long, value_name = "FD")]
     passphrase_fd: Option<u32>,
+    /// Also trust the CA certificate(s) in this PEM file when dialing a `wss://`
+    /// relay (on top of the public roots), e.g. the local CA of a LAN relay.
+    #[arg(long, value_name = "PEM")]
+    ca_file: Option<PathBuf>,
 }
 
 type R<T> = Result<T, String>;
@@ -159,6 +163,7 @@ fn server_error(e: ServerError) -> String {
     match e {
         ServerError::MailboxTaken => MAILBOX_TAKEN_WARNING.into(),
         ServerError::Relay(_) => format!("cannot reach the relay: {e}"),
+        ServerError::Tls(m) => format!("--ca-file: {m}"),
         ServerError::BadOffer => "pairing text names a relay this vault will not use".into(),
         other => other.to_string(),
     }
@@ -186,6 +191,12 @@ async fn serve(a: ServeArgs) -> R<()> {
     if let Ok(bytes) = std::fs::read(a.dir.join("header")) {
         check_header(&bytes).map_err(|e| format!("cannot open container: {e}"))?;
     }
+    let extra_ca = match &a.ca_file {
+        Some(p) => Some(
+            std::fs::read(p).map_err(|e| format!("cannot read --ca-file {}: {e}", p.display()))?,
+        ),
+        None => None,
+    };
     let pass = read_passphrase(&a)?;
     let mut secrets = load_secrets(&a.dir, &pass).map_err(|e| match e {
         ContainerError::BadSecrets => "wrong passphrase (or not a vaultctl directory)".to_string(),
@@ -215,11 +226,15 @@ async fn serve(a: ServeArgs) -> R<()> {
         );
     }
 
+    let config = ServerConfig {
+        extra_ca_pem: extra_ca,
+        ..ServerConfig::default()
+    };
     let server = VaultServer::new(
         container,
         identity,
         Arc::new(TerminalApprover::new()),
-        ServerConfig::default(),
+        config,
     )
     .map_err(server_error)?;
 

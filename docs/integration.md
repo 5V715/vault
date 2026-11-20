@@ -61,10 +61,23 @@ docker run -p 127.0.0.1:8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://my-app.exa
   your users.
 - TLS is required: browsers and vaults use `wss://` (the `relay_origin` is
   `https://...`, which maps to `wss://`). Plain `ws://` is accepted only for
-  loopback hosts, for local development. `vault-relay` itself speaks plain HTTP,
-  so terminate TLS in front of it. A `relay_origin` may include a base path
+  loopback hosts, for local development. By default `vault-relay` speaks plain
+  HTTP, so terminate TLS in front of it, or give it a certificate (next item).
+  A `relay_origin` may include a base path
   (`https://example.com/relay` becomes `wss://example.com/relay/mailbox/<id>`)
   if your proxy strips it before forwarding.
+- `--tls-cert CERT.pem --tls-key KEY.pem` (or `VAULT_RELAY_TLS_CERT` and
+  `VAULT_RELAY_TLS_KEY`, for containers) make the relay terminate TLS itself,
+  for a LAN or a single host without a reverse proxy. The certificate file is a
+  PEM chain (leaf first, intermediates after), the key file PEM (PKCS#8, PKCS#1
+  or SEC1). Both are required together; a missing, mismatched or unparsable pair
+  stops the relay with exit status 2 and a message that never shows key
+  material. It uses rustls with TLS 1.2 or newer (1.3 preferred), no client
+  certificates, and the same connection cap and stall timeout cover the
+  handshake. On Unix it warns when the key file is readable by group or others
+  (use mode 0600). Certificates are read once at start; restart to renew. A
+  private CA is trusted by `vault-dev` with `--ca-file` (see
+  `docs/vault/README.md`) and has to be installed on the phone or browser.
 - `--trust-proxy` makes the relay take the client address from the first
   `X-Forwarded-For` hop. Behind a proxy you need it, or every user shares the
   proxy's address and its per-address limit (`--max-per-ip`, default 8 open

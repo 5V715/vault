@@ -98,12 +98,23 @@ fn pump(mut r: impl std::io::Read + Send + 'static) -> Arc<Mutex<String>> {
 }
 
 fn spawn_vault(dir: &Path, pass: &str, offer: &str, passfile: &Path) -> Vault {
+    spawn_vault_with(dir, pass, offer, passfile, &[])
+}
+
+fn spawn_vault_with(
+    dir: &Path,
+    pass: &str,
+    offer: &str,
+    passfile: &Path,
+    extra: &[&Path],
+) -> Vault {
     std::fs::write(passfile, format!("{pass}\n")).unwrap();
     let mut child = Command::new(BIN)
         .args(["serve", "--dir"])
         .arg(dir)
         .args(["--pair", offer, "--passphrase-file"])
         .arg(passfile)
+        .args(extra.iter().flat_map(|p| [Path::new("--ca-file"), p]))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -230,6 +241,11 @@ fn offer_for(relay: &Relay, tag: u8, app: &str, origin: &str) -> Offer {
 }
 
 async fn handshake(relay: &Relay, o: Offer) -> Browser {
+    handshake_via(relay, o, None).await
+}
+
+/// `tls`: dial `wss://` trusting the CA in that PEM file.
+async fn handshake_via(relay: &Relay, o: Offer, tls: Option<&Path>) -> Browser {
     let id: String = o
         .keys
         .offer()
@@ -237,9 +253,33 @@ async fn handshake(relay: &Relay, o: Offer) -> Browser {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/mailbox/{id}", relay.addr))
-        .await
-        .unwrap();
+    let (mut ws, _) = match tls {
+        None => tokio_tungstenite::connect_async(format!("ws://{}/mailbox/{id}", relay.addr))
+            .await
+            .unwrap(),
+        Some(ca) => {
+            use rustls_pki_types::{CertificateDer, pem::PemObject};
+            let mut roots = rustls::RootCertStore::empty();
+            for c in CertificateDer::pem_file_iter(ca).unwrap() {
+                roots.add(c.unwrap()).unwrap();
+            }
+            let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            tokio_tungstenite::connect_async_tls_with_config(
+                format!("wss://{}/mailbox/{id}", relay.addr),
+                None,
+                false,
+                Some(tokio_tungstenite::Connector::Rustls(Arc::new(cfg))),
+            )
+            .await
+            .unwrap()
+        }
+    };
     let (init, m1) = o.keys.into_initiator().unwrap();
     ws.send(Message::Binary(m1.into())).await.unwrap();
     let m2 = match tokio::time::timeout(T, ws.next()).await.unwrap() {
@@ -588,4 +628,115 @@ fn passphrase_fd_flag_present_on_unix() {
     let help = serve_help();
     assert!(help.contains("--passphrase-fd"), "{help}");
     assert!(help.contains("--passphrase-file"), "{help}");
+}
+
+/// A CA and a leaf for 127.0.0.1, written as `ca.pem`, `leaf.pem`, `leaf.key` (in-test only).
+fn local_pki() -> tempfile::TempDir {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+    let dir = tempfile::tempdir().unwrap();
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+    p.subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let leaf = p
+        .signed_by(&leaf_key, &Issuer::from_params(&ca_params, &ca_key))
+        .unwrap();
+    std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+    std::fs::write(dir.path().join("leaf.pem"), leaf.pem()).unwrap();
+    std::fs::write(dir.path().join("leaf.key"), leaf_key.serialize_pem()).unwrap();
+    dir
+}
+
+/// An in-process relay that terminates TLS with the leaf from `local_pki`.
+async fn tls_relay(pki: &Path) -> Relay {
+    let cfg = vault_mailbox::tls_server_config(
+        &std::fs::read(pki.join("leaf.pem")).unwrap(),
+        &std::fs::read(pki.join("leaf.key")).unwrap(),
+    )
+    .unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let mailboxes = vault_mailbox::Mailboxes::new(vault_mailbox::MailboxConfig::default());
+    tokio::spawn(vault_mailbox::serve_tls(
+        l,
+        mailboxes,
+        Some(cfg),
+        async move {
+            let _ = rx.await;
+        },
+    ));
+    Relay { addr, _stop: tx }
+}
+
+fn tls_offer(relay: &Relay) -> Offer {
+    let keys = PairKeys::generate(
+        format!("https://{}", relay.addr),
+        [9; 16],
+        APP.into(),
+        ORIGIN.into(),
+    )
+    .unwrap();
+    let text = keys.offer().to_qr().unwrap();
+    Offer { keys, text }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vault_dev_ca_file_trusts_local_ca() {
+    let pki = local_pki();
+    let relay = tls_relay(pki.path()).await;
+    let dir = make_dir(PASS).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ca = pki.path().join("ca.pem");
+    let o = tls_offer(&relay);
+    let v = spawn_vault_with(dir.path(), PASS, &o.text, &tmp.path().join("pw"), &[&ca]);
+    // The vault dials wss:// and trusts the local CA; the browser side meets it there.
+    let _browser = handshake_via(&relay, o, Some(&ca)).await;
+    v.wait_err("Connected. Waiting for the browser").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vault_dev_without_ca_file_rejects_local_ca() {
+    let pki = local_pki();
+    let relay = tls_relay(pki.path()).await;
+    let dir = make_dir(PASS).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = spawn_vault(
+        dir.path(),
+        PASS,
+        &tls_offer(&relay).text,
+        &tmp.path().join("pw"),
+    );
+    let st = v.exit().await;
+    assert!(!st.success());
+    let err = v.err.lock().unwrap().clone();
+    assert!(err.contains("cannot reach the relay"), "{err}");
+    assert!(!err.contains("Connected."), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vault_dev_ca_file_must_parse() {
+    let dir = make_dir(PASS).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = relay().await;
+    let junk = tmp.path().join("junk.pem");
+    std::fs::write(&junk, "not a pem").unwrap();
+    let missing = tmp.path().join("missing.pem");
+    for (ca, needle) in [(&junk, "--ca-file"), (&missing, "cannot read --ca-file")] {
+        let mut v = spawn_vault_with(
+            dir.path(),
+            PASS,
+            &offer(&relay, 3).text,
+            &tmp.path().join("pw"),
+            &[ca],
+        );
+        let st = v.exit().await;
+        assert!(!st.success());
+        let err = v.err.lock().unwrap().clone();
+        assert!(err.contains(needle) && !err.contains("Connected."), "{err}");
+    }
 }

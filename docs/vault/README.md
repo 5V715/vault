@@ -201,8 +201,11 @@ Options and behaviour:
   `http://`/`ws://` only for loopback hosts (`localhost`, `127.0.0.1`, `[::1]`), which
   the web app's own offer encoding also enforces. There is therefore no
   `--insecure-dev-relay` flag: a plain-`ws` offer for a non-loopback host cannot be
-  produced or parsed. To test against a relay with a private CA, that CA support exists in
-  `ServerConfig::extra_ca_pem` but is not yet exposed on this command line.
+  produced or parsed. To test against a relay whose certificate comes from a private CA
+  (for example a LAN relay started with `vault-relay --tls-cert/--tls-key`), pass
+  `--ca-file CA.pem`: the CA certificate(s) in that PEM file (one or more) are trusted in
+  addition to the public roots. An unreadable or malformed file is an error before
+  anything is dialed (exit 1); the certificate must still name the relay's host or IP.
 - The vault's long-term Noise key is created on first use in `D/.vault-dev-identity`,
   sealed under the same passphrase (Argon2id, AES-256-GCM, mode 0600 on Unix; on Windows
   the file keeps the ACL inherited from its directory, so keep the vault directory under
