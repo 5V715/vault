@@ -47,7 +47,7 @@ Useful options (all in `--help`):
 | `--dir D` | keep the demo files in `D` instead of `.showcase/` |
 | `--reset` | delete the demo vault first (asks `y/N`; `--yes` skips the question) |
 | `--no-build` | reuse the existing builds |
-| `--pair TEXT` | pair once with this pairing text instead of asking |
+| `--pair TEXT` | pair once with this pairing text instead of asking (it ends up in your shell history; prefer pasting at the prompt) |
 | `--check` | build, start, health-check, exit 0 (used by CI) |
 
 ## What you will see
@@ -60,10 +60,11 @@ Useful options (all in `--help`):
    button. The QR is what a phone vault would scan; on your laptop you copy the text.
 4. **Click Copy pairing text** and paste it at the terminal's `Pairing text:` prompt.
    The text is valid for about 60 seconds.
-5. **`vault-dev` asks for approval** in the terminal and shows a code, a short number,
-   and the page shows a number too. If they are the same, type `y` and the number, for
-   example `y 417`, then press Enter. If they differ, answer `n`: someone is in the
-   middle.
+5. **`vault-dev` asks for approval** in the terminal. It prints the app, origin and
+   relay it was asked about, a 6-digit code, and a prompt number such as `[#1]`. Compare
+   the 6-digit code with the one in the browser. If they are the same, answer
+   `y <prompt number>` (for `[#1]`: `y 1`) and press Enter. If they differ, answer `n`:
+   someone may be in the middle.
 6. **Click Codes match** in the page. The to-do list appears. It is empty at first.
 7. **Add a few items, tick some.** Changes are saved to the vault after 500 ms of
    quiet. Nothing is stored in the browser.
@@ -108,15 +109,17 @@ Everything is under `.showcase/` in the repository (git-ignored), or `--dir`:
 
 | Path | What |
 |---|---|
+| `.showcase-dir` | marker: the script only resets or reuses a directory that has it |
 | `vault/` | the encrypted vault container (segments and a sealed manifest) |
 | `passphrase` | random passphrase, mode 0600, never printed or passed on a command line |
 | `origin` | the origin the vault is bound to |
 | `web/` | the built page |
 | `logs/relay.log`, `logs/web.log` | what the background processes wrote |
 
-The items you add are encrypted inside `vault/`. The recovery key that `vaultctl init`
-prints once is not kept for the demo vault; if you want a vault you can recover, create
-one by hand (see "Next steps").
+The items you add are encrypted inside `vault/`. `vaultctl init` creates a recovery key
+and normally prints it once; the script discards that output, so the demo vault's
+recovery key is created and sealed in `vault/.vaultctl` but never shown. Treat the demo
+vault as throwaway: it cannot be restored from a replica. Do not put real data in it.
 
 ## Reset
 
@@ -126,11 +129,14 @@ scripts/showcase.sh --reset
 
 asks `y/N`, then deletes `vault/`, `passphrase`, `origin`, `web/` and `logs/` in the
 demo directory (and nothing else), and starts over with a fresh vault and passphrase.
+The script only touches a directory it created itself (one holding `.showcase-dir`),
+and refuses `/`, your home directory, the repository, symlinks and any other existing
+directory, so `--dir` cannot point it at your own files.
 Use it after changing `--web-port`: a vault is bound to one origin.
 
 ## Troubleshooting
 
-- **A port is busy** (`cannot bind` in the log tail): pick other ports with
+- **A port is busy** (the script says "already in use" before it builds anything): pick other ports with
   `--web-port` and `--relay-port`, or stop what uses them. Changing `--web-port`
   needs `--reset`, because the vault is bound to the old origin.
 - **The page does not connect, or the relay refuses it:** open it as
@@ -159,15 +165,15 @@ text is a secret while the QR is shown, so use this build only on localhost, for
 - **Use the vault in your own app:** [`docs/integration.md`](integration.md) (what the
   UI must do, the pairing flow, running a relay), with the to-do example in
   [`examples/todo`](../examples/todo/README.md) as a working reference.
-- **Replicate the demo vault to WebDAV or S3** with `vaultctl`. From the repository
-  root, with the passphrase in the environment (it is read from the file here, not
-  typed on the command line):
+- **Replicate a vault to WebDAV or S3** with `vaultctl`. Do not use the demo vault for
+  this: its recovery key was never shown, so a replica could not be restored. Create
+  your own vault with `vaultctl init --app <id> --origin <url>` (it shows the recovery
+  key once: write it down), then add a replica and replicate:
 
   ```sh
-  export VAULTCTL_PASSPHRASE="$(head -n1 .showcase/passphrase)"
-  target/release/vaultctl --dir .showcase/vault replica add webdav --id nextcloud \
+  vaultctl --dir ~/my-vault replica add webdav --id nextcloud \
     --url https://cloud.example.com/remote.php/dav/files/alice/vault --username alice
-  target/release/vaultctl --dir .showcase/vault replicate
+  vaultctl --dir ~/my-vault replicate
   ```
 
   S3, restore and divergence are covered in [`docs/vault/README.md`](vault/README.md).
