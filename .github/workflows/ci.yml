@@ -205,6 +205,14 @@ jobs:
         env:
           VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
         run: npm run test:e2e
+      # LAN mode (showcase.sh --lan) with 127.0.0.1 as the "LAN IP": a CA from
+      # scripts/lan-cert.sh, the relay terminating wss, the page over https, vault-dev
+      # with --ca-file; a certificate for another IP must be refused.
+      - name: e2e in LAN mode (TLS relay, https page, local CA)
+        working-directory: examples/todo
+        env:
+          VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: npm run test:lan
       # The page in a real browser (Chrome preinstalled on ubuntu-latest): CSP and the
       # relay WebSocket upgrade from the page's origin.
       - name: browser smoke (headless Chrome)
@@ -220,6 +228,10 @@ jobs:
         env:
           VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/showcase.sh --check --no-build --dir "$RUNNER_TEMP/showcase"
+      - name: showcase script in LAN mode (--lan --check, 127.0.0.1 as the LAN IP)
+        env:
+          VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/showcase.sh --lan --lan-ip 127.0.0.1 --check --no-build --dir "$RUNNER_TEMP/showcase-lan"
 
   # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
   # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN

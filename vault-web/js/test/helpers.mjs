@@ -70,7 +70,7 @@ export function binaries() {
 }
 
 /** A child process whose stdout and stderr are kept for waiting and for the report. */
-class Proc {
+export class Proc {
   constructor(name, cmd, args, opts = {}) {
     this.name = name;
     this.out = "";
@@ -207,8 +207,11 @@ export class Harness {
     return { dir, passFile, app, origin };
   }
 
-  /** `vault-dev serve` for one pairing text; answer its prompt with `approve`. */
-  serveVault(vault, pairText) {
+  /**
+   * `vault-dev serve` for one pairing text; answer its prompt with `approve`.
+   * `extraArgs` go after the others (e.g. `--ca-file ca.pem` for a wss relay).
+   */
+  serveVault(vault, pairText, extraArgs = []) {
     const n = this.procs.filter((p) => p.name.startsWith("vault-dev")).length + 1;
     const p = new Proc(`vault-dev #${n}`, this.bins.dev, [
       "serve",
@@ -218,6 +221,7 @@ export class Harness {
       pairText,
       "--passphrase-file",
       vault.passFile,
+      ...extraArgs,
     ]);
     this.procs.push(p);
     return new VaultDev(p);

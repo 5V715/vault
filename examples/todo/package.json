@@ -14,11 +14,12 @@
     "build:dev": "node build.mjs --relay http://127.0.0.1:8787 --dev",
     "serve": "npm run build:dev && node serve.mjs",
     "build:test": "esbuild src/store.ts src/view.ts src/app.ts --outdir=.test-build --format=esm --platform=neutral --define:__DEV__=true --log-level=warning",
-    "test": "npm run typecheck && npm run test:unit && npm run test:build && npm run test:e2e && npm run test:browser",
+    "test": "npm run typecheck && npm run test:unit && npm run test:build && npm run test:e2e && npm run test:lan && npm run test:browser",
     "test:unit": "npm run build:test && node --test test/store.test.mjs test/view.test.mjs test/app.test.mjs test/serve.test.mjs test/sinks.test.mjs test/build.test.mjs",
     "test:build": "node test/build-check.mjs",
     "test:browser": "node --test --test-force-exit --test-reporter=spec test/browser.test.mjs",
-    "test:e2e": "npm run build:test && node --test --test-force-exit --test-concurrency=1 --test-reporter=spec test/e2e.test.mjs"
+    "test:e2e": "npm run build:test && node --test --test-force-exit --test-concurrency=1 --test-reporter=spec test/e2e.test.mjs",
+    "test:lan": "npm run build:test && node test/lan-run.mjs"
   },
   "dependencies": {
     "vault-web": "file:../../vault-web/js"
