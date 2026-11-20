@@ -38,12 +38,28 @@ async fn route(
 }
 
 /// Serve until `shutdown` resolves, then stop accepting, close every mailbox with
-/// 1001 and wait up to 5 s for the connections to drain.
+/// 1001 and wait up to 5 s for the connections to drain. Plain HTTP; see
+/// [`serve_tls`] to terminate TLS here.
 pub async fn serve(
     listener: TcpListener,
     mailboxes: Mailboxes,
     shutdown: impl Future<Output = ()>,
 ) {
+    serve_tls(listener, mailboxes, None, shutdown).await
+}
+
+/// [`serve`] with optional TLS termination: with `Some(config)` (see
+/// [`crate::tls_server_config`]) every accepted connection first completes a TLS
+/// handshake, inside the same connection cap and under the same stall and
+/// handshake time limits as the HTTP that follows; a failed handshake just drops
+/// the connection.
+pub async fn serve_tls(
+    listener: TcpListener,
+    mailboxes: Mailboxes,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    shutdown: impl Future<Output = ()>,
+) {
+    let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     let stop = mailboxes.inner.stop.subscribe();
     let mut tasks = tokio::task::JoinSet::new();
     let static_timeout = mailboxes.inner.cfg.static_timeout;
@@ -69,27 +85,27 @@ pub async fn serve(
         };
         while tasks.try_join_next().is_some() {}
         let mailboxes = mailboxes.clone();
+        let acceptor = acceptor.clone();
         let mut stop = stop.clone();
         tasks.spawn(async move {
             let _slot = slot;
-            let svc = service_fn(move |req| route(mailboxes.clone(), req, peer));
             let progress = progress::Progress::new();
+            // Progress is measured on the raw socket, below TLS, so the handshake
+            // counts too.
             let io = progress::Tracked::new(stream, progress.clone());
-            // header_read_timeout also closes keep-alive connections idle between requests.
-            let conn = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(10))
-                .serve_connection(TokioIo::new(io), svc)
-                .with_upgrades();
-            tokio::pin!(conn);
-            tokio::select! {
-                _ = &mut conn => {}
-                // No I/O progress for static_timeout cuts the connection (an upgraded
-                // mailbox has left `conn` by then and has its own idle timeout).
-                _ = progress.stalled(static_timeout) => {}
-                _ = stopped(&mut stop) => {
-                    conn.as_mut().graceful_shutdown();
-                    let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+            match acceptor {
+                None => drive(io, mailboxes, peer, progress, static_timeout, stop).await,
+                Some(acceptor) => {
+                    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io));
+                    let tls = tokio::select! {
+                        r = handshake => match r {
+                            Ok(Ok(tls)) => tls,
+                            _ => return,
+                        },
+                        _ = progress.stalled(static_timeout) => return,
+                        _ = stopped(&mut stop) => return,
+                    };
+                    drive(tls, mailboxes, peer, progress, static_timeout, stop).await
                 }
             }
         });
@@ -111,4 +127,39 @@ pub async fn serve(
 
 async fn stopped(rx: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = rx.wait_for(|v| *v).await;
+}
+
+/// Upper bound for a TLS handshake (the stall timeout alone would let a client
+/// that sends a byte at a time hold a slot).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One HTTP connection (plain or already TLS) until it ends, stalls or the relay stops.
+async fn drive<I>(
+    io: I,
+    mailboxes: Mailboxes,
+    peer: SocketAddr,
+    progress: progress::Progress,
+    static_timeout: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = service_fn(move |req| route(mailboxes.clone(), req, peer));
+    // header_read_timeout also closes keep-alive connections idle between requests.
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(10))
+        .serve_connection(TokioIo::new(io), svc)
+        .with_upgrades();
+    tokio::pin!(conn);
+    tokio::select! {
+        _ = &mut conn => {}
+        // No I/O progress for static_timeout cuts the connection (an upgraded
+        // mailbox has left `conn` by then and has its own idle timeout).
+        _ = progress.stalled(static_timeout) => {}
+        _ = stopped(&mut stop) => {
+            conn.as_mut().graceful_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn).await;
+        }
+    }
 }

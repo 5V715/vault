@@ -13,6 +13,8 @@ mod pipe;
 mod progress;
 #[cfg(feature = "server")]
 mod serve;
+#[cfg(feature = "server")]
+mod tls;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -29,7 +31,9 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 pub use pipe::parse_id;
 #[cfg(feature = "server")]
-pub use serve::serve;
+pub use serve::{serve, serve_tls};
+#[cfg(feature = "server")]
+pub use tls::tls_server_config;
 
 /// Mailbox limits and policy. The defaults are the limits the relay used before the split.
 #[derive(Clone, Debug)]

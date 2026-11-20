@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! `vault-relay`: serves only `GET /mailbox/<32hex>` and `GET /healthz`.
-//! Plain HTTP; terminate TLS in a reverse proxy (and pass `--trust-proxy` behind it).
+//! Plain HTTP by default; terminate TLS in a reverse proxy (and pass `--trust-proxy`
+//! behind it), or give `--tls-cert` and `--tls-key` to serve HTTPS/`wss://` directly
+//! (rustls, TLS 1.2 or newer, no client certificates).
 //!
 //! It refuses to start without at least one allowed browser origin
 //! (`--allow-origin` or `VAULT_RELAY_ALLOW_ORIGIN`), so a relay is never open to
@@ -8,6 +10,7 @@
 //! (`vault_proto::binding::normalize_origin`) and is stored in canonical form.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
@@ -58,6 +61,13 @@ struct Args {
     /// Seconds without any read or write progress before a plain HTTP connection is cut.
     #[arg(long, default_value_t = MailboxConfig::default().static_timeout.as_secs())]
     stall_timeout_s: u64,
+    /// PEM certificate chain (leaf first) to serve HTTPS/wss directly. Needs
+    /// `--tls-key`; without both, the relay speaks plain HTTP.
+    #[arg(long, value_name = "PEM", env = TLS_CERT_ENV)]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key for `--tls-cert`. Keep it readable by the relay only (0600).
+    #[arg(long, value_name = "PEM", env = TLS_KEY_ENV)]
+    tls_key: Option<PathBuf>,
     /// Take the client address from the first X-Forwarded-For hop (only behind a
     /// reverse proxy that overwrites that header).
     #[arg(long)]
@@ -65,6 +75,56 @@ struct Args {
 }
 
 const ALLOW_ORIGIN_ENV: &str = "VAULT_RELAY_ALLOW_ORIGIN";
+const TLS_CERT_ENV: &str = "VAULT_RELAY_TLS_CERT";
+const TLS_KEY_ENV: &str = "VAULT_RELAY_TLS_KEY";
+
+/// Loads the TLS config when `--tls-cert`/`--tls-key` (or their environment
+/// variables) are given; an empty value counts as not given. An error message for
+/// the user otherwise; it never contains key material.
+fn load_tls(
+    cert: &Option<PathBuf>,
+    key: &Option<PathBuf>,
+) -> Result<Option<std::sync::Arc<rustls::ServerConfig>>, String> {
+    let given = |p: &Option<PathBuf>| p.clone().filter(|p| !p.as_os_str().is_empty());
+    let (cert, key) = match (given(cert), given(key)) {
+        (None, None) => return Ok(None),
+        (Some(c), Some(k)) => (c, k),
+        _ => {
+            return Err(format!(
+                "--tls-cert and --tls-key must be given together (or {TLS_CERT_ENV} and \
+                 {TLS_KEY_ENV})"
+            ));
+        }
+    };
+    warn_if_key_exposed(&key);
+    let read = |what: &str, p: &Path| {
+        std::fs::read(p).map_err(|e| format!("cannot read the TLS {what} {}: {e}", p.display()))
+    };
+    let cert_pem = read("certificate", &cert)?;
+    let key_pem = read("key", &key)?;
+    vault_mailbox::tls_server_config(&cert_pem, &key_pem)
+        .map(Some)
+        .map_err(|e| format!("TLS: {e}"))
+}
+
+/// Warns (does not fail) when the key file is readable by group or others.
+fn warn_if_key_exposed(key: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(key) {
+            let mode = m.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    "TLS key file {} is readable by other users (mode {mode:04o}); run chmod 600 on it",
+                    key.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = key;
+}
 
 /// Validates and normalizes the allowlist; an error message for the user otherwise.
 fn allowed_origins(raw: &[String]) -> Result<Vec<String>, String> {
@@ -101,6 +161,13 @@ async fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    let tls = match load_tls(&args.tls_cert, &args.tls_key) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("vault-relay: {e}");
+            std::process::exit(2);
+        }
+    };
     let cfg = MailboxConfig {
         allowed_origins: allowed.clone(),
         max_mailboxes_waiting: args.max_waiting,
@@ -121,8 +188,8 @@ async fn main() {
         }
     };
     let addr = listener.local_addr().unwrap_or(args.listen);
-    tracing::info!(%addr, allowed_origins = ?allowed, "vault-relay listening");
-    vault_mailbox::serve(listener, Mailboxes::new(cfg), shutdown_signal()).await;
+    tracing::info!(%addr, tls = tls.is_some(), allowed_origins = ?allowed, "vault-relay listening");
+    vault_mailbox::serve_tls(listener, Mailboxes::new(cfg), tls, shutdown_signal()).await;
     tracing::info!("vault-relay stopped");
 }
 
