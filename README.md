@@ -3,6 +3,9 @@
 An encrypted, replicated container for an app's persistent user data, plus the
 protocol and server that let a stateless browser app use it through a relay mailbox.
 
+**Getting started:** `scripts/showcase.sh` builds and serves the to-do example with a demo
+vault in one command; see [`docs/getting-started.md`](docs/getting-started.md).
+
 Crates:
 
 - `vault-container`: the encrypted container (segments, sealed manifest, recovery key),

@@ -29,6 +29,9 @@ with a console warning that names the key. The vault is created for app id
 
 ## Run it locally
 
+The quickest way is `scripts/showcase.sh` (see [`docs/getting-started.md`](../../docs/getting-started.md)):
+it does the steps below for you. Or by hand:
+
 Build vault-web first (it needs the `wasm32-unknown-unknown` target and
 `wasm-bindgen-cli` at the version in `Cargo.lock`; see `vault-web/js/build.mjs`):
 
