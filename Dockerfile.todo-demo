@@ -111,6 +111,9 @@ COPY vault-server vault-server
 COPY vault-mailbox vault-mailbox
 COPY vault-client vault-client
 COPY vault-web vault-web
+# Only so the workspace manifest loads (every member must exist for --locked):
+# nothing of vault-ffi (or UniFFI) is built or downloaded for -p vault-web.
+COPY vault-ffi vault-ffi
 # The steps of vault-web/js/build.mjs for the web target only.
 RUN cargo build -p vault-web --release --locked --target wasm32-unknown-unknown \
  && mkdir -p /pkg/web \
