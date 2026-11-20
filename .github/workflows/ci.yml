@@ -325,8 +325,9 @@ jobs:
             docker logs smoke
             test "$(docker inspect smoke --format '{{.HostConfig.ReadonlyRootfs}}')" = true
             # The process runs as 65532, not root.
-            docker top smoke -o uid,comm
-            test "$(docker top smoke -o uid | tail -n +2 | sort -u)" = 65532
+            # docker top needs pid among the ps columns; every process must be uid 65532.
+            docker top smoke -o pid,uid,comm
+            test "$(docker top smoke -o pid,uid | tail -n +2 | awk '{ print $2 }' | sort -u)" = 65532
           } 2>&1 | tee logs/todo-demo-image.log
       - name: image_smoke (page, CSP, config.json, healthz)
         shell: bash
