@@ -63,7 +63,9 @@ fs.appendFileSync(process.env.SHOWCASE_TEST_LOG, `vault-relay ${a.join(" ")}\n`)
 fs.appendFileSync(process.env.SHOWCASE_TEST_PIDS, `relay ${process.pid}\n`);
 const listen = a[a.indexOf("--listen") + 1];
 const port = Number(listen.split(":").pop());
-const host = listen.slice(0, listen.lastIndexOf(":"));
+// The LAN IPs in these tests are not on this machine (nor 127.0.0.2 on macOS): listen
+// on loopback (the script's probe goes there through SHOWCASE_TEST_CONNECT_HOST).
+const host = "127.0.0.1";
 const h = (q, r) => { if (q.url === "/healthz") r.end("ok\n"); else { r.statusCode = 404; r.end(); } };
 const opt = (f) => (a.includes(f) ? fs.readFileSync(a[a.indexOf(f) + 1]) : undefined);
 const srv = a.includes("--tls-cert") ? https.createServer({ cert: opt("--tls-cert"), key: opt("--tls-key") }, h) : http.createServer(h);
@@ -110,7 +112,7 @@ const a = process.argv.slice(2);
 fs.appendFileSync(process.env.SHOWCASE_TEST_LOG, `todo-serve ${a.join(" ")}\n`);
 fs.appendFileSync(process.env.SHOWCASE_TEST_PIDS, `web ${process.pid}\n`);
 const port = Number(a[a.indexOf("--port") + 1]);
-const host = a.includes("--host") ? a[a.indexOf("--host") + 1] : "127.0.0.1";
+const host = "127.0.0.1"; // see the vault-relay stub
 const opt = (f) => (a.includes(f) ? fs.readFileSync(a[a.indexOf(f) + 1]) : undefined);
 const h = (q, r) => r.end("<!doctype html>\n");
 const srv = a.includes("--tls-cert") ? https.createServer({ cert: opt("--tls-cert"), key: opt("--tls-key") }, h) : http.createServer(h);
@@ -148,12 +150,20 @@ cat > "$stubs/npm" << 'EOF'
 echo "npm ${PWD##*/repo/} $*" >> "$SHOWCASE_TEST_LOG"
 EOF
 
-# `ip -4 route get 1.1.1.1` (Linux) answering with $STUB_LAN_IP as the source address.
+# `ip -4 route get 1.1.1.1` (Linux) answering with $STUB_LAN_IP as the source address on
+# $STUB_LAN_DEV; `ip -4 -o addr show scope global` lists $STUB_ADDRS ("dev:ip ...").
 cat > "$stubs/ip" << 'EOF'
 #!/usr/bin/env bash
 echo "ip $*" >> "$SHOWCASE_TEST_LOG"
 case "$*" in
-  *"route get 1.1.1.1"*) echo "1.1.1.1 via 192.0.2.1 dev wlan0 src ${STUB_LAN_IP:-192.168.1.77} uid 1000"; echo "    cache" ;;
+  *"route get 1.1.1.1"*)
+    echo "1.1.1.1 via 192.0.2.1 dev ${STUB_LAN_DEV:-wlan0} src ${STUB_LAN_IP:-192.168.1.77} uid 1000"; echo "    cache" ;;
+  *"addr show scope global"*)
+    i=2
+    for e in ${STUB_ADDRS:-}; do
+      echo "$i: ${e%%:*}    inet ${e#*:}/24 brd 0.0.0.0 scope global ${e%%:*}\       valid_lft forever preferred_lft forever"
+      i=$((i + 1))
+    done ;;
   *) exit 1 ;;
 esac
 EOF
@@ -171,12 +181,15 @@ EOF
 cat > "$stubs/route" << 'EOF'
 #!/usr/bin/env bash
 echo "route $*" >> "$SHOWCASE_TEST_LOG"
-printf '   route to: default\ndestination: default\n    gateway: 192.0.2.1\n  interface: en0\n'
+printf '   route to: default\ndestination: default\n    gateway: 192.0.2.1\n  interface: %s\n' "${STUB_LAN_DEV:-en0}"
 EOF
 cat > "$stubs/ipconfig" << 'EOF'
 #!/usr/bin/env bash
 echo "ipconfig $*" >> "$SHOWCASE_TEST_LOG"
-[ "$*" = "getifaddr en0" ] && echo "${STUB_LAN_IP:-192.168.1.77}"
+[ "$1" = getifaddr ] || exit 1
+if [ "$2" = "${STUB_LAN_DEV:-en0}" ]; then echo "${STUB_LAN_IP:-192.168.1.77}"; exit 0; fi
+if [ "$2" = en0 ] && [ -n "${STUB_EN0_IP:-}" ]; then echo "$STUB_EN0_IP"; exit 0; fi
+exit 1
 EOF
 
 cat > "$stubs/node-old" << 'EOF'
@@ -236,7 +249,7 @@ sc() {
   out="$(PATH="$b" CARGO_HOME="${STUB_CARGO_HOME:-$tmp/$name/no-cargo-home}" \
     SHOWCASE_TEST_LOG="$tmp/$name/log" SHOWCASE_TEST_PIDS="$tmp/$name/pids" \
     STUB_TEMPLATES="$stubs" STUB_WB_VERSION="${STUB_WB_VERSION:-$WB_VERSION}" \
-    STUB_LAN_IP="${STUB_LAN_IP:-192.168.1.77}" \
+    STUB_LAN_IP="${STUB_LAN_IP:-192.168.1.77}" SHOWCASE_TEST_CONNECT_HOST=127.0.0.1 \
     /bin/bash "$r/scripts/showcase.sh" "$@" < /dev/null 2>&1)"
   rc=$?
 }
@@ -556,7 +569,7 @@ t_lan_ca_created_once_and_reused() {
   openssl x509 -noout -text -in "$ca/ca.pem" > "$tmp/$n/ca.txt" 2>&1
   { grep -q "CA:TRUE, pathlen:0" "$tmp/$n/ca.txt" && grep -q "Certificate Sign, CRL Sign" "$tmp/$n/ca.txt" &&
     grep -q "prime256v1\|P-256" "$tmp/$n/ca.txt" && grep -q "Subject: CN *= *vault showcase CA (" "$tmp/$n/ca.txt" &&
-    grep -q "IP:127.0.0.0/255.0.0.0" "$tmp/$n/ca.txt" && grep -q "DNS:localhost" "$tmp/$n/ca.txt"; }
+    grep -q "IP:127.0.0.1/255.255.255.255" "$tmp/$n/ca.txt" && grep -q "DNS:localhost" "$tmp/$n/ca.txt"; }
   check "$n: CA is P-256, CA:TRUE pathlen:0, keyCertSign/cRLSign, name-constrained" $? "$(cat "$tmp/$n/ca.txt")"
   openssl x509 -noout -text -in "$ca/leaf-127.0.0.1.pem" > "$tmp/$n/leaf.txt" 2>&1
   { grep -q "IP Address:127.0.0.1, DNS:localhost" "$tmp/$n/leaf.txt" &&
@@ -564,10 +577,10 @@ t_lan_ca_created_once_and_reused() {
     openssl verify -CAfile "$ca/ca.pem" "$ca/leaf-127.0.0.1.pem" > /dev/null 2>&1 &&
     ! openssl x509 -noout -checkend $((826 * 86400)) -in "$ca/leaf-127.0.0.1.pem" > /dev/null 2>&1; }
   check "$n: leaf has the SAN, serverAuth, verifies, at most 825 days" $? "$(cat "$tmp/$n/leaf.txt")"
-  logged "vault-relay --listen 0.0.0.0:$rp --allow-origin https://127.0.0.1:$wp --tls-cert $ca/leaf-127.0.0.1.pem --tls-key $ca/leaf-127.0.0.1.key" $n
-  check "$n: relay on 0.0.0.0 with TLS, allowing the https page origin" $? "$(cat "$tmp/$n/log")"
-  logged "todo-serve --port $wp --dir $d/web --host 0.0.0.0 --tls-cert $ca/leaf-127.0.0.1.pem --tls-key $ca/leaf-127.0.0.1.key" $n
-  check "$n: page server on 0.0.0.0 over https" $? "$(cat "$tmp/$n/log")"
+  logged "vault-relay --listen 127.0.0.1:$rp --allow-origin https://127.0.0.1:$wp --tls-cert $ca/leaf-127.0.0.1.pem --tls-key $ca/leaf-127.0.0.1.key" $n
+  check "$n: relay on the LAN IP only, with TLS, allowing the https page origin" $? "$(cat "$tmp/$n/log")"
+  logged "todo-serve --port $wp --dir $d/web --host 127.0.0.1 --tls-cert $ca/leaf-127.0.0.1.pem --tls-key $ca/leaf-127.0.0.1.key" $n
+  check "$n: page server on the LAN IP only, over https" $? "$(cat "$tmp/$n/log")"
   logged "todo-build --relay wss://127.0.0.1:$rp --page-origin https://127.0.0.1:$wp --out $d/web" $n
   check "$n: release page build for the wss relay and the https page" $?
   ! logged "--dev" $n; check "$n: no copy button without --dev" $?
@@ -580,13 +593,14 @@ t_lan_ca_created_once_and_reused() {
   { has "reusing the local CA" && cmp -s "$tmp/$n/ca.before" "$ca/ca.pem" && cmp -s "$tmp/$n/key.before" "$ca/ca.key" &&
     cmp -s "$tmp/$n/leaf.before" "$ca/leaf-127.0.0.1.pem"; }
   check "$n: the CA and the certificate are reused" $? "$out"
-  # Another IP: same CA, a new certificate for it.
+  # Another IP: the CA is limited to the old one, so a new CA (said loudly) and certificate.
   lan $n "$r" "$b" --lan-ip 127.0.0.2
-  { [ "$rc" = 0 ] && cmp -s "$tmp/$n/ca.before" "$ca/ca.pem" && [ -f "$ca/leaf-127.0.0.2.pem" ] &&
-    has "issued a certificate for 127.0.0.2"; }
-  check "$n: a new IP gets a new certificate from the same CA" $? "rc=$rc $out"
+  { [ "$rc" = 0 ] && ! cmp -s "$tmp/$n/ca.before" "$ca/ca.pem" && [ -f "$ca/leaf-127.0.0.2.pem" ] &&
+    [ ! -e "$ca/leaf-127.0.0.1.pem" ] && has "re-install the CA on your phone" && has "issued a certificate for 127.0.0.2"; }
+  check "$n: a new IP gets a new CA, announced loudly" $? "rc=$rc $out"
+  cp "$ca/ca.pem" "$tmp/$n/ca.before"
   # --reset keeps the CA (it is installed on devices).
-  lan $n "$r" "$b" --lan-ip 127.0.0.1 --reset --yes
+  lan $n "$r" "$b" --lan-ip 127.0.0.2 --reset --yes
   { [ "$rc" = 0 ] && cmp -s "$tmp/$n/ca.before" "$ca/ca.pem"; }; check "$n: --reset keeps the CA" $? "rc=$rc $out"
 
   # --lan --dev: copy button, demo vault bound to the https origin, vault-dev trusts the CA.
@@ -657,17 +671,29 @@ t_lan_ip_detection_and_override() {
   { [ "$rc" = 0 ] && has "https://192.168.1.77:$wp" && logged "ip -4 route get 1.1.1.1" $n; }
   check "$n: Linux detection via ip route get" $? "rc=$rc $out"
   [ -f "$tmp/$n/demo/ca/leaf-192.168.1.77.pem" ]; check "$n: certificate for the detected IP" $?
-  for ip in 10.20.30.40 172.16.5.5 172.31.255.1 100.64.0.9 100.127.1.1; do
+  for ip in 10.20.30.40 172.16.5.5 172.31.255.1; do
     STUB_LAN_IP=$ip lan $n "$r" "$b"
     { [ "$rc" = 0 ] && has "https://$ip:$wp"; }; check "$n: $ip is a LAN address" $? "rc=$rc $out"
   done
   # Loopback, link-local and public addresses are refused unless given with --lan-ip.
-  for ip in 127.0.0.1 169.254.10.10 8.8.8.8 172.32.0.1 100.128.0.1 192.169.1.1; do
+  for ip in 127.0.0.1 169.254.10.10 8.8.8.8 172.32.0.1 100.128.0.1 192.169.1.1 100.64.0.9 100.127.1.1; do
     : > "$tmp/$n/log"
     STUB_LAN_IP=$ip lan $n "$r" "$b"
     { [ "$rc" != 0 ] && has "$ip" && has "--lan-ip"; }; check "$n: detected $ip is refused" $? "rc=$rc $out"
     ! logged "vault-relay" $n; check "$n: nothing started for $ip" $?
   done
+  # Carrier-grade NAT space (Tailscale, mobile uplinks) only when given explicitly.
+  lan $n "$r" "$b" --lan-ip 100.64.0.9
+  { [ "$rc" = 0 ] && has "https://100.64.0.9:$wp" && has "not a private LAN address"; }
+  check "$n: 100.64/10 with --lan-ip is used, with a note" $? "rc=$rc $out"
+  # A VPN on the default route (Linux): its interface is skipped for the LAN one.
+  for dev in tun0 wg0 tailscale0 utun2; do
+    STUB_LAN_DEV=$dev STUB_LAN_IP=10.8.0.2 STUB_ADDRS="$dev:10.8.0.2 eth0:192.168.5.9" lan $n "$r" "$b"
+    { [ "$rc" = 0 ] && has "https://192.168.5.9:$wp" && ! has "https://10.8.0.2"; }
+    check "$n: default route via $dev is skipped" $? "rc=$rc $out"
+  done
+  STUB_LAN_DEV=wg0 STUB_LAN_IP=10.8.0.2 STUB_ADDRS="wg0:10.8.0.2" lan $n "$r" "$b"
+  { [ "$rc" != 0 ] && has "--lan-ip"; }; check "$n: only a VPN address: refused, names --lan-ip" $? "rc=$rc $out"
   # --lan-ip wins over detection, and an explicit non-LAN address is used (with a note).
   : > "$tmp/$n/log"
   STUB_LAN_IP=192.168.1.77 lan $n "$r" "$b" --lan-ip 127.0.0.1
@@ -690,6 +716,9 @@ t_lan_ip_detection_and_override() {
   sc ${n}3 "$r" "$b" --lan --check --no-build --dir "$tmp/${n}3/demo" --web-port "$wp" --relay-port "$rp"
   { [ "$rc" = 0 ] && has "https://192.168.1.77:$wp" && logged "ipconfig getifaddr en0" ${n}3; }
   check "$n: macOS detection via route and ipconfig" $? "rc=$rc $out"
+  STUB_LAN_DEV=utun3 STUB_LAN_IP=10.8.0.2 STUB_EN0_IP=192.168.2.9 \
+    sc ${n}3 "$r" "$b" --lan --check --no-build --dir "$tmp/${n}3/demo" --web-port "$wp" --relay-port "$rp"
+  { [ "$rc" = 0 ] && has "https://192.168.2.9:$wp"; }; check "$n: macOS default route via utun is skipped" $? "rc=$rc $out"
 }
 
 t_lan_prints_fingerprint_and_trust_steps() {
@@ -703,7 +732,8 @@ t_lan_prints_fingerprint_and_trust_steps() {
   has "$tmp/$n/demo/ca/ca.pem"; check "$n: names the CA file" $?
   { has "Encryption & credentials" && has "Install a certificate" && has "CA certificate"; }
   check "$n: Android steps" $? "$out"
-  has "debug build"; check "$n: says the vault app trusts user CAs only in debug builds" $?
+  { has "debug build" && has "not released yet"; }
+  check "$n: the vault app's debug-only user-CA trust is described as planned" $? "$out"
   { has "Authorities" && has "Firefox"; }; check "$n: Linux browser steps" $? "$out"
   has "firewall"; check "$n: firewall note" $?
   has "vaultctl init --app vault-todo --origin https://127.0.0.1:$wp"; check "$n: the phone vault's binding" $?
@@ -737,6 +767,50 @@ EOF
   check "$n: the CA has no name constraints" $?
 }
 
+# The CA may only vouch for the one IP (and localhost): a certificate it signs for another
+# address fails verification on the name constraints.
+t_lan_ca_scoped_to_ip() {
+  local n=lan_scope r b ca
+  r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm ip uname-linux)"
+  pickports; ca="$tmp/$n/demo/ca"
+  lan $n "$r" "$b"
+  check "$n: run" "$rc" "$out"
+  openssl x509 -noout -text -in "$ca/ca.pem" > "$tmp/$n/ca.txt" 2>&1
+  { grep -A4 "Name Constraints: critical" "$tmp/$n/ca.txt" | grep -q "Permitted:" &&
+    grep -q "IP:192.168.1.77/255.255.255.255" "$tmp/$n/ca.txt" && grep -q "DNS:localhost" "$tmp/$n/ca.txt" &&
+    [ "$(grep -c "IP:" "$tmp/$n/ca.txt")" = 1 ] && ! grep -q "Excluded" "$tmp/$n/ca.txt"; }
+  check "$n: critical name constraints permit exactly IP:<ip>/32 and DNS:localhost" $? "$(cat "$tmp/$n/ca.txt")"
+  has "limited to 192.168.1.77/32 and localhost"; check "$n: the banner names the /32" $? "$out"
+  # Sign a leaf for a neighbour (192.168.1.78) with the CA key directly: it must not verify.
+  printf 'subjectAltName = IP:192.168.1.78\nextendedKeyUsage = serverAuth\n' > "$tmp/$n/ext.cnf"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$tmp/$n/other.key" 2> /dev/null
+  openssl req -new -key "$tmp/$n/other.key" -subj "/CN=other" -out "$tmp/$n/other.csr" 2> /dev/null
+  openssl x509 -req -in "$tmp/$n/other.csr" -CA "$ca/ca.pem" -CAkey "$ca/ca.key" -set_serial 7 -days 1 \
+    -extfile "$tmp/$n/ext.cnf" -out "$tmp/$n/other.pem" 2> /dev/null
+  local v
+  v="$(openssl verify -CAfile "$ca/ca.pem" "$tmp/$n/other.pem" 2>&1)"
+  { [ -s "$tmp/$n/other.pem" ] && ! openssl verify -CAfile "$ca/ca.pem" "$tmp/$n/other.pem" > /dev/null 2>&1 &&
+    printf '%s' "$v" | grep -qi "subtree"; }
+  check "$n: a certificate for another LAN host fails on the name constraints" $? "$v"
+}
+
+t_lan_empty_fingerprint_fails() {
+  local n=lan_nofp r b real
+  r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
+  real="$(command -v openssl)"
+  rm -f "$b/openssl"
+  cat > "$b/openssl" << EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [ "\$a" = -fingerprint ] && exit 1; done
+exec "$real" "\$@"
+EOF
+  chmod +x "$b/openssl"
+  pickports
+  lan $n "$r" "$b" --lan-ip 127.0.0.1
+  { [ "$rc" != 0 ] && has "fingerprint" && ! has "check ok"; }; check "$n: no fingerprint, no go" $? "rc=$rc $out"
+  pids_dead $n; check "$n: servers stopped" $?
+}
+
 t_lan_preflight() {
   local n=lan_preflight r b
   r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
@@ -749,7 +823,8 @@ t_lan_preflight() {
 
 for t in help args preflight check_flow reset reset_refuses_unmarked_dir reset_refuses_home_and_root busy_port pair \
   cleanup_signal lan_ca_created_once_and_reused lan_ca_key_private lan_refuses_wide_key_perms \
-  lan_ip_detection_and_override lan_prints_fingerprint_and_trust_steps lan_without_name_constraints lan_preflight; do
+  lan_ip_detection_and_override lan_prints_fingerprint_and_trust_steps lan_without_name_constraints lan_preflight \
+  lan_ca_scoped_to_ip lan_empty_fingerprint_fails; do
   want "$t" && "t_$t"
 done
 

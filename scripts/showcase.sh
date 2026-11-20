@@ -42,13 +42,14 @@ starts the relay and the page server, then pairs a browser with the vault.
 
 Options:
   --lan             serve on this computer's LAN IP for a phone on the home network:
-                    https page (port 8443) and wss relay (8787) on all interfaces, with
-                    a certificate from a local CA in DIR/ca that you install on your
-                    devices once (the script prints the steps and its fingerprint). The
-                    page is the QR-only release build; the phone's vault app pairs.
+                    https page (port 8443) and wss relay (8787) on that IP only, with
+                    a certificate from a local CA in DIR/ca (limited to that IP) that
+                    you install on your devices (the script prints the steps and its
+                    fingerprint; a new IP means a new CA). The page is the QR-only
+                    release build; the phone's vault app pairs.
   --lan-ip IP       with --lan: use this IPv4 address instead of the detected one
-                    (any address; detection only accepts 10/8, 172.16/12, 192.168/16
-                    and 100.64/10)
+                    (any address; detection only accepts 10/8, 172.16/12 and
+                    192.168/16, and skips VPN/tunnel interfaces)
   --dev             with --lan: keep the "Copy pairing text" button and pair with a
                     demo vault (vault-dev) here instead of a phone
   --web-port N      port of the page (default 8080, with --lan 8443); open it as
@@ -128,27 +129,52 @@ in_cidr() { # in_cidr <ip> <net/len>
   local m=$(((0xFFFFFFFF << (32 - ${2#*/})) & 0xFFFFFFFF))
   [ $(($(ip_int "$1") & m)) = $(($(ip_int "${2%/*}") & m)) ]
 }
-# A home-network address: RFC 1918 or carrier-grade NAT (100.64/10).
+# A home-network address: RFC 1918. (Carrier-grade NAT space, 100.64/10, is Tailscale
+# or a mobile uplink far more often than a home LAN: only with an explicit --lan-ip.)
 is_lan_ip() {
   local c
-  for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+  for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
     in_cidr "$1" "$c" && return 0
   done
   return 1
 }
-# The primary IPv4 address: the source of the route to the internet (no packet is sent).
+# VPN and tunnel interfaces: a phone on the home Wi-Fi cannot reach their addresses.
+is_vpn_iface() {
+  case "$1" in tun* | tap* | wg* | utun* | tailscale* | zt* | ipsec* | ppp*) return 0 ;; *) return 1 ;; esac
+}
+# Prints "<ip> <interface>": the source of the route to the internet (no packet is
+# sent); when that goes through a VPN or tunnel, the first home-network address of
+# another interface instead. Prints "<ip> <vpn-interface>" if there is none.
 detect_lan_ip() {
-  local iface
+  local ip="" iface="" a dev
   case "$(uname -s 2> /dev/null)" in
     Darwin)
       iface="$(route -n get default 2> /dev/null | awk '$1 == "interface:" { print $2; exit }')"
-      [ -n "$iface" ] && ipconfig getifaddr "$iface" 2> /dev/null
+      [ -n "$iface" ] && ip="$(ipconfig getifaddr "$iface" 2> /dev/null)"
+      if is_vpn_iface "$iface"; then
+        for dev in en0 en1 en2 en3 en4 en5 en6 en7 en8 en9; do
+          a="$(ipconfig getifaddr "$dev" 2> /dev/null | head -n1)"
+          if is_ipv4 "$a" && is_lan_ip "$a"; then echo "$a $dev"; return; fi
+        done
+      fi
       ;;
     *)
-      ip -4 route get 1.1.1.1 2> /dev/null |
-        awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+      # shellcheck disable=SC2046  # two words: source address and interface
+      set -- $(ip -4 route get 1.1.1.1 2> /dev/null |
+        awk '{ for (i = 1; i < NF; i++) { if ($i == "src") s = $(i + 1); if ($i == "dev") d = $(i + 1) } print s, d; exit }')
+      ip="${1:-}"
+      iface="${2:-}"
+      if is_vpn_iface "$iface"; then
+        while read -r dev a; do
+          is_vpn_iface "$dev" && continue
+          if is_ipv4 "$a" && is_lan_ip "$a"; then echo "$a $dev"; return; fi
+        done << EOF
+$(ip -4 -o addr show scope global 2> /dev/null | awk '{ sub(/\/.*/, "", $4); print $2, $4 }')
+EOF
+      fi
       ;;
   esac
+  echo "$ip $iface"
 }
 
 [ "$LAN" = 1 ] || [ "$LAN_IP_GIVEN" = 0 ] || usage_error "--lan-ip needs --lan"
@@ -162,12 +188,18 @@ fi
 
 if [ "$LAN" = 1 ]; then
   if [ "$LAN_IP_GIVEN" = 0 ]; then
-    LAN_IP="$(detect_lan_ip | head -n1 | tr -d '[:space:]')"
+    detected="$(detect_lan_ip | head -n1)"
+    LAN_IP="${detected%% *}"
+    LAN_IFACE="${detected#* }"
     if ! is_ipv4 "$LAN_IP"; then
       die "cannot detect this computer's LAN IPv4 address: give it with --lan-ip <IP> (see: ip -4 addr, or ipconfig getifaddr en0 on macOS)"
     fi
+    if is_vpn_iface "$LAN_IFACE"; then
+      die "the route to the internet goes through the VPN/tunnel interface $LAN_IFACE ($LAN_IP), and no other interface has a home-network address: give the right one with --lan-ip <IP>"
+    fi
     is_lan_ip "$LAN_IP" ||
-      die "the detected address $LAN_IP is not a home-network address (10/8, 172.16/12, 192.168/16, 100.64/10): connect to your LAN, or give the right one with --lan-ip <IP>"
+      die "the detected address $LAN_IP${LAN_IFACE:+ ($LAN_IFACE)} is not a home-network address (10/8, 172.16/12, 192.168/16): connect to your LAN, or give the right one with --lan-ip <IP>"
+    step "using $LAN_IP${LAN_IFACE:+ ($LAN_IFACE)} as this computer's LAN IP (override with --lan-ip)"
   fi
 fi
 
@@ -181,7 +213,8 @@ if [ "$LAN" = 1 ]; then
   LEAF_KEY="$CA_DIR/leaf-$LAN_IP.key"
   # A demo vault on this computer only with --dev; otherwise the phone is the vault.
   LOCAL_VAULT=$DEV
-  BIND=0.0.0.0
+  # Only the LAN IP: not a VPN, a second network or a public interface.
+  BIND="$LAN_IP"
 else
   WEB_ORIGIN="http://localhost:$WEB_PORT"
   RELAY_ORIGIN="http://127.0.0.1:$RELAY_PORT"
@@ -433,7 +466,7 @@ fi
 # A server counts as up only when the process we started is alive, its log says it is
 # listening (so it, and not another program on the port, owns the port), and the URL answers.
 # With --lan the URL is the https one on the LAN IP, checked against the local CA (so the
-# certificate is checked too) but connected through 127.0.0.1 (the servers bind 0.0.0.0).
+# certificate is checked too).
 wait_for() { # wait_for <name> <pid> <url> <log> <listening-text>
   local i
   for i in $(seq 1 150); do
@@ -457,7 +490,10 @@ probe() { # probe <url>
   if [ "$LAN" = 1 ]; then
     local hp="${1#https://}"
     hp="${hp%%/*}"
-    curl -fsS -o /dev/null --max-time 2 --cacert "$CA_DIR/ca.pem" --connect-to "$hp:127.0.0.1:${hp##*:}" "$1" 2> /dev/null
+    # SHOWCASE_TEST_CONNECT_HOST: for scripts/test/showcase_test.sh only, whose stub
+    # servers cannot listen on a made-up LAN IP. The certificate is checked either way.
+    curl -fsS -o /dev/null --max-time 2 --cacert "$CA_DIR/ca.pem" \
+      --connect-to "$hp:${SHOWCASE_TEST_CONNECT_HOST:-$LAN_IP}:${hp##*:}" "$1" 2> /dev/null
   else
     curl -fsS -o /dev/null --max-time 2 "$1" 2> /dev/null
   fi
@@ -489,6 +525,10 @@ fi
 lan_banner() {
   local fp os scope limit
   fp="$(openssl x509 -noout -fingerprint -sha256 -in "$CA_DIR/ca.pem" 2> /dev/null | sed 's/^[^=]*=//')"
+  case "$fp" in
+    *:*:*) ;;
+    *) die "cannot compute the SHA-256 fingerprint of $CA_DIR/ca.pem: without it the CA cannot be checked before you trust it" ;;
+  esac
   os="$(uname -s 2> /dev/null)"
   scope="$(cat "$CA_DIR/ca.scope" 2> /dev/null || true)"
   case "$scope" in
@@ -507,8 +547,9 @@ lan_banner() {
 
   Android phone (the vault app): copy ca.pem to the phone, then Settings -> Security
     -> Encryption & credentials -> Install a certificate -> CA certificate (the path
-    differs a little by vendor; search Settings for "CA certificate"). The vault app
-    trusts user-installed CAs only in its debug build; a release build will not connect.
+    differs a little by vendor; search Settings for "CA certificate"). The Android vault
+    app is not released yet; it is planned to trust user-installed CAs only in its
+    debug build, so a release build would not connect to this relay.
 EOF
   if [ "$os" = Darwin ]; then
     cat << EOF
@@ -520,7 +561,8 @@ EOF
   else
     cat << EOF
   This computer's browser (Linux): Chrome/Chromium: Settings -> Privacy and security ->
-    Security -> Manage certificates -> Authorities -> Import (tick "identify websites").
+    Security -> Manage certificates (the menu differs between versions), or:
+      certutil -d sql:\$HOME/.pki/nssdb -A -t C,, -n 'vault showcase CA' -i '$CA_DIR/ca.pem'
     Firefox: Settings -> Privacy & Security -> Certificates -> View Certificates ->
     Authorities -> Import (tick "identify websites").
 EOF
@@ -531,10 +573,12 @@ EOF
   The phone's vault must be bound to this page:
       vaultctl init --app $APP --origin $WEB_ORIGIN
 
-  Both ports ($WEB_PORT and $RELAY_PORT) listen on every interface of this computer. If a
-  host firewall blocks them, allow them from your home network only (for example:
+  Both ports ($WEB_PORT and $RELAY_PORT) listen on $LAN_IP only. If a host firewall blocks
+  them, allow them from your home network only (for example:
   sudo ufw allow from <your LAN>/24 to any port $WEB_PORT,$RELAY_PORT proto tcp), never
   forward them from your router, and stop the demo with Ctrl-C when you are done.
+  Tip: a DHCP reservation for this computer in your router keeps $LAN_IP, and so the CA
+  on your phone, valid across restarts.
 EOF
 }
 

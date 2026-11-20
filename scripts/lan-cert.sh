@@ -16,11 +16,11 @@
 # the IP yet (or it no longer verifies or expires within 30 days). Key files are
 # 0600 and are never printed; a key file with wider permissions is refused.
 #
-# Name constraints: the CA may only sign for DNS:localhost and the private range
-# that holds the IP (10/8, 172.16/12, 192.168/16, 100.64/10 or 127/8; a /32 for
-# any other address), so that a new IP from the same router reuses the CA that is
-# already installed on the phone. If this openssl cannot add name constraints the
-# CA is made without them, with a warning.
+# Name constraints: the CA may only sign for this one IP (/32) and DNS:localhost, so a
+# leaked CA key cannot be used against any other host on the network on the devices
+# that trust it. A new IP therefore needs a new CA (said loudly: re-install it on the
+# phone); a DHCP reservation for the computer avoids that. If this openssl cannot add
+# name constraints the CA is made without them, with a warning and openssl's error.
 set -uo pipefail
 umask 077
 
@@ -74,14 +74,8 @@ in_cidr() { # in_cidr <ip> <net/len>
   m="$(mask_int "${2#*/}")"
   [ $(($(ip_int "$1") & m)) = $(($(ip_int "${2%/*}") & m)) ]
 }
-# The range the CA is constrained to for this IP.
-scope_for() {
-  local c
-  for c in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8; do
-    if in_cidr "$1" "$c"; then echo "$c"; return; fi
-  done
-  echo "$1/32"
-}
+# The range the CA is constrained to for this IP: the IP alone.
+scope_for() { echo "$1/32"; }
 
 is_ipv4 "$IP" || usage_error "--ip: not an IPv4 address: $IP"
 command -v openssl > /dev/null 2>&1 || die "openssl not found: install it (apt install openssl, brew install openssl)"
@@ -156,6 +150,7 @@ make_ca() { # make_ca <scope>
     -subj "/CN=vault showcase CA ($host)" -config "$work/ca.cnf" -extensions v3_ca \
     -out "$DIR/ca.pem.new" 2> "$work/err"; then
     constraints=0
+    cp "$work/err" "$work/nc-err"
     write_ca_cfg 0
     openssl req -new -x509 -key "$DIR/ca.key.new" -sha256 -days "$CA_DAYS" \
       -subj "/CN=vault showcase CA ($host)" -config "$work/ca.cnf" -extensions v3_ca \
@@ -164,7 +159,8 @@ make_ca() { # make_ca <scope>
       rm -f "$DIR/ca.key.new" "$DIR/ca.pem.new"
       die "openssl could not create the CA certificate"
     }
-    err "warning: this openssl ($(openssl version 2> /dev/null)) cannot add name constraints;"
+    err "warning: this openssl ($(openssl version 2> /dev/null)) cannot add name constraints:"
+    sed 's/^/    /' "$work/nc-err" >&2
     err "  the CA is not limited to $scope and localhost. Remove it from your devices after the demo."
     scope=any
   fi
@@ -193,8 +189,11 @@ else
     err "  Install the new CA on your devices and remove the old one."
     make_ca "$scope"
   elif [ "$have_scope" != any ] && ! { [ -n "$have_scope" ] && in_cidr "$IP" "$have_scope"; }; then
-    err "the CA in $DIR is limited to ${have_scope:-an unknown range}, which does not contain $IP:"
-    err "  making a new CA. Install it on your devices and remove the old one."
+    err ""
+    err "*** The IP changed: the CA in $DIR only vouches for ${have_scope:-another address}, not $IP."
+    err "*** Making a NEW CA: re-install the CA on your phone (and browsers), remove the old one."
+    err "*** A DHCP reservation for this computer in your router keeps the IP (and the CA) stable."
+    err ""
     make_ca "$scope"
   else
     say "reusing the local CA in $DIR"
