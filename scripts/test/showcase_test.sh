@@ -190,7 +190,8 @@ sc() {
   local name="$1" r="$2" b="$3"
   shift 3
   mkdir -p "$tmp/$name"
-  out="$(PATH="$b" SHOWCASE_TEST_LOG="$tmp/$name/log" SHOWCASE_TEST_PIDS="$tmp/$name/pids" \
+  out="$(PATH="$b" CARGO_HOME="${STUB_CARGO_HOME:-$tmp/$name/no-cargo-home}" \
+    SHOWCASE_TEST_LOG="$tmp/$name/log" SHOWCASE_TEST_PIDS="$tmp/$name/pids" \
     STUB_TEMPLATES="$stubs" STUB_WB_VERSION="${STUB_WB_VERSION:-$WB_VERSION}" \
     /bin/bash "$r/scripts/showcase.sh" "$@" < /dev/null 2>&1)"
   rc=$?
@@ -248,6 +249,13 @@ t_preflight() {
   { [ "$rc" != 0 ] && has "cargo install --locked wasm-bindgen-cli --version $WB_VERSION" && has "--install-deps"; }
   check "$n: missing wasm-bindgen names the command" $? "rc=$rc $out"
   ! logged "cargo install" $n; check "$n: nothing installed silently" $?
+  # wasm-bindgen installed by cargo into $CARGO_HOME/bin, which is not on PATH: found anyway.
+  b="$(mkbin $n node npm cargo rustup)"
+  rm -rf "$tmp/$n/cargo-home"; mkdir -p "$tmp/$n/cargo-home/bin"
+  cp "$stubs/wasm-bindgen" "$tmp/$n/cargo-home/bin/wasm-bindgen"
+  STUB_CARGO_HOME="$tmp/$n/cargo-home" sc $n "$r" "$b" --check
+  { ! has "wasm-bindgen CLI not found" && has "$tmp/$n/cargo-home/bin"; }
+  check "$n: wasm-bindgen in CARGO_HOME/bin is found" $? "rc=$rc $out"
   # Wrong wasm-bindgen version.
   b="$(mkbin $n node npm cargo rustup wasm-bindgen)"
   STUB_WB_VERSION=0.2.1 sc $n "$r" "$b" --check

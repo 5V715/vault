@@ -168,7 +168,25 @@ locked_wasm_bindgen() {
 }
 
 preflight() {
-  local want have_v major
+  local want have_v major cargo_bin=""
+  # `cargo install` puts tools into $CARGO_HOME/bin (default ~/.cargo/bin), which is
+  # often not on PATH in the current shell. Use it for this run, so an installed
+  # (or just installed) wasm-bindgen is found.
+  if [ -n "${CARGO_HOME:-}" ]; then
+    cargo_bin="$CARGO_HOME/bin"
+  elif [ -n "${HOME:-}" ]; then
+    cargo_bin="$HOME/.cargo/bin"
+  fi
+  if [ -n "$cargo_bin" ] && [ -d "$cargo_bin" ]; then
+    case ":$PATH:" in
+      *":$cargo_bin:"*) ;;
+      *)
+        PATH="$cargo_bin:$PATH"
+        export PATH
+        step "using $cargo_bin for this run (add it to your PATH to make it permanent)"
+        ;;
+    esac
+  fi
   have curl || problem "curl not found" "install curl with your package manager (apt install curl, brew install curl)"
   if ! have node; then
     problem "Node.js not found (22 or newer is needed)" "install Node.js 22+: https://nodejs.org/ (or: nvm install 22, brew install node@22)"
