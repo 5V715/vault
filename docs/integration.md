@@ -82,13 +82,14 @@ docker run -p 127.0.0.1:8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://my-app.exa
   (use mode 0600). Certificates are read once at start; restart to renew. A
   private CA is trusted by `vault-dev` with `--ca-file` (see
   `docs/vault/README.md`) and has to be installed on the phone or browser.
-- `--trust-proxy` makes the relay take the client address from the first
-  `X-Forwarded-For` hop. Behind a proxy you need it, or every user shares the
-  proxy's address and its per-address limit (`--max-per-ip`, default 8 open
-  mailbox connections). Set it only when the proxy overwrites that header (for
-  example nginx `proxy_set_header X-Forwarded-For $remote_addr;`); otherwise a
-  client can pick its own address and evade the limit. Without a proxy, leave it
-  off.
+- `--trust-proxy` makes the relay count the per-address limit (`--max-per-ip`,
+  default 8 open mailbox connections) on the rightmost `X-Forwarded-For` entry,
+  the one the proxy in front appended, instead of the proxy's own address (which
+  every user would share). Entries to its left come from the client and are never
+  used, and the header is read only from loopback or private peers (a proxy on
+  the same host or network). One proxy hop is supported; publish the relay's port
+  only to that proxy. Without a proxy, leave it off. See
+  [`deploy-todo-demo.md`](deploy-todo-demo.md#--trust-proxy-and-x-forwarded-for).
 - The proxy must pass the WebSocket upgrade (`Upgrade`/`Connection` headers)
   and must keep idle WebSockets open for longer than the 30 s keepalive
   interval (nginx's default `proxy_read_timeout` of 60 s is enough; the relay's
@@ -110,8 +111,8 @@ and route `GET /mailbox/<id>` to
 mailboxes.handle_from(id, req, Some(peer_ip)).await
 ```
 
-where `peer_ip` is the TCP peer address (the relay replaces it with the first
-`X-Forwarded-For` hop only if you set `trust_proxy`). Serve the connection with
+where `peer_ip` is the TCP peer address (with `trust_proxy` set and a loopback or
+private peer, the relay counts the rightmost `X-Forwarded-For` entry instead). Serve the connection with
 hyper's upgrades enabled (`serve_connection(..).with_upgrades()`), and call
 `mailboxes.shutdown()` when your server stops so open mailboxes close cleanly
 (1001). In a `MailboxConfig` built in code, `allowed_origins` defaults to empty,

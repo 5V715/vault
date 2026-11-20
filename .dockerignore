@@ -2,9 +2,11 @@ target
 .git
 .superpowers
 *.key
+**/*.key
 **/node_modules
 **/.test-build
 examples/todo/dist
 vault-web/js/dist
 vault-web/js/pkg
 .showcase
+**/.showcase

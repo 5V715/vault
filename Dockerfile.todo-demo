@@ -10,7 +10,11 @@
 # Run it behind a TLS-terminating reverse proxy (docs/deploy-todo-demo.md has
 # Traefik and Caddy examples), with the origin the proxy serves the page at:
 #
-#   docker run --read-only -p 8080:8080 -e PUBLIC_ORIGIN=https://todo.example IMAGE --trust-proxy
+#   docker run --read-only -p 127.0.0.1:8080:8080 -e PUBLIC_ORIGIN=https://todo.example IMAGE --trust-proxy
+#
+# Publish 8080 only to the proxy (127.0.0.1 or the proxy's container network):
+# with --trust-proxy the per-IP limit counts the rightmost X-Forwarded-For entry
+# from loopback/private peers (one proxy hop).
 #
 # PUBLIC_ORIGIN is required (the container exits at once with status 2 and says
 # why otherwise). It is the relay's browser-origin allowlist (unless

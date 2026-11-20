@@ -8,9 +8,11 @@
 #   docker buildx build -f Dockerfile.relay --platform linux/arm64,linux/arm/v7 -t IMAGE .
 #
 # Run it with the page origin of every app that uses the relay (comma-separated),
-# behind a TLS-terminating reverse proxy that overwrites X-Forwarded-For:
+# behind a TLS-terminating reverse proxy (one hop; publish the port only to it,
+# since --trust-proxy counts the rightmost X-Forwarded-For entry from
+# loopback/private peers):
 #
-#   docker run -p 8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://app.example IMAGE --trust-proxy
+#   docker run -p 127.0.0.1:8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://app.example IMAGE --trust-proxy
 #
 # (or pass `--allow-origin https://app.example` as arguments). Without an allowed
 # origin the container exits at once with status 2 and says why: an open relay

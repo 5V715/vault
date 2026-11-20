@@ -30,9 +30,16 @@ read-only root filesystem (`--read-only`, `read_only: true`).
 |---|---|---|
 | `PUBLIC_ORIGIN` | `--public-origin` | **Required.** The origin the proxy serves the page at, e.g. `https://todo.example` (`https`; `http` only for `localhost`, `127.0.0.1`, `[::1]`). Without it the container exits at once with status 2 and says why. |
 | `RELAY_ORIGIN` | `--relay-origin` | Optional. The relay the page dials. Default: the same host, `wss://<PUBLIC_ORIGIN host>`, which is this container. Give another relay as `wss://host[:port]`. That relay must allow `PUBLIC_ORIGIN`. |
-| `VAULT_RELAY_ALLOW_ORIGIN` | `--allow-origin` | Optional. The browser origins allowed to open a mailbox. Default: `PUBLIC_ORIGIN`, so the page's own origin is the whole allowlist. Any other `Origin` gets HTTP 403. |
-| | `--trust-proxy` | Take the client address for the per-IP limits from `X-Forwarded-For`. Pass it behind a proxy, see below. |
+| `VAULT_RELAY_ALLOW_ORIGIN` | `--allow-origin` | Optional. The browser origins allowed to open a mailbox. Default: `PUBLIC_ORIGIN`, so the page's own origin is the whole browser allowlist. A browser with any other `Origin` gets HTTP 403 on `/mailbox`. |
+| | `--trust-proxy` | Count the per-IP limits on the address the proxy saw (the rightmost `X-Forwarded-For` entry). Pass it behind one proxy, see below. |
 | `RUST_LOG` | | Log level, default `info`. |
+
+The allowlist is not access control. Requests to `/mailbox` **without** an `Origin`
+header (native vaults, `vault-dev`, `curl`) always pass, because a vault app sends
+none. So anyone can use this relay's mailboxes from a non-browser client, bounded
+only by the relay's limits (`--max-per-ip`, `--max-total`, `--max-waiting`). What the
+allowlist stops is other websites using the relay from their users' browsers. The
+relay only forwards Noise ciphertext, so this costs availability, never data.
 
 A variable that is set but empty (`RELAY_ORIGIN=`) is an error, not "unset". Pass
 flags after the image name (`docker run ... vault-todo-demo --trust-proxy`), or as the
@@ -42,22 +49,36 @@ compose `command`. The entrypoint already has `--static-dir /srv/todo`.
 
 The relay limits open mailboxes per client address. Behind a proxy, every connection
 comes from the proxy's address, so all users would share one limit. With
-`--trust-proxy` the relay uses the **first** `X-Forwarded-For` entry instead.
+`--trust-proxy` the relay counts the **rightmost** `X-Forwarded-For` entry instead:
+the one the proxy in front appended (the client's address as the proxy saw it).
+Entries to its left are whatever the client sent and are never used.
 
-That is only safe if a client cannot choose that entry. Two conditions:
+It reads the header only when the connection comes from a loopback or private
+address (127.0.0.0/8, ::1, 10/8, 172.16/12, 192.168/16, fc00::/7), which is where a
+proxy on the same host or container network connects from. A connection from a
+public address reached the relay directly, so its header is ignored and its own
+address counts.
 
-1. **The proxy overwrites `X-Forwarded-For`** for clients it does not trust, instead
-   of appending to what they sent. Traefik (without
-   `forwardedHeaders.trustedIPs` or `forwardedHeaders.insecure` on the entrypoint) and
-   Caddy (without `trusted_proxies`) do this by default. If you add a CDN or load
-   balancer in front, trust only its address ranges there.
-2. **Nothing reaches port 8080 except the proxy.** In the examples the container
-   publishes no port (Traefik) or only on `127.0.0.1` (Caddy). If 8080 is reachable
-   from outside, anyone can send their own `X-Forwarded-For` and dodge the limit;
-   then leave `--trust-proxy` out.
+This is built for **exactly one proxy hop**: Traefik or Caddy directly in front,
+appending (or setting) `X-Forwarded-For`. In addition:
 
-Origin checks do not depend on this: the `Origin` header comes from the browser and
-the proxy passes it through unchanged.
+- **Publish 8080 only to the proxy**, on the compose network (no `ports:`, as in the
+  Traefik example) or on `127.0.0.1` (as in the Caddy example). Never `-p 8080:8080`:
+  Docker's published ports bypass host firewalls such as ufw, and other containers or
+  hosts on a private network could then send their own header.
+- **With a CDN or a second load balancer in front of the proxy**, the rightmost entry
+  is that hop's address, not the client's, so every user behind one edge node shares a
+  limit. That is safe (nobody can choose the address) but coarse; either leave
+  `--trust-proxy` out and let the CDN do per-client rate limiting, or accept it.
+- How the proxies treat a client's own `X-Forwarded-For` depends on their version and
+  settings (check your version's docs). Current Traefik (v2+) drops it from clients
+  outside the entrypoint's `forwardedHeaders.trustedIPs` unless
+  `forwardedHeaders.insecure` is set. Caddy 2.5+ ignores it from clients outside
+  `trusted_proxies`; older Caddy versions appended to it. The relay does not depend on
+  either: it uses only the entry the last proxy added.
+
+Origin checks do not depend on any of this: the `Origin` header comes from the
+browser and the proxy passes it through unchanged.
 
 ## What the page gets
 
