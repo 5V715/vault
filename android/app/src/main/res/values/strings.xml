@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vault</string>
+    <string name="vaults_title">Vaults</string>
+    <string name="vaults_empty">No vaults on this phone yet.</string>
+</resources>
