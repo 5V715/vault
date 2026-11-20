@@ -14,26 +14,103 @@
 //! - `/config.json` from memory: `{"relay":"<relay ws origin>"}`, how the page
 //!   learns its relay at run time.
 //!
+//! Files are streamed in chunks of at most 64 KiB (a file over 32 MiB is not
+//! served), so a request holds one chunk in memory, not the file.
+//!
 //! Every response carries the page's exact CSP (computed once, here), `nosniff`,
 //! `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin` and
 //! `Cache-Control: no-store`. The root is assumed not to change while serving
 //! (a read-only image layer); a symlink swapped in between the check and the read
 //! is not defended against.
 
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::{
     ALLOW, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HeaderValue, REFERRER_POLICY,
     X_CONTENT_TYPE_OPTIONS,
 };
 use hyper::{Method, Response, StatusCode};
+use tokio::io::{AsyncRead, ReadBuf};
 
-type Resp = Response<Full<Bytes>>;
+/// The response body of [`crate::serve_with`]: in-memory or a streamed file.
+pub(crate) type ServeBody = BoxBody<Bytes, io::Error>;
+type Resp = Response<ServeBody>;
 
 /// Largest file served (the page's bundle with the wasm inside is well under this).
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest frame of a streamed file.
+const CHUNK: usize = 64 * 1024;
+
+/// An in-memory body as a [`ServeBody`].
+pub(crate) fn full(b: Full<Bytes>) -> ServeBody {
+    b.map_err(|never| match never {}).boxed()
+}
+
+/// A file streamed as exactly `len` bytes, in frames of at most [`CHUNK`]. A file
+/// that turns out shorter ends the body with an error (hyper then drops the
+/// connection rather than send a short body).
+pub(crate) struct FileBody {
+    file: tokio::fs::File,
+    remaining: u64,
+    buf: Box<[u8]>,
+}
+
+impl FileBody {
+    pub(crate) fn new(file: tokio::fs::File, len: u64) -> Self {
+        Self {
+            file,
+            remaining: len,
+            buf: vec![0; CHUNK].into_boxed_slice(),
+        }
+    }
+}
+
+impl Body for FileBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+        let want = this.remaining.min(CHUNK as u64) as usize;
+        let mut rb = ReadBuf::new(&mut this.buf[..want]);
+        match Pin::new(&mut this.file).poll_read(cx, &mut rb) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    this.remaining = 0;
+                    return Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file shorter than its length",
+                    ))));
+                }
+                this.remaining -= n as u64;
+                Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(rb.filled())))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining)
+    }
+}
 
 /// A directory served read-only with the page's headers, plus `/config.json`.
 #[derive(Debug)]
@@ -88,18 +165,22 @@ impl StaticSite {
                 .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
             return r;
         }
-        let (body, ty) = if path == "/config.json" {
-            (self.config_json.clone(), "application/json")
-        } else {
-            match self.read(path).await {
-                Some(v) => v,
-                None => return self.reply(StatusCode::NOT_FOUND, TEXT, "not found\n"),
+        if path == "/config.json" {
+            return self.reply(StatusCode::OK, "application/json", self.config_json.clone());
+        }
+        match self.open(path).await {
+            Some((file, len, ty)) => {
+                let mut r = self.with_headers(StatusCode::OK, ty, FileBody::new(file, len).boxed());
+                r.headers_mut()
+                    .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from(len));
+                r
             }
-        };
-        self.reply(StatusCode::OK, ty, body)
+            None => self.reply(StatusCode::NOT_FOUND, TEXT, "not found\n"),
+        }
     }
 
-    async fn read(&self, path: &str) -> Option<(Bytes, &'static str)> {
+    /// The open file, its length and type, if `path` names a servable file.
+    async fn open(&self, path: &str) -> Option<(tokio::fs::File, u64, &'static str)> {
         let rel = safe_relative(path)?;
         let ty = content_type(&rel)?;
         let full = self.root.join(&rel);
@@ -113,12 +194,21 @@ impl StaticSite {
         if !real.starts_with(&self.root) || real == self.root {
             return None;
         }
-        let body = tokio::fs::read(&real).await.ok()?;
-        Some((Bytes::from(body), ty))
+        // Size and type again from the opened handle (what is actually streamed).
+        let file = tokio::fs::File::open(&real).await.ok()?;
+        let meta = file.metadata().await.ok()?;
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            return None;
+        }
+        Some((file, meta.len(), ty))
     }
 
     fn reply(&self, status: StatusCode, ty: &'static str, body: impl Into<Bytes>) -> Resp {
-        let mut r = Response::new(Full::new(body.into()));
+        self.with_headers(status, ty, full(Full::new(body.into())))
+    }
+
+    fn with_headers(&self, status: StatusCode, ty: &'static str, body: ServeBody) -> Resp {
+        let mut r = Response::new(body);
         *r.status_mut() = status;
         let h = r.headers_mut();
         h.insert(CONTENT_TYPE, HeaderValue::from_static(ty));
@@ -235,5 +325,48 @@ mod tests {
              img-src 'self' data:; connect-src 'self' wss://todo.example; base-uri 'none'; \
              form-action 'none'; frame-ancestors 'none'"
         );
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn file_body_streams_in_bounded_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.js");
+        let data: Vec<u8> = (0..(3 * CHUNK + 123)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &data).unwrap();
+        let file = tokio::fs::File::open(&p).await.unwrap();
+        let mut body = FileBody::new(file, data.len() as u64);
+        assert_eq!(body.size_hint().exact(), Some(data.len() as u64));
+        let mut got = Vec::new();
+        let mut frames = 0;
+        while let Some(f) = body.frame().await {
+            let chunk = f.unwrap().into_data().unwrap();
+            assert!(chunk.len() <= CHUNK, "frame of {} bytes", chunk.len());
+            got.extend_from_slice(&chunk);
+            frames += 1;
+        }
+        assert_eq!(got, data);
+        assert!(frames >= 4, "{frames} frames");
+    }
+
+    #[tokio::test]
+    async fn file_body_errors_when_the_file_shrinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.js");
+        std::fs::write(&p, b"short").unwrap();
+        let file = tokio::fs::File::open(&p).await.unwrap();
+        let mut body = FileBody::new(file, 100);
+        let mut err = false;
+        while let Some(f) = body.frame().await {
+            if f.is_err() {
+                err = true;
+                break;
+            }
+        }
+        assert!(err, "a truncated file must end the body with an error");
     }
 }

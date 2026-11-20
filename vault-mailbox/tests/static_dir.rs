@@ -528,3 +528,24 @@ async fn config_json_matches_relay_origin() {
         assert_eq!(out.status.code(), Some(2), "{page} {relay_origin}: {err}");
     }
 }
+
+/// Files are streamed with their exact length; a file above the cap is not served.
+#[tokio::test]
+async fn static_dir_streams_large_files_with_a_cap() {
+    let tmp = site();
+    let root = tmp.path().join("site");
+    let data: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 253) as u8).collect();
+    std::fs::write(root.join("big.js"), &data).unwrap();
+    // Sparse: 32 MiB + 1 byte without writing them.
+    let huge = std::fs::File::create(root.join("huge.js")).unwrap();
+    huge.set_len(32 * 1024 * 1024 + 1).unwrap();
+    let (addr, _stop) = start(Some(&root), todo_cfg()).await;
+    let r = get(&addr, "/big.js").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        r.header("content-length"),
+        Some(data.len().to_string().as_str())
+    );
+    assert!(r.body == data, "body differs");
+    assert_eq!(get(&addr, "/huge.js").await.status, 404);
+}

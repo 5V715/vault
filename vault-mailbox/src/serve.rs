@@ -16,6 +16,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use crate::static_site::{ServeBody, full};
 use crate::{Mailboxes, StaticSite, progress, text};
 
 /// What [`serve_with`] serves besides the relay. The default is the plain relay.
@@ -32,21 +33,22 @@ async fn route(
     static_site: Option<Arc<StaticSite>>,
     req: Request<Incoming>,
     peer: SocketAddr,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<ServeBody>, Infallible> {
     let path = req.uri().path().to_string();
+    let relay = |r: Response<Full<Bytes>>| r.map(full);
     Ok(match (req.method(), path.as_str()) {
-        (&Method::GET, "/healthz") => text(StatusCode::OK, "ok"),
-        (&Method::GET, p) if p.starts_with("/mailbox/") => {
+        (&Method::GET, "/healthz") => relay(text(StatusCode::OK, "ok")),
+        (&Method::GET, p) if p.starts_with("/mailbox/") => relay(
             mailboxes
                 .handle_from(&p["/mailbox/".len()..], req, Some(peer.ip()))
-                .await
-        }
+                .await,
+        ),
         (_, p) if p == "/healthz" || p.starts_with("/mailbox/") => {
-            text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+            relay(text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"))
         }
         (m, p) => match &static_site {
             Some(site) => site.respond(m, p).await,
-            None => text(StatusCode::NOT_FOUND, "not found"),
+            None => relay(text(StatusCode::NOT_FOUND, "not found")),
         },
     })
 }
