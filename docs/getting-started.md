@@ -111,27 +111,36 @@ scripts/showcase.sh --lan
 ```
 
 serves the page at `https://<LAN IP>:8443` and the relay at `wss://<LAN IP>:8787` so
-that the vault app on an Android phone in the same home network can pair with the page.
+that a vault app on an Android phone in the same home network can pair with the page.
+(The Android vault app is not released yet; until then, `--lan --dev` below pairs the
+page with a demo vault on the computer over the same TLS setup.)
 
 - **The LAN IP** is your computer's primary IPv4 address (Linux: the source address of
   `ip route get 1.1.1.1`; macOS: `ipconfig getifaddr` of the default route's
-  interface). Only home-network addresses are accepted (10/8, 172.16/12, 192.168/16
-  and 100.64/10); give another one explicitly with `--lan-ip 192.168.1.20`.
+  interface). If that route goes through a VPN or tunnel (`tun*`, `wg*`, `utun*`,
+  `tailscale*`, ...), the home-network address of another interface is used instead.
+  Only home-network addresses are accepted (10/8, 172.16/12, 192.168/16); give any
+  other one, such as a 100.64/10 address, explicitly with `--lan-ip 192.168.1.20`.
+- **Give the computer a fixed address.** Set up a DHCP reservation for it in your
+  router. The CA and the vault binding are both tied to the IP, so a new IP means a
+  new CA to install on the phone and a new vault binding.
 - **A local CA** is created once in `.showcase/ca/` (mode 0700; keys 0600, never
   printed). It is an ECDSA P-256 CA valid for 10 years with `pathlen:0`, and its name
-  constraints let it vouch only for the private range of your IP (for example
-  `192.168.0.0/16`) and `localhost`. The server certificate (825 days, for your IP and
-  `localhost`) is issued from it; when your IP changes, the script issues a new one and
-  keeps the CA, so you install the CA only once. If your `openssl` cannot add name
-  constraints the script says so and makes the CA without them. A key file or CA
+  constraints let it vouch only for your IP (`<ip>/32`) and `localhost`: even if its
+  key leaked, it could not be used to impersonate any other host on your network to
+  the devices that trust it. The server certificate (825 days, for your IP and
+  `localhost`) is issued from it. When your IP changes, the script makes a **new CA**
+  and says so loudly: install the new one on your phone and browsers and remove the
+  old one. If your `openssl` cannot add name constraints the script says so (with
+  openssl's error) and makes the CA without them. A key file or CA
   directory that other users can read is refused. `--reset` keeps the CA; delete
   `.showcase/ca/` yourself to make a new one.
 - **The page** is the release build: it only shows the QR code, which the vault app on
   your phone scans. `--lan --dev` keeps the **Copy pairing text** button and pairs with
   a demo vault on the computer instead (vault-dev, which trusts the CA with
   `--ca-file`).
-- **Both ports listen on every interface** (in localhost mode they listen on
-  127.0.0.1 only). If a host firewall blocks them, open them for your home network
+- **Both ports listen on the LAN IP only** (in localhost mode on 127.0.0.1 only), not
+  on a VPN or any other interface. If a host firewall blocks them, open them for your home network
   only (for example `sudo ufw allow from 192.168.1.0/24 to any port 8443,8787 proto tcp`),
   never forward them from your router, and stop the script with Ctrl-C when you are done.
 
@@ -146,12 +155,12 @@ when you no longer need it.
   Security → Encryption & credentials → Install a certificate → CA certificate** (the
   path varies a little by vendor; search Settings for "CA certificate"). Android shows
   a warning; the installed CA is listed under **Trusted credentials → User**, where
-  its details show the fingerprint. The Android vault app trusts user-installed
-  CAs **only in its debug build**; a release build of the app will not connect to the
-  LAN relay.
+  its details show the fingerprint. The Android vault app (not released yet) is
+  planned to trust user-installed CAs **only in its debug build**; a release build of
+  the app would not connect to the LAN relay.
 - **Linux browser:** Chrome/Chromium: **Settings → Privacy and security → Security →
-  Manage certificates → Authorities → Import**, tick "Trust this certificate for
-  identifying websites" (or `certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "vault
+  Manage certificates** and import `ca.pem` as a trusted authority (the menu differs
+  between Chrome versions), or `certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "vault
   showcase CA" -i .showcase/ca/ca.pem`). Firefox: **Settings → Privacy & Security →
   Certificates → View Certificates → Authorities → Import**, tick "identify websites".
 - **macOS browser:** Safari and Chrome use the keychain:
@@ -164,7 +173,8 @@ when you no longer need it.
 
 ### Pair the phone
 
-1. On the phone, create (or reset) the vault for this page: it must be bound to the
+1. On the phone, create (or reset) the vault for this page in the vault app (once it
+   exists): it must be bound to the
    app `vault-todo` and the origin the script prints, the same as
    `vaultctl init --app vault-todo --origin https://<LAN IP>:8443`.
 2. Open `https://<LAN IP>:8443` in a browser that trusts the CA (on the computer or
@@ -174,8 +184,8 @@ when you no longer need it.
    match** in the page.
 
 The vault is bound to the exact origin, including the IP: if your IP changes, the page
-moves to the new address, and the phone's vault has to be created for it again (or ask
-your router for a fixed address for the computer).
+moves to the new address, the phone needs the new CA, and the phone's vault has to be
+created for the new origin. A DHCP reservation avoids all of that.
 
 ## Where the data lives
 
@@ -188,7 +198,7 @@ Everything is under `.showcase/` in the repository (git-ignored), or `--dir`:
 | `passphrase` | random passphrase, mode 0600, never printed or passed on a command line |
 | `origin` | the origin the vault is bound to |
 | `web/` | the built page |
-| `ca/` | with `--lan`: the local CA (`ca.pem`, `ca.key`) and a certificate per IP (`leaf-<ip>.pem`, `.key`); kept by `--reset` |
+| `ca/` | with `--lan`: the local CA (`ca.pem`, `ca.key`) and the certificate for its IP (`leaf-<ip>.pem`, `.key`); kept by `--reset` |
 | `logs/relay.log`, `logs/web.log` | what the background processes wrote |
 
 The items you add are encrypted inside `vault/`. `vaultctl init` creates a recovery key
