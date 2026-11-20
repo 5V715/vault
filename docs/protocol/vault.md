@@ -14,7 +14,9 @@ crate. Design context: `docs/design/vault.md` ("Pairing and sessions (V2)") and
 
 - Browser: Noise initiator, fresh static key pair per session, discarded at
   session end.
-- Vault: Noise responder, long-term static key.
+- Vault: Noise responder, fresh random static key per pairing, never stored.
+  Nobody pins it: the SAS authenticates every session. The vault can pair while
+  its container is locked; it unlocks only when the user approves.
 - Relay: `GET /mailbox/<32 hex chars>` upgrades to WebSocket (binary frames
   only) and pairs the first two connections on that mailbox id (128-bit random,
   chosen by the browser). A mailbox expires 60 s after creation if unpaired.
@@ -334,8 +336,8 @@ Vault to browser: `VaultMessage::Response(Response{ id, body })` or
 - The SAS is 6 digits (about 20 bits): it protects against an online
   man-in-the-middle in a single pairing attempt, not against offline guessing,
   because each attempt needs a fresh session and a user confirmation.
-- The browser static key is per session and forgotten at session end; the
-  vault's long-term static key identifies it across sessions.
+- Both static keys are per session and forgotten at session end; neither
+  identifies a party across sessions (the SAS comparison does that job).
 - A compromised active browser sees what it reads while the session lasts and
   loses access on revocation or session end.
 

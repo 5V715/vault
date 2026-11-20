@@ -186,7 +186,7 @@ web app page you pair from (for a local development server, for example
    or origin than the container was created for: the session is refused without a
    prompt and the browser reports `wrong app`.
 6. The process exits (code 0) when the session ends (browser disconnect, denial,
-   replaced, wrong app, timeout; it prints `session ended: <reason>`). Run it again with the new
+   replaced, wrong app, timeout, unlock failed; it prints `session ended: <reason>`). Run it again with the new
    QR text for the next session. Ctrl-C locks and exits (the high-water mark of the
    last commit is saved; staged, uncommitted writes are dropped).
 
@@ -206,10 +206,11 @@ Options and behaviour:
   `--ca-file CA.pem`: the CA certificate(s) in that PEM file (one or more) are trusted in
   addition to the public roots. An unreadable or malformed file is an error before
   anything is dialed (exit 1); the certificate must still name the relay's host or IP.
-- The vault's long-term Noise key is created on first use in `D/.vault-dev-identity`,
-  sealed under the same passphrase (Argon2id, AES-256-GCM, mode 0600 on Unix; on Windows
-  the file keeps the ACL inherited from its directory, so keep the vault directory under
-  your user profile). The high-water mark is saved back into `D/.vaultctl` when a session ends.
+- The vault pairs while locked: each run uses a fresh random Noise key (nothing is
+  stored), and the container is opened with the recovery key from `D/.vaultctl` only
+  when you approve the prompt. `D/.vault-dev-identity`, written by earlier versions, is
+  obsolete: it is ignored and can be deleted; no migration is needed. The high-water
+  mark is saved back into `D/.vaultctl` when a session ends.
 - Growth and compaction: every commit adds at least one segment file of 64 KiB or
   more under `D/seg/` (the browser commits once per received batch and up to three
   times per sent message), and every session start decrypts all of them. The vault
