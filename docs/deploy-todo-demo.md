@@ -62,6 +62,10 @@ address counts.
 This is built for **exactly one proxy hop**: Traefik or Caddy directly in front,
 appending (or setting) `X-Forwarded-For`. In addition:
 
+- **No other service on the proxy network may reach port 8080** while `--trust-proxy`
+  is on: any container there connects from a private address, so the relay would
+  take its `X-Forwarded-For` at face value. Put the relay and the proxy on a network
+  of their own.
 - **Publish 8080 only to the proxy**, on the compose network (no `ports:`, as in the
   Traefik example) or on `127.0.0.1` (as in the Caddy example). Never `-p 8080:8080`:
   Docker's published ports bypass host firewalls such as ufw, and other containers or
@@ -176,6 +180,12 @@ services:
 
 `docker compose up -d`, then check `https://todo.example/healthz` (`ok`) and
 `https://todo.example/config.json`.
+
+Recent Traefik v3 releases set the entrypoint's `transport.respondingTimeouts.readTimeout`
+to 60 s by default (check your version's docs), which can also end an idle WebSocket.
+The client pings at least every 30 s, so sessions should stay up; if they drop after
+about a minute, raise it on `websecure`, e.g.
+`--entrypoints.websecure.transport.respondingTimeouts.readTimeout=600s`.
 
 ## Caddy
 
