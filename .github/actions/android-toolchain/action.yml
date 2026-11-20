@@ -1,0 +1,77 @@
+name: Android toolchain
+description: >-
+  The pinned Rust toolchain with the Android targets, the pinned NDK (and, with
+  sdk-packages, the pinned SDK platform and build tools) through the runner's
+  sdkmanager, and the pinned cargo-ndk. The pins come from
+  android/gradle/libs.versions.toml (ndk, cargoNdk, compileSdk, buildTools), the
+  same values the Gradle build uses. Exports ANDROID_NDK_HOME. Run after checkout.
+inputs:
+  rust-targets:
+    description: Rust targets to add (space-separated).
+    required: false
+    default: aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+  sdk-packages:
+    description: Also install the pinned platform and build tools ("true"/"false").
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: read the pins from android/gradle/libs.versions.toml
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PY' | tee -a "$GITHUB_ENV"
+        import re, tomllib
+        with open("android/gradle/libs.versions.toml", "rb") as f:
+            v = tomllib.load(f)["versions"]
+        pins = {
+            "NDK_VERSION": (v["ndk"], r"\d+\.\d+\.\d+"),
+            "CARGO_NDK_VERSION": (v["cargoNdk"], r"\d+\.\d+\.\d+"),
+            "ANDROID_COMPILE_SDK": (v["compileSdk"], r"\d+(\.\d+)?"),
+            "ANDROID_BUILD_TOOLS": (v["buildTools"], r"\d+\.\d+\.\d+"),
+        }
+        for k, (val, pat) in pins.items():
+            if not re.fullmatch(pat, val):
+                raise SystemExit(f"{k}: '{val}' is not an exact version")
+            print(f"{k}={val}")
+        PY
+    - name: toolchain (exact version from rust-toolchain.toml) and Android targets
+      shell: bash
+      run: scripts/setup-rust.sh ${{ inputs.rust-targets }}
+    - name: NDK (pinned, via the runner's sdkmanager)
+      shell: bash
+      env:
+        SDK_PACKAGES: ${{ inputs.sdk-packages }}
+      run: |
+        set -euo pipefail
+        set -x
+        sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+        # `yes` ends with SIGPIPE once sdkmanager stops reading: not a failure.
+        (yes || true) | "$sdk" --licenses > /dev/null
+        # The pinned packages must be offered by the runner's SDK repository.
+        "$sdk" --list > /tmp/sdk-list.txt
+        grep -E "^ *ndk;" /tmp/sdk-list.txt | sort -u
+        pkgs=("ndk;$NDK_VERSION")
+        if [ "$SDK_PACKAGES" = true ]; then
+          grep -E "^ *(platforms;android-|build-tools;)" /tmp/sdk-list.txt | sort -u | tail -n 20
+          pkgs+=("platforms;android-$ANDROID_COMPILE_SDK" "build-tools;$ANDROID_BUILD_TOOLS")
+        fi
+        for p in "${pkgs[@]}"; do
+          grep -qE "^ *${p//./\\.}( |\|)" /tmp/sdk-list.txt || { echo "sdkmanager does not offer $p" >&2; exit 1; }
+        done
+        "$sdk" --install "${pkgs[@]}" > /dev/null
+        ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
+        grep '^Pkg.Revision' "$ndk/source.properties"
+        grep -q "^Pkg.Revision *= *$NDK_VERSION" "$ndk/source.properties"
+        if [ "$SDK_PACKAGES" = true ]; then
+          test -f "$ANDROID_HOME/platforms/android-$ANDROID_COMPILE_SDK/android.jar"
+          test -x "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/aapt2"
+        fi
+        echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+    - name: cargo-ndk (pinned)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo install --locked cargo-ndk --version "$CARGO_NDK_VERSION"
+        cargo install --list | grep -E '^cargo-ndk '

@@ -9,6 +9,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
+  # Temurin, exact build: the JDK that runs Gradle for android/ (bytecode target 17).
+  ANDROID_JDK: "21.0.13+9"
 
 jobs:
   rust:
@@ -49,33 +51,12 @@ jobs:
   vault-ffi-android:
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    env:
-      NDK_VERSION: "30.0.16248370"
-      CARGO_NDK_VERSION: "4.1.2"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - name: toolchain (exact version from rust-toolchain.toml) and Android targets
-        run: scripts/setup-rust.sh aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-      - name: NDK (pinned, via the runner's sdkmanager) and cargo-ndk (pinned)
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -x
-          sdk="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          # `yes` ends with SIGPIPE once sdkmanager stops reading: not a failure.
-          (yes || true) | "$sdk" --licenses > /dev/null
-          # The pinned NDK must be offered by the runner's SDK repository.
-          "$sdk" --list > /tmp/sdk-list.txt
-          grep -E "^ *ndk;" /tmp/sdk-list.txt | sort -u
-          grep -qE "^ *ndk;$NDK_VERSION( |\|)" /tmp/sdk-list.txt
-          "$sdk" --install "ndk;$NDK_VERSION" > /dev/null
-          ndk="$ANDROID_HOME/ndk/$NDK_VERSION"
-          grep '^Pkg.Revision' "$ndk/source.properties"
-          grep -q "^Pkg.Revision *= *$NDK_VERSION" "$ndk/source.properties"
-          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
-          cargo install --locked cargo-ndk --version "$CARGO_NDK_VERSION"
+      # The pins (NDK, cargo-ndk) come from android/gradle/libs.versions.toml.
+      - uses: ./.github/actions/android-toolchain
       - name: cross build (arm64-v8a, armeabi-v7a, x86_64; minSdk 30) and bindings
         shell: bash
         run: |
@@ -86,6 +67,118 @@ jobs:
           cargo run -p vault-ffi --features bindgen --bin uniffi-bindgen --locked -- \
             generate --library target/aarch64-linux-android/release/libvault_ffi.so --language kotlin --no-format --out-dir "$out"
           test -s "$out/uniffi/vault_ffi/vault_ffi.kt"
+
+  # The Android app (android/): JVM tests, lint, the debug APK and the unsigned
+  # release APK (uploaded), with vault-ffi built by cargo-ndk and its bindings by
+  # uniffi-bindgen inside the Gradle build. Dependency verification is strict once
+  # android/gradle/verification-metadata.xml is committed (android/ci/gradle.sh).
+  # The Gradle cache is written only by pushes to main; every other run, pull
+  # requests from forks included, reads it at most.
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.ANDROID_JDK }}
+      - name: JDK is the pinned build
+        run: java -version 2>&1 | tee /dev/stderr | grep -F "$ANDROID_JDK" > /dev/null
+      - uses: ./.github/actions/android-toolchain
+        with:
+          sdk-packages: "true"
+      - name: Gradle wrapper pin equals Gradle's published checksum
+        run: android/ci/check-wrapper.sh
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+          cache-read-only: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
+      - name: JVM tests, lint, debug and unsigned release APKs, FFI test APK
+        run: >-
+          android/ci/gradle.sh --stacktrace
+          :core:test testDebugUnitTest lint assembleDebug assembleRelease :ffi:assembleDebugAndroidTest
+      - name: no Google Play Services or Firebase in the app
+        shell: bash
+        run: |
+          set -euo pipefail
+          android/ci/gradle.sh -q :app:dependencies --configuration releaseRuntimeClasspath > /tmp/app-deps.txt
+          if grep -E 'com\.google\.android\.gms|com\.google\.firebase' /tmp/app-deps.txt; then
+            echo "Play Services / Firebase dependency found" >&2
+            exit 1
+          fi
+          grep -cE 'net\.java\.dev\.jna:jna|androidx\.compose\.material3:material3' /tmp/app-deps.txt
+      - name: APK contents and hardening
+        run: android/ci/check-apks.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-apks
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: android-reports
+          path: |
+            android/*/build/reports/
+            android/*/build/test-results/
+          if-no-files-found: ignore
+
+  # The FFI smoke test (ffi_loads_and_creates_vault) on x86_64 emulators: the
+  # oldest supported API level (minSdk 30) and a recent one. Only the x86_64
+  # library is built here.
+  android-emulator:
+    name: android emulator (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [30, 36]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.ANDROID_JDK }}
+      - uses: ./.github/actions/android-toolchain
+        with:
+          rust-targets: x86_64-linux-android
+          sdk-packages: "true"
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+          cache-read-only: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: build the FFI test APK (x86_64 only)
+        run: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:assembleDebugAndroidTest
+      - uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          # One line: the action runs each script line as its own shell command.
+          script: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: android-emulator-${{ matrix.api-level }}-reports
+          path: |
+            android/ffi/build/reports/androidTests/
+            android/ffi/build/outputs/androidTest-results/
+          if-no-files-found: ignore
 
   # The three shipped binaries (vaultctl, vault-dev, vault-relay) on the other
   # desktop platforms. Linux is covered by the `rust` job above.
