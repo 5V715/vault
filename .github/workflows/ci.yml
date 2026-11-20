@@ -31,6 +31,51 @@ jobs:
           # The browser drivers (feature `wasm`) also type-check on the host.
           cargo clippy -p vault-client --all-targets --features wasm,native --locked -- -D warnings
           cargo test --workspace --locked
+      - name: vault-ffi Kotlin bindings (pinned uniffi-bindgen, from the built library)
+        shell: bash
+        run: |
+          set -eo pipefail
+          set -x
+          cargo clippy -p vault-ffi --all-targets --features bindgen --locked -- -D warnings
+          cargo build -p vault-ffi --locked
+          out="$(mktemp -d)"
+          cargo run -p vault-ffi --features bindgen --bin uniffi-bindgen --locked -- \
+            generate --library target/debug/libvault_ffi.so --language kotlin --no-format --out-dir "$out"
+          grep -q "suspend fun \`serveOffer\`" "$out/uniffi/vault_ffi/vault_ffi.kt"
+
+  # vault-ffi cross-built for the Android ABIs with cargo-ndk and the NDK, both
+  # pinned. The app (android/) packages these libraries; this job only checks
+  # that the Rust core builds for them and that bindings generate from them.
+  vault-ffi-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      NDK_VERSION: "30.0.16248370"
+      CARGO_NDK_VERSION: "4.1.2"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: toolchain (exact version from rust-toolchain.toml) and Android targets
+        run: scripts/setup-rust.sh aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+      - name: NDK (pinned, via the runner's sdkmanager) and cargo-ndk (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -x
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          cargo install --locked cargo-ndk --version "$CARGO_NDK_VERSION"
+      - name: cross build (arm64-v8a, armeabi-v7a, x86_64; minSdk 30) and bindings
+        shell: bash
+        run: |
+          set -eo pipefail
+          set -x
+          cargo ndk --platform 30 -t arm64-v8a -t armeabi-v7a -t x86_64 build -p vault-ffi --release --locked
+          out="$(mktemp -d)"
+          cargo run -p vault-ffi --features bindgen --bin uniffi-bindgen --locked -- \
+            generate --library target/aarch64-linux-android/release/libvault_ffi.so --language kotlin --no-format --out-dir "$out"
+          test -s "$out/uniffi/vault_ffi/vault_ffi.kt"
 
   # The three shipped binaries (vaultctl, vault-dev, vault-relay) on the other
   # desktop platforms. Linux is covered by the `rust` job above.
