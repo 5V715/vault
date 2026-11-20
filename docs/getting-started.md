@@ -49,6 +49,7 @@ Useful options (all in `--help`):
 | `--no-build` | reuse the existing builds |
 | `--pair TEXT` | pair once with this pairing text instead of asking (it ends up in your shell history; prefer pasting at the prompt) |
 | `--check` | build, start, health-check, exit 0 (used by CI) |
+| `--lan` [`--lan-ip IP`] [`--dev`] | serve on your LAN IP over https/wss for a phone: see [Test with your phone (LAN)](#test-with-your-phone-lan) |
 
 ## What you will see
 
@@ -103,6 +104,79 @@ Stop everything with Ctrl-C. The script stops the relay and the page server too.
 
 The design is in `docs/design/vault.md`, the wire protocol in `docs/protocol/vault.md`.
 
+## Test with your phone (LAN)
+
+```sh
+scripts/showcase.sh --lan
+```
+
+serves the page at `https://<LAN IP>:8443` and the relay at `wss://<LAN IP>:8787` so
+that the vault app on an Android phone in the same home network can pair with the page.
+
+- **The LAN IP** is your computer's primary IPv4 address (Linux: the source address of
+  `ip route get 1.1.1.1`; macOS: `ipconfig getifaddr` of the default route's
+  interface). Only home-network addresses are accepted (10/8, 172.16/12, 192.168/16
+  and 100.64/10); give another one explicitly with `--lan-ip 192.168.1.20`.
+- **A local CA** is created once in `.showcase/ca/` (mode 0700; keys 0600, never
+  printed). It is an ECDSA P-256 CA valid for 10 years with `pathlen:0`, and its name
+  constraints let it vouch only for the private range of your IP (for example
+  `192.168.0.0/16`) and `localhost`. The server certificate (825 days, for your IP and
+  `localhost`) is issued from it; when your IP changes, the script issues a new one and
+  keeps the CA, so you install the CA only once. If your `openssl` cannot add name
+  constraints the script says so and makes the CA without them. A key file or CA
+  directory that other users can read is refused. `--reset` keeps the CA; delete
+  `.showcase/ca/` yourself to make a new one.
+- **The page** is the release build: it only shows the QR code, which the vault app on
+  your phone scans. `--lan --dev` keeps the **Copy pairing text** button and pairs with
+  a demo vault on the computer instead (vault-dev, which trusts the CA with
+  `--ca-file`).
+- **Both ports listen on every interface** (in localhost mode they listen on
+  127.0.0.1 only). If a host firewall blocks them, open them for your home network
+  only (for example `sudo ufw allow from 192.168.1.0/24 to any port 8443,8787 proto tcp`),
+  never forward them from your router, and stop the script with Ctrl-C when you are done.
+
+### Trust the CA
+
+The script prints the path of `ca.pem` and its **SHA-256 fingerprint**. Every device
+that opens the page or runs the vault must trust the CA once. Compare the fingerprint
+your device shows with the printed one before you trust it, and remove the CA again
+when you no longer need it.
+
+- **Android phone (the vault app):** copy `ca.pem` to the phone, then **Settings →
+  Security → Encryption & credentials → Install a certificate → CA certificate** (the
+  path varies a little by vendor; search Settings for "CA certificate"). Android shows
+  a warning; the installed CA is listed under **Trusted credentials → User**, where
+  its details show the fingerprint. The Android vault app trusts user-installed
+  CAs **only in its debug build**; a release build of the app will not connect to the
+  LAN relay.
+- **Linux browser:** Chrome/Chromium: **Settings → Privacy and security → Security →
+  Manage certificates → Authorities → Import**, tick "Trust this certificate for
+  identifying websites" (or `certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "vault
+  showcase CA" -i .showcase/ca/ca.pem`). Firefox: **Settings → Privacy & Security →
+  Certificates → View Certificates → Authorities → Import**, tick "identify websites".
+- **macOS browser:** Safari and Chrome use the keychain:
+  `security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db .showcase/ca/ca.pem`
+  (or open `ca.pem` in Keychain Access and set it to "Always Trust"). Firefox: as on
+  Linux.
+- **Windows browser** (if you open the page from another computer): Edge and Chrome
+  use the Windows store: `certutil -user -addstore Root ca.pem`, or `certmgr.msc` →
+  Trusted Root Certification Authorities → Import. Firefox: as on Linux.
+
+### Pair the phone
+
+1. On the phone, create (or reset) the vault for this page: it must be bound to the
+   app `vault-todo` and the origin the script prints, the same as
+   `vaultctl init --app vault-todo --origin https://<LAN IP>:8443`.
+2. Open `https://<LAN IP>:8443` in a browser that trusts the CA (on the computer or
+   another device in the network), click **Connect to vault**, and scan the QR code
+   with the vault app.
+3. Compare the 6-digit codes on both screens, approve in the app, then click **Codes
+   match** in the page.
+
+The vault is bound to the exact origin, including the IP: if your IP changes, the page
+moves to the new address, and the phone's vault has to be created for it again (or ask
+your router for a fixed address for the computer).
+
 ## Where the data lives
 
 Everything is under `.showcase/` in the repository (git-ignored), or `--dir`:
@@ -114,6 +188,7 @@ Everything is under `.showcase/` in the repository (git-ignored), or `--dir`:
 | `passphrase` | random passphrase, mode 0600, never printed or passed on a command line |
 | `origin` | the origin the vault is bound to |
 | `web/` | the built page |
+| `ca/` | with `--lan`: the local CA (`ca.pem`, `ca.key`) and a certificate per IP (`leaf-<ip>.pem`, `.key`); kept by `--reset` |
 | `logs/relay.log`, `logs/web.log` | what the background processes wrote |
 
 The items you add are encrypted inside `vault/`. `vaultctl init` creates a recovery key
@@ -155,9 +230,19 @@ Use it after changing `--web-port`: a vault is bound to one origin.
   belong together (a half-deleted `.showcase`). Use `--reset`.
 - **The script says a process exited:** read the log tail it prints, or
   `.showcase/logs/relay.log` and `web.log`.
+- **`--lan`: "is not a home-network address" / "cannot detect":** the computer is not
+  on a home network, or the detected interface is a VPN; pass the right address with
+  `--lan-ip`.
+- **`--lan`: the browser or the phone says the connection is not private:** the CA is
+  not trusted on that device yet (see [Trust the CA](#trust-the-ca)), or the page is
+  opened under another address than the one the script printed.
+- **`--lan`: "refusing to reuse it" for a key file:** its permissions were widened.
+  `chmod 600` it if nobody else could have copied it; otherwise delete `.showcase/ca/`,
+  and install the new CA in place of the old one.
 
 The page is a `--dev` build, which has the **Copy pairing text** button. The pairing
-text is a secret while the QR is shown, so use this build only on localhost, for demos.
+text is a secret while the QR is shown, so use this build only on localhost (or your
+own home network with `--lan --dev`), for demos.
 
 ## Next steps
 

@@ -63,11 +63,17 @@ and no clipboard access; you pair it by scanning the QR with your vault.
 
 ## Build and serve
 
-- `node build.mjs --relay <origin> [--dev] [--out dist]`
+- `node build.mjs --relay <origin> [--page-origin <origin>] [--dev] [--out dist]`
   - `--relay` must be a bare origin: `https://host[:port]`, or `http` for
-    loopback only. It is compiled in.
+    loopback only. Its WebSocket form (`wss://host[:port]`, `ws://` for loopback)
+    is accepted too and means the same relay. It is compiled in.
+  - `--page-origin` is where the page will be served. With it, an `https` page
+    with a `ws:` relay (mixed content, which browsers block) and a `wss:` relay
+    for an `http` page are refused.
   - The wasm is bundled into `main.js` as bytes, so the page never fetches it.
-- `node serve.mjs [--port 8080] [--dir dist]` serves `dist` on 127.0.0.1 with:
+- `node serve.mjs [--port 8080] [--dir dist] [--host 127.0.0.1] [--tls-cert cert.pem --tls-key key.pem]`
+  serves `dist` (over HTTPS with the certificate, as `scripts/showcase.sh --lan`
+  does) with:
   - `Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src <relay WebSocket origin>; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`
   - `connect-src` is the relay's WebSocket origin: `http://127.0.0.1:8787` becomes
     `ws://127.0.0.1:8787`, and `https://relay.example` becomes `wss://relay.example`.
@@ -106,6 +112,10 @@ See `docs/integration.md`, "Traffic and commit batching".
   real `vault-relay`, `vault-dev` and `vaultctl`. It covers persistence across
   sessions, edits dropped on close, wrong app, and cancel. It needs vault-web
   built, and uses `VAULT_BIN_DIR` or builds the binaries with cargo.
+- `npm run test:lan` runs LAN mode end to end with a throwaway CA from
+  `scripts/lan-cert.sh`: the relay terminating `wss`, the page over https, and
+  vault-dev with `--ca-file`; a certificate for another IP must be refused. Same
+  needs as `test:e2e`, plus `openssl`.
 - `npm run test:browser` is a smoke test in headless Chrome. It serves the
   built page with `serve.mjs`, starts the real relay, clicks "Connect to vault",
   and fails on any CSP violation or console error. It also fails unless the relay
