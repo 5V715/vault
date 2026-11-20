@@ -63,7 +63,7 @@ fs.appendFileSync(process.env.SHOWCASE_TEST_LOG, `vault-relay ${a.join(" ")}\n`)
 fs.appendFileSync(process.env.SHOWCASE_TEST_PIDS, `relay ${process.pid}\n`);
 const port = Number(a[a.indexOf("--listen") + 1].split(":").pop());
 http.createServer((q, r) => { if (q.url === "/healthz") r.end("ok\n"); else { r.statusCode = 404; r.end(); } })
-  .listen(port, "127.0.0.1");
+  .listen(port, "127.0.0.1", () => console.log("vault-relay listening"));
 EOF
 
 cat > "$stubs/bins/vaultctl" << 'EOF'
@@ -105,7 +105,7 @@ const a = process.argv.slice(2);
 fs.appendFileSync(process.env.SHOWCASE_TEST_LOG, `todo-serve ${a.join(" ")}\n`);
 fs.appendFileSync(process.env.SHOWCASE_TEST_PIDS, `web ${process.pid}\n`);
 const port = Number(a[a.indexOf("--port") + 1]);
-http.createServer((q, r) => r.end("<!doctype html>\n")).listen(port, "127.0.0.1");
+http.createServer((q, r) => r.end("<!doctype html>\n")).listen(port, "127.0.0.1", () => console.log("serving"));
 EOF
 
 cat > "$stubs/cargo" << 'EOF'
@@ -350,6 +350,62 @@ t_reset() {
   [ -f "$d/unrelated.txt" ]; check "$n: --reset leaves unrelated files alone" $?
 }
 
+t_reset_refuses_unmarked_dir() {
+  local n=reset_unmarked r b wp rp d
+  r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
+  pickports; d="$tmp/$n/mine"
+  mkdir -p "$d/vault" "$d/web" "$d/logs"; echo keep > "$d/vault/x"; echo keep > "$d/passphrase"
+  chmod 755 "$d"
+  sc $n "$r" "$b" --reset --yes --check --no-build --dir "$d" --web-port "$wp" --relay-port "$rp"
+  { [ "$rc" != 0 ] && [ -f "$d/vault/x" ] && [ -f "$d/passphrase" ] && [ -d "$d/web" ]; }
+  check "$n: --reset refuses a dir the script did not create, deletes nothing" $? "rc=$rc $out"
+  sc $n "$r" "$b" --check --no-build --dir "$d" --web-port "$wp" --relay-port "$rp"
+  { [ "$rc" != 0 ] && [ "$(ls -ld "$d" | cut -c1-10)" = "drwxr-xr-x" ] && [ ! -e "$d/.showcase-dir" ]; }
+  check "$n: a foreign existing dir is refused without --reset too, mode untouched" $? "rc=$rc $out"
+  sc $n "$r" "$b" --check --no-build --dir "$tmp/$n/new" --web-port "$wp" --relay-port "$rp"
+  check "$n: a fresh dir is created" "$rc" "$out"
+  [ "$(ls -ld "$tmp/$n/new" | cut -c1-10)" = "drwx------" ] && [ -f "$tmp/$n/new/.showcase-dir" ]
+  check "$n: created dir is 0700 and marked" $?
+  ln -s "$tmp/$n/new" "$tmp/$n/link"
+  sc $n "$r" "$b" --reset --yes --check --no-build --dir "$tmp/$n/link" --web-port "$wp" --relay-port "$rp"
+  { [ "$rc" != 0 ] && has "symlink" && [ -d "$tmp/$n/new/vault" ]; }; check "$n: a symlinked --dir is refused" $? "rc=$rc $out"
+  sc $n "$r" "$b" --check --no-build --dir "" --web-port "$wp" --relay-port "$rp"
+  [ "$rc" = 2 ]; check "$n: empty --dir is a usage error" $? "rc=$rc $out"
+}
+
+t_reset_refuses_home_and_root() {
+  local n=reset_home r b wp rp h
+  r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
+  pickports; h="$tmp/$n/home"
+  mkdir -p "$h/vault" "$h/web" "$h/logs"; echo keep > "$h/vault/x"; echo keep > "$h/passphrase"
+  touch "$h/.showcase-dir"
+  HOME="$h" sc $n "$r" "$b" --reset --yes --check --no-build --dir "$h" --web-port "$wp" --relay-port "$rp"
+  { [ "$rc" != 0 ] && [ -f "$h/vault/x" ] && [ -f "$h/passphrase" ]; }
+  check "$n: HOME is refused even with a marker file" $? "rc=$rc $out"
+  sc $n "$r" "$b" --reset --yes --check --no-build --dir / --web-port "$wp" --relay-port "$rp"
+  [ "$rc" != 0 ]; check "$n: / is refused" $? "rc=$rc $out"
+  touch "$r/.showcase-dir"
+  sc $n "$r" "$b" --reset --yes --check --no-build --dir "$r" --web-port "$wp" --relay-port "$rp"
+  { [ "$rc" != 0 ] && [ -d "$r/target" ]; }; check "$n: the repository root is refused" $? "rc=$rc $out"
+  ! logged "vault-relay" $n; check "$n: nothing was started" $?
+}
+
+t_busy_port() {
+  local n=busy r b wp rp d lp which
+  r="$(mkrepo $n with-bins)"; b="$(mkbin $n node npm)"
+  pickports; d="$tmp/$n/demo"
+  for which in web relay; do
+    lp="$wp"; [ "$which" = relay ] && lp="$rp"
+    node -e 'require("http").createServer((q,r)=>r.end("foreign\n")).listen(Number(process.argv[1]),"127.0.0.1")' "$lp" &
+    local npid=$!
+    sleep 0.5
+    sc $n "$r" "$b" --check --no-build --dir "$d" --web-port "$wp" --relay-port "$rp"
+    { [ "$rc" != 0 ] && has "already in use" && has "$lp"; }; check "$n: busy $which port refused with a clear message" $? "rc=$rc $out"
+    ! logged "vault-relay" $n; check "$n: nothing was launched ($which busy)" $?
+    kill "$npid" 2> /dev/null; wait "$npid" 2> /dev/null
+  done
+}
+
 # start_interactive <name> <repo> <bin> <args...>: runs the script with a fifo as stdin;
 # sets $spid, $fifo, $outf and keeps fd 4 open to the fifo.
 start_interactive() {
@@ -387,6 +443,7 @@ t_pair() {
   start_interactive $n "$r" "$b" --no-build --dir "$d" --web-port "$wp" --relay-port "$rp"
   wait_for_out "$outf" "Pairing text"; check "$n: banner asks for the pairing text" $? "$(cat "$outf")"
   grep -qF "http://localhost:$wp" "$outf"; check "$n: banner shows the localhost URL" $?
+  grep -qF "y <prompt number>" "$outf"; check "$n: banner explains the prompt number answer" $?
   grep -qi "local demos only" "$outf"; check "$n: banner warns the copy button is for local demos" $?
   printf 'not-a-pairing-text\n' >&4
   wait_for_out "$outf" "vault-pair:v1:"; check "$n: bad text is rejected with the expected prefix" $?
@@ -426,7 +483,7 @@ t_cleanup_signal() {
   pids_dead $n2; check "$n2: the relay is stopped again" $?
 }
 
-for t in help args preflight check_flow reset pair cleanup_signal; do
+for t in help args preflight check_flow reset reset_refuses_unmarked_dir reset_refuses_home_and_root busy_port pair cleanup_signal; do
   want "$t" && "t_$t"
 done
 

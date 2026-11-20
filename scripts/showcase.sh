@@ -42,7 +42,8 @@ Options:
                     without this flag)
   --no-build        reuse the existing cargo and vault-web builds (the page is still
                     built for the chosen ports)
-  --pair TEXT       pair once with this pairing text instead of asking for it
+  --pair TEXT       pair once with this pairing text instead of asking for it (the text
+                    lands in your shell history; prefer the prompt)
   --check           non-interactive: build, create, start, health-check, then exit 0
   -h, --help        show this help
 
@@ -70,7 +71,7 @@ while [ $# -gt 0 ]; do
     -h | --help) usage; exit 0 ;;
     --web-port) need_value "$1" $#; port_arg "$1" "$2"; WEB_PORT="$2"; shift 2 ;;
     --relay-port) need_value "$1" $#; port_arg "$1" "$2"; RELAY_PORT="$2"; shift 2 ;;
-    --dir) need_value "$1" $#; DIR="$2"; shift 2 ;;
+    --dir) need_value "$1" $#; [ -n "$2" ] || usage_error "--dir must not be empty"; DIR="$2"; shift 2 ;;
     --pair) need_value "$1" $#; PAIR="$2"; shift 2 ;;
     --reset) RESET=1; shift ;;
     --yes) YES=1; shift ;;
@@ -104,18 +105,39 @@ stop_pid() {
 }
 # shellcheck disable=SC2329  # run from the traps below
 cleanup() {
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   stop_pid "$WEB_PID"
   stop_pid "$RELAY_PID"
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
-# ---- --reset ----------------------------------------------------------------------------
-# Only the demo's own files are removed, never the whole directory.
+# ---- the demo directory -----------------------------------------------------------------
+# The script only works in a directory it created itself (it holds MARKER). It refuses
+# "/", $HOME, the repository, symlinks, and any existing directory without the marker, so
+# neither --reset nor the later steps can touch the user's own files.
+MARKER=".showcase-dir"
+MARKER_TEXT="vault-showcase-dir v1"
+physical() { (cd "$1" 2> /dev/null && pwd -P); }
+
+if [ -L "$DIR" ]; then die "$DIR is a symlink: refusing to use it"; fi
+if [ -e "$DIR" ]; then
+  [ -d "$DIR" ] || die "$DIR exists and is not a directory"
+  real="$(physical "$DIR")" || die "cannot resolve $DIR"
+  for forbidden in / "$(physical "${HOME:-/nonexistent}")" "$(physical "$repo")"; do
+    [ -n "$forbidden" ] || continue
+    [ "$real" != "$forbidden" ] || die "refusing to use $real as the demo directory"
+  done
+  [ "$(cat "$DIR/$MARKER" 2> /dev/null)" = "$MARKER_TEXT" ] ||
+    die "$DIR was not created by this script (no $MARKER file): use another --dir, or an empty path that does not exist yet"
+else
+  case "$DIR" in / | "$HOME" | "$repo") die "refusing to use $DIR as the demo directory" ;; esac
+fi
+
 if [ "$RESET" = 1 ]; then
-  if [ -e "$DIR/vault" ] || [ -e "$DIR/passphrase" ]; then
+  if [ -e "$DIR/vault" ] || [ -e "$DIR/passphrase" ] || [ -e "$DIR/web" ] || [ -e "$DIR/logs" ]; then
     if [ "$YES" != 1 ]; then
       printf 'Delete the demo vault and passphrase in %s? [y/N] ' "$DIR"
       ans=""
@@ -125,8 +147,8 @@ if [ "$RESET" = 1 ]; then
         *) say; die "not confirmed: nothing was deleted" ;;
       esac
     fi
+    # Only the known entries; the directory and its marker stay.
     rm -rf "$DIR/vault" "$DIR/passphrase" "$DIR/origin" "$DIR/web" "$DIR/logs"
-    rmdir "$DIR" 2> /dev/null || true
     step "demo vault deleted"
   else
     step "nothing to reset in $DIR"
@@ -207,6 +229,18 @@ preflight() {
 }
 preflight
 
+# Both ports must be free before anything is built or started (curl exit 7 = refused).
+port_busy() {
+  local rc=0
+  curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$1/" 2> /dev/null || rc=$?
+  [ "$rc" != 7 ]
+}
+for pp in "$WEB_PORT:--web-port" "$RELAY_PORT:--relay-port"; do
+  if port_busy "${pp%%:*}"; then
+    die "port ${pp%%:*} is already in use by another program: stop it or choose another port with ${pp#*:}"
+  fi
+done
+
 # ---- build ------------------------------------------------------------------------------
 if [ "$NO_BUILD" != 1 ]; then
   step "building vault-relay, vault-dev and vaultctl (release)"
@@ -218,8 +252,12 @@ step "building the to-do example (dev build for the relay at $RELAY_ORIGIN)"
 if [ "$NO_BUILD" != 1 ] || [ ! -d "$repo/examples/todo/node_modules" ]; then
   (cd "$repo/examples/todo" && npm ci) || die "npm ci failed in examples/todo"
 fi
-mkdir -p "$DIR/logs" || die "cannot create $DIR"
-chmod 700 "$DIR" 2> /dev/null || true
+if [ ! -e "$DIR" ]; then
+  mkdir -p "$(dirname "$DIR")" || die "cannot create $(dirname "$DIR")"
+  mkdir -m 700 "$DIR" || die "cannot create $DIR"
+  printf '%s\n' "$MARKER_TEXT" > "$DIR/$MARKER" || die "cannot write $DIR/$MARKER"
+fi
+mkdir -p "$DIR/logs" || die "cannot create $DIR/logs"
 node "$repo/examples/todo/build.mjs" --relay "$RELAY_ORIGIN" --dev --out "$DIR/web" || die "building the page failed"
 
 # ---- demo vault -------------------------------------------------------------------------
@@ -228,7 +266,8 @@ node "$repo/examples/todo/build.mjs" --relay "$RELAY_ORIGIN" --dev --out "$DIR/w
 if [ -e "$DIR/vault" ]; then
   [ -s "$DIR/passphrase" ] || die "$DIR/vault exists but its passphrase file is missing: use --reset to start over"
   bound="$(cat "$DIR/origin" 2> /dev/null || true)"
-  [ -z "$bound" ] || [ "$bound" = "$WEB_ORIGIN" ] || die "the demo vault is bound to $bound; use --web-port to match it, or --reset"
+  [ -n "$bound" ] || die "$DIR/origin is missing: use --reset to start over"
+  [ "$bound" = "$WEB_ORIGIN" ] || die "the demo vault is bound to $bound; use --web-port to match it, or --reset"
   step "using the existing demo vault in $DIR/vault"
 else
   if [ ! -s "$DIR/passphrase" ]; then
@@ -247,7 +286,9 @@ else
 fi
 
 # ---- start the relay and the page server -----------------------------------------------
-wait_for() { # wait_for <name> <pid> <url> <log>
+# A server counts as up only when the process we started is alive, its log says it is
+# listening (so it, and not another program on the port, owns the port), and the URL answers.
+wait_for() { # wait_for <name> <pid> <url> <log> <listening-text>
   local i
   for i in $(seq 1 150); do
     if ! kill -0 "$2" 2> /dev/null; then
@@ -255,10 +296,13 @@ wait_for() { # wait_for <name> <pid> <url> <log>
       tail -n 20 "$4" >&2
       return 1
     fi
-    curl -fsS -o /dev/null --max-time 2 "$3" 2> /dev/null && return 0
+    if grep -q "$5" "$4" 2> /dev/null && curl -fsS -o /dev/null --max-time 2 "$3" 2> /dev/null; then
+      sleep 0.2
+      kill -0 "$2" 2> /dev/null && return 0
+    fi
     sleep 0.2
   done
-  err "$1 did not answer at $3 within 30 s; last lines of $4:"
+  err "$1 did not come up at $3 within 30 s; last lines of $4:"
   tail -n 20 "$4" >&2
   return 1
 }
@@ -270,8 +314,8 @@ step "serving the page on 127.0.0.1:$WEB_PORT (logs: $DIR/logs/web.log)"
 node "$repo/examples/todo/serve.mjs" --port "$WEB_PORT" --dir "$DIR/web" > "$DIR/logs/web.log" 2>&1 < /dev/null &
 WEB_PID=$!
 
-wait_for "the relay" "$RELAY_PID" "http://127.0.0.1:$RELAY_PORT/healthz" "$DIR/logs/relay.log" || exit 1
-wait_for "the page server" "$WEB_PID" "http://127.0.0.1:$WEB_PORT/" "$DIR/logs/web.log" || exit 1
+wait_for "the relay" "$RELAY_PID" "http://127.0.0.1:$RELAY_PORT/healthz" "$DIR/logs/relay.log" "listening" || exit 1
+wait_for "the page server" "$WEB_PID" "http://127.0.0.1:$WEB_PORT/" "$DIR/logs/web.log" "serving" || exit 1
 
 if [ "$CHECK" = 1 ]; then
   step "check ok: the relay answers on /healthz and the page on /"
@@ -285,9 +329,9 @@ cat << EOF
 
   1. Open $WEB_ORIGIN in your browser (use "localhost", not 127.0.0.1).
   2. Click "Connect to vault", then "Copy pairing text".
-  3. Paste the text below. The vault asks you to compare the codes: answer
-     "y <number>" if the number shown in the browser is the same, then click
-     "Codes match" in the page.
+  3. Paste the text below. vault-dev prints a 6-digit code and a prompt number such
+     as [#1]. If the code is the same as the one in the browser, answer
+     "y <prompt number>" (for [#1]: y 1), then click "Codes match" in the page.
 
   The pairing text is valid for about 60 seconds and is a secret while the QR is shown.
   The "Copy pairing text" button exists only in this development build, which is for
