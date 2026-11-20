@@ -10,7 +10,8 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -158,23 +159,51 @@ before(async () => {
     "about:blank",
   ]);
   const dt = await chrome.waitFor(/DevTools listening on (ws:\/\/\S+)/, 30_000, "Chrome's DevTools endpoint");
+  ctx.chromeProc = chrome;
   ctx.cdp = await cdpConnect(dt[1]);
 });
 
+/** Resolves once `p` exited; SIGKILL after `graceMs` if it has not by then. */
+function exited(p, graceMs) {
+  return new Promise((resolve) => {
+    if (p.child.exitCode !== null || p.child.signalCode !== null) return resolve();
+    const timer = setTimeout(() => p.child.kill("SIGKILL"), graceMs);
+    p.child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 after(async () => {
-  ctx.cdp?.close();
+  // Chrome first: ask it to quit over CDP and wait for the process, so it is no
+  // longer writing its profile when the temp dir is removed.
+  if (ctx.cdp) {
+    try {
+      await ctx.cdp.send("Browser.close");
+    } catch (e) {
+      // The connection may drop before Chrome answers; the exit wait decides.
+      console.warn(`browser.test: Browser.close: ${e.message}`);
+    }
+    ctx.cdp.close();
+  }
+  if (ctx.chromeProc) await exited(ctx.chromeProc, 5_000);
   ctx.server?.close();
-  await Promise.all(
-    ctx.procs.map(
-      (p) =>
-        new Promise((r) => {
-          if (p.child.exitCode !== null || p.child.signalCode !== null) return r();
-          p.child.once("exit", r);
-          p.child.kill("SIGKILL");
-        }),
-    ),
-  );
-  for (const d of ctx.dirs) rmSync(d, { recursive: true, force: true, maxRetries: 5 });
+  for (const p of ctx.procs) if (p !== ctx.chromeProc) p.child.kill("SIGKILL");
+  await Promise.all(ctx.procs.map((p) => exited(p, 5_000)));
+  for (const d of ctx.dirs) {
+    try {
+      await rm(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (e) {
+      // A leftover temp dir must not turn a passing run red (or hide a failure),
+      // but say so; anything else is a real error.
+      if (["ENOTEMPTY", "EBUSY", "EPERM"].includes(e.code)) {
+        console.warn(`browser.test: could not remove ${d}: ${e.code}`);
+      } else {
+        throw e;
+      }
+    }
+  }
 });
 
 test("browser_smoke_csp_and_upgrade", T, async () => {
