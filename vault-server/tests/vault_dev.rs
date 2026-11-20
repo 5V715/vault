@@ -364,6 +364,36 @@ async fn approve_persists_put_and_commit() {
     );
 }
 
+/// The Noise key is fresh per run and nothing is stored: an identity file left
+/// by an earlier vault-dev is ignored and left as it is, and none is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn obsolete_identity_file_is_ignored_and_none_created() {
+    let relay = relay().await;
+    let dir = make_dir(PASS).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut keys = Vec::new();
+    for tag in [21, 22] {
+        if tag == 22 {
+            std::fs::write(dir.path().join(".vault-dev-identity"), b"stale").unwrap();
+        }
+        let o = offer(&relay, tag);
+        let mut v = spawn_vault(dir.path(), PASS, &o.text, &tmp.path().join("pw"));
+        let mut b = handshake(&relay, o).await;
+        keys.push(b.noise.remote_static());
+        let _ = b.send(RequestBody::Close).await;
+        let st = v.exit().await;
+        assert!(st.success(), "{st:?}; stderr {}", v.err.lock().unwrap());
+        if tag == 21 {
+            assert!(!dir.path().join(".vault-dev-identity").exists());
+        }
+    }
+    assert_ne!(keys[0], keys[1]);
+    assert_eq!(
+        std::fs::read(dir.path().join(".vault-dev-identity")).unwrap(),
+        b"stale"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn deny_and_eof_end_session_without_persisting() {
     for answer in [Some("n\n"), None] {
@@ -736,7 +766,9 @@ async fn vault_dev_ca_file_must_parse() {
         );
         let st = v.exit().await;
         assert!(!st.success());
+        // The stderr pump thread may not have read everything yet when the child exits.
+        v.wait_err(needle).await;
         let err = v.err.lock().unwrap().clone();
-        assert!(err.contains(needle) && !err.contains("Connected."), "{err}");
+        assert!(!err.contains("Connected."), "{err}");
     }
 }
