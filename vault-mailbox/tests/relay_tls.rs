@@ -370,3 +370,34 @@ async fn tls_handshake_stall_is_cut_inside_the_connection_cap() {
     assert!(matches!(stalled.read(&mut buf).await, Ok(0) | Err(_)));
     let _ = tx.send(());
 }
+
+/// A TLS variable that is set but empty (a typo in a unit file or a compose
+/// `VAULT_RELAY_TLS_CERT=`) is a startup error, never a silent fall back to plain
+/// HTTP; so is an empty `--tls-cert`/`--tls-key` value.
+#[test]
+fn empty_tls_env_is_error() {
+    let pki = make_pki();
+    let cert = pki.path("leaf.pem").display().to_string();
+    let key = pki.path("leaf.key").display().to_string();
+    let mut cases: Vec<(Command, &str)> = Vec::new();
+    for (env, other_env, other) in [(CERT_ENV, KEY_ENV, &key), (KEY_ENV, CERT_ENV, &cert)] {
+        let mut c = relay(&[]);
+        c.env(env, "");
+        cases.push((c, env));
+        let mut c = relay(&[]);
+        c.env(env, "").env(other_env, other);
+        cases.push((c, env));
+    }
+    let mut c = relay(&[]);
+    c.env(CERT_ENV, "").env(KEY_ENV, "");
+    cases.push((c, CERT_ENV));
+    cases.push((relay(&["--tls-cert", "", "--tls-key", &key]), "--tls-cert"));
+    cases.push((relay(&["--tls-cert", &cert, "--tls-key", ""]), "--tls-key"));
+    for (c, needle) in cases {
+        let out = refused(c);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{needle}: {err}");
+        assert!(err.contains(needle), "{needle}: {err}");
+        assert!(err.contains("empty"), "{needle}: {err}");
+    }
+}

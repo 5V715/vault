@@ -70,8 +70,8 @@ docker run -p 127.0.0.1:8080:8080 -e VAULT_RELAY_ALLOW_ORIGIN=https://my-app.exa
   `VAULT_RELAY_TLS_KEY`, for containers) make the relay terminate TLS itself,
   for a LAN or a single host without a reverse proxy. The certificate file is a
   PEM chain (leaf first, intermediates after), the key file PEM (PKCS#8, PKCS#1
-  or SEC1). Both are required together; a missing, mismatched or unparsable pair
-  stops the relay with exit status 2 and a message that never shows key
+  or SEC1). Both are required together; a missing, mismatched or unparsable pair,
+  or a variable that is set but empty, stops the relay with exit status 2 and a message that never shows key
   material. It uses rustls with TLS 1.2 or newer (1.3 preferred), no client
   certificates, and the same connection cap and stall timeout cover the
   handshake. On Unix it warns when the key file is readable by group or others

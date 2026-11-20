@@ -63,10 +63,10 @@ struct Args {
     stall_timeout_s: u64,
     /// PEM certificate chain (leaf first) to serve HTTPS/wss directly. Needs
     /// `--tls-key`; without both, the relay speaks plain HTTP.
-    #[arg(long, value_name = "PEM", env = TLS_CERT_ENV)]
+    #[arg(long, value_name = "PEM", env = TLS_CERT_ENV, value_parser = tls_cert_path)]
     tls_cert: Option<PathBuf>,
     /// PEM private key for `--tls-cert`. Keep it readable by the relay only (0600).
-    #[arg(long, value_name = "PEM", env = TLS_KEY_ENV)]
+    #[arg(long, value_name = "PEM", env = TLS_KEY_ENV, value_parser = tls_key_path)]
     tls_key: Option<PathBuf>,
     /// Take the client address from the first X-Forwarded-For hop (only behind a
     /// reverse proxy that overwrites that header).
@@ -78,15 +78,35 @@ const ALLOW_ORIGIN_ENV: &str = "VAULT_RELAY_ALLOW_ORIGIN";
 const TLS_CERT_ENV: &str = "VAULT_RELAY_TLS_CERT";
 const TLS_KEY_ENV: &str = "VAULT_RELAY_TLS_KEY";
 
+/// A TLS file path from a flag or its environment variable. An empty value (a set
+/// but empty variable, as from `VAULT_RELAY_TLS_CERT=` in a unit or compose file)
+/// is an error: falling back to plain HTTP there would be silent.
+fn tls_path(value: &str, flag: &str, env: &str) -> Result<PathBuf, String> {
+    if value.is_empty() {
+        return Err(format!(
+            "{flag} (or {env}) is set but empty: give the PEM file path, or unset {env} \
+             to serve plain HTTP"
+        ));
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn tls_cert_path(value: &str) -> Result<PathBuf, String> {
+    tls_path(value, "--tls-cert", TLS_CERT_ENV)
+}
+
+fn tls_key_path(value: &str) -> Result<PathBuf, String> {
+    tls_path(value, "--tls-key", TLS_KEY_ENV)
+}
+
 /// Loads the TLS config when `--tls-cert`/`--tls-key` (or their environment
-/// variables) are given; an empty value counts as not given. An error message for
-/// the user otherwise; it never contains key material.
+/// variables) are given (empty values never get here: `tls_path`). An error
+/// message for the user otherwise; it never contains key material.
 fn load_tls(
     cert: &Option<PathBuf>,
     key: &Option<PathBuf>,
 ) -> Result<Option<std::sync::Arc<rustls::ServerConfig>>, String> {
-    let given = |p: &Option<PathBuf>| p.clone().filter(|p| !p.as_os_str().is_empty());
-    let (cert, key) = match (given(cert), given(key)) {
+    let (cert, key) = match (cert.clone(), key.clone()) {
         (None, None) => return Ok(None),
         (Some(c), Some(k)) => (c, k),
         _ => {
