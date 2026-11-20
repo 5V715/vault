@@ -1,0 +1,47 @@
+# Every version here is exact. CI reads `ndk`, `cargoNdk`, `compileSdk` and
+# `buildTools` from this file (.github/actions/android-toolchain), so the NDK the
+# Gradle build asks for and the one CI installs are the same pin.
+[versions]
+# Toolchain and SDK levels (not libraries).
+agp = "9.5.1"
+kotlin = "2.4.21"
+minSdk = "30"
+compileSdk = "37"
+targetSdk = "37"
+buildTools = "36.0.0"
+ndk = "30.0.16248370"
+cargoNdk = "4.1.2"
+jvmTarget = "17"
+
+# Libraries.
+composeBom = "2026.09.00"
+activityCompose = "1.13.0"
+kotlinxCoroutines = "1.11.0"
+# UniFFI's Kotlin runtime; the Android AAR carries libjnidispatch for each ABI.
+jna = "5.19.1"
+junit = "4.13.2"
+androidxTestCore = "1.7.0"
+androidxTestRunner = "1.7.0"
+androidxTestExtJunit = "1.3.0"
+
+[libraries]
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+junit = { module = "junit:junit", version.ref = "junit" }
+androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTestCore" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidxTestRunner" }
+androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidxTestExtJunit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+# :core only. The Android modules use AGP's built-in Kotlin; declaring this
+# plugin at the root also puts KGP `kotlin` on the build classpath, which raises
+# AGP's own KGP dependency to the pinned version.
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
