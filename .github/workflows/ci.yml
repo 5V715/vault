@@ -283,3 +283,110 @@ jobs:
         with:
           name: log-relay-image
           path: logs/relay-image.log
+
+  # Builds Dockerfile.todo-demo (vault-relay --static-dir plus the release to-do
+  # page) for amd64 (loaded and smoke-tested read-only, as non-root, with
+  # PUBLIC_ORIGIN=https://todo.example) and arm64 + arm/v7 (cross-compile only).
+  # Nothing is pushed and no registry is logged in to.
+  todo-demo-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CSP: "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self' wss://todo.example; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: build (amd64) and start read-only as non-root
+        shell: bash
+        run: |
+          set -eo pipefail
+          mkdir -p logs
+          {
+            set -ex
+            docker buildx build -f Dockerfile.todo-demo --progress=plain --platform linux/amd64 --load -t vault-todo-demo:smoke .
+            test "$(docker image inspect vault-todo-demo:smoke --format '{{.Config.User}}')" = 65532:65532
+            docker image inspect vault-todo-demo:smoke --format '{{json .Config.Entrypoint}} {{json .Config.Labels}}'
+            # Without PUBLIC_ORIGIN the image must refuse to start, and say why.
+            set +e
+            docker run --rm --read-only vault-todo-demo:smoke > logs/no-origin.txt 2>&1
+            code=$?
+            set -e
+            cat logs/no-origin.txt
+            test "$code" = 2
+            grep -q 'PUBLIC_ORIGIN' logs/no-origin.txt
+            docker run -d --name smoke --read-only --cap-drop ALL --security-opt no-new-privileges \
+              -p 127.0.0.1:8080:8080 -e PUBLIC_ORIGIN=https://todo.example vault-todo-demo:smoke
+            for _ in $(seq 1 50); do
+              curl -fsS -o /dev/null http://127.0.0.1:8080/healthz && break
+              sleep 0.2
+            done
+            docker logs smoke
+            test "$(docker inspect smoke --format '{{.HostConfig.ReadonlyRootfs}}')" = true
+            # The process runs as 65532, not root.
+            docker top smoke -o uid,comm
+            test "$(docker top smoke -o uid | tail -n +2 | sort -u)" = 65532
+          } 2>&1 | tee logs/todo-demo-image.log
+      - name: image_smoke (page, CSP, config.json, healthz)
+        shell: bash
+        run: |
+          set -eo pipefail
+          {
+            set -ex
+            base=http://127.0.0.1:8080
+            test "$(curl -s -o /dev/null -w '%{http_code}' "$base/healthz")" = 200
+            test "$(curl -s -o page.html -w '%{http_code}' "$base/")" = 200
+            grep -q '<script type="module" src="main.js"></script>' page.html
+            test "$(curl -s -o /dev/null -w '%header{content-security-policy}' "$base/")" = "$CSP"
+            test "$(curl -s -o /dev/null -w '%header{x-content-type-options}' "$base/")" = nosniff
+            test "$(curl -s -o /dev/null -w '%header{cross-origin-opener-policy}' "$base/")" = same-origin
+            test "$(curl -s -o /dev/null -w '%header{content-security-policy}' "$base/main.js")" = "$CSP"
+            test "$(curl -s -o /dev/null -w '%{content_type}' "$base/main.js")" = 'text/javascript; charset=utf-8'
+            test "$(curl -s "$base/config.json")" = '{"relay":"wss://todo.example"}'
+            test "$(curl -s -o /dev/null -w '%{content_type}' "$base/config.json")" = application/json
+            test "$(curl -s -o /dev/null -w '%{http_code}' "$base/.build.json")" = 404
+            test "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$base/../etc/passwd")" = 404
+            test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/")" = 405
+          } 2>&1 | tee -a logs/todo-demo-image.log
+      - name: image_smoke_foreign_origin (mailbox upgrade by Origin)
+        shell: bash
+        run: |
+          set -eo pipefail
+          {
+            set -ex
+            # Status of a WebSocket upgrade of /mailbox/<id> with this Origin (raw
+            # socket: a 101 keeps the connection open, which curl would wait on).
+            upgrade() {
+              python3 - "$1" <<'PY'
+          import socket, sys
+          s = socket.create_connection(("127.0.0.1", 8080), timeout=5)
+          s.sendall((
+              "GET /mailbox/0123456789abcdef0123456789abcdef HTTP/1.1\r\n"
+              "Host: todo.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+              "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+              f"Origin: {sys.argv[1]}\r\n\r\n"
+          ).encode())
+          print(s.recv(64).split(b" ")[1].decode())
+          PY
+            }
+            test "$(upgrade https://evil.example)" = 403
+            test "$(upgrade https://todo.example)" = 101
+            # Still up, still read-only.
+            test "$(docker inspect smoke --format '{{.State.Running}}')" = true
+            docker logs smoke
+            docker rm -f smoke
+          } 2>&1 | tee -a logs/todo-demo-image.log
+      - name: cross-build arm64 and arm/v7
+        shell: bash
+        run: |
+          set -eo pipefail
+          {
+            set -ex
+            docker buildx build -f Dockerfile.todo-demo --progress=plain --platform linux/arm64,linux/arm/v7 --output type=cacheonly .
+          } 2>&1 | tee -a logs/todo-demo-image.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: log-todo-demo-image
+          path: logs/todo-demo-image.log
