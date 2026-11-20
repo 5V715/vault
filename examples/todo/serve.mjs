@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: MIT
 // A tiny static server for the built page (Node built-ins only), for local runs:
 //   node serve.mjs [--dir dist] [--port 8080] [--host 127.0.0.1] [--relay <origin>]
+//                  [--tls-cert cert.pem --tls-key key.pem]
+// With --tls-cert/--tls-key (PEM; both or neither) it serves HTTPS, e.g. for a
+// phone on the LAN (scripts/showcase.sh --lan).
 // Every response carries the page's CSP (connect-src = the ws:/wss: form of the
 // relay origin the build was made for, from dist/.build.json, or --relay) and nosniff. Only
 // regular files with a known type under the directory are served: no listings,
@@ -10,6 +13,7 @@
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { createServer } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,11 +24,11 @@ const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]"]);
 /**
  * `value` as a canonical origin (`https://host[:port]`, `http` only for
  * loopback), or an error. No path, query, fragment or credentials, so it is
- * safe to put into the CSP.
+ * safe to put into the CSP. `what` names the value in the error.
  */
-export function checkRelayOrigin(value) {
+export function checkOrigin(value, what = "origin") {
   const fail = (why) => {
-    throw new Error(`bad relay origin ${JSON.stringify(value)}: ${why}`);
+    throw new Error(`bad ${what} ${JSON.stringify(value)}: ${why}`);
   };
   if (typeof value !== "string" || !/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s;,'"]+$/.test(value)) {
     fail("expected http(s)://host[:port]");
@@ -40,6 +44,21 @@ export function checkRelayOrigin(value) {
   if (u.username || u.password) fail("no credentials");
   if (u.pathname !== "/" || u.search || u.hash || /[?#]/.test(value)) fail("no path, query or fragment");
   return u.origin;
+}
+
+/**
+ * The relay's origin, canonical as for `checkOrigin`. The relay may also be
+ * given in its WebSocket form (`wss://host[:port]`, `ws://` only for loopback):
+ * that is the same relay, and it becomes the `https:`/`http:` origin.
+ */
+export function checkRelayOrigin(value) {
+  const asHttp =
+    typeof value === "string" ? value.replace(/^wss:\/\//i, "https://").replace(/^ws:\/\//i, "http://") : value;
+  try {
+    return checkOrigin(asHttp, "relay origin");
+  } catch (e) {
+    throw new Error(e.message.replace(JSON.stringify(asHttp), JSON.stringify(value)));
+  }
 }
 
 /**
@@ -113,8 +132,11 @@ function resolvePath(root, url) {
   return full;
 }
 
-/** An `http.Server` serving `root` with the page's headers. */
-export function createStaticServer({ root, relayOrigin }) {
+/**
+ * An `http.Server` serving `root` with the page's headers; an `https.Server`
+ * when `tls` (`{ cert, key }`, PEM) is given.
+ */
+export function createStaticServer({ root, relayOrigin, tls }) {
   const realRoot = realpathSync(resolve(root));
   const headers = {
     "Content-Security-Policy": cspFor(relayOrigin),
@@ -139,7 +161,7 @@ export function createStaticServer({ root, relayOrigin }) {
     }
   }
 
-  return createServer(async (req, res) => {
+  const handler = async (req, res) => {
     const send = (status, type, body, extra = {}) => {
       res.writeHead(status, { ...headers, "Content-Type": type, "Content-Length": body.length, ...extra });
       res.end(req.method === "HEAD" ? undefined : body);
@@ -159,11 +181,21 @@ export function createStaticServer({ root, relayOrigin }) {
       if (!res.headersSent) send(500, "text/plain; charset=utf-8", Buffer.from("error\n"));
       else res.destroy();
     }
-  });
+  };
+  return tls
+    ? createHttpsServer({ cert: tls.cert, key: tls.key, minVersion: "TLSv1.2" }, handler)
+    : createServer(handler);
 }
 
 function parseArgs(argv) {
-  const opts = { dir: join(here, "dist"), port: 8080, host: "127.0.0.1", relay: undefined };
+  const opts = {
+    dir: join(here, "dist"),
+    port: 8080,
+    host: "127.0.0.1",
+    relay: undefined,
+    tlsCert: undefined,
+    tlsKey: undefined,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => {
@@ -175,9 +207,14 @@ function parseArgs(argv) {
     else if (a === "--port") opts.port = Number(next());
     else if (a === "--host") opts.host = next();
     else if (a === "--relay") opts.relay = next();
+    else if (a === "--tls-cert") opts.tlsCert = resolve(next());
+    else if (a === "--tls-key") opts.tlsKey = resolve(next());
     else throw new Error(`unknown argument ${a}`);
   }
   if (!Number.isInteger(opts.port) || opts.port < 0 || opts.port > 65535) throw new Error("bad --port");
+  if ((opts.tlsCert === undefined) !== (opts.tlsKey === undefined)) {
+    throw new Error("--tls-cert and --tls-key must be given together");
+  }
   return opts;
 }
 
@@ -197,11 +234,28 @@ function main() {
   if (built && checkRelayOrigin(relay) !== checkRelayOrigin(built)) {
     throw new Error(`--relay ${relay} differs from the build's relay ${built}: rebuild instead`);
   }
-  const server = createStaticServer({ root: opts.dir, relayOrigin: relay });
+  let tls;
+  if (opts.tlsCert !== undefined) {
+    // Read errors name the file only; nothing of its content is printed.
+    const read = (what, path) => {
+      try {
+        return readFileSync(path);
+      } catch (e) {
+        throw new Error(`cannot read the TLS ${what} ${path}: ${e.code ?? "error"}`);
+      }
+    };
+    tls = { cert: read("certificate", opts.tlsCert), key: read("key", opts.tlsKey) };
+  }
+  const server = createStaticServer({ root: opts.dir, relayOrigin: relay, tls });
+  server.on("error", (e) => {
+    console.error(`serve.mjs: ${e.message}`);
+    process.exit(1);
+  });
   server.listen(opts.port, opts.host, () => {
     const { port } = server.address();
     const host = opts.host === "127.0.0.1" ? "localhost" : opts.host;
-    console.log(`serving ${opts.dir} at http://${host}:${port}/ (relay ${checkRelayOrigin(relay)})`);
+    const scheme = tls ? "https" : "http";
+    console.log(`serving ${opts.dir} at ${scheme}://${host}:${port}/ (relay ${checkRelayOrigin(relay)})`);
   });
 }
 

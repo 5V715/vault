@@ -3,10 +3,13 @@
 // and no way out of the served directory.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
+import { get as httpsGet } from "node:https";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 
 import { checkRelayOrigin, cspFor, createStaticServer } from "../serve.mjs";
@@ -16,6 +19,7 @@ const CSP =
   "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; " +
   "connect-src ws://127.0.0.1:8787; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const SECRET = "TOP SECRET OUTSIDE ROOT";
+const serveJs = join(dirname(fileURLToPath(import.meta.url)), "..", "serve.mjs");
 
 const ctx = {};
 
@@ -161,5 +165,72 @@ describe("serve", () => {
     const p = await get("/main.js", "POST");
     assert.equal(p.status, 405);
     assert.equal(p.headers.allow, "GET, HEAD");
+  });
+});
+
+describe("serve over https (--tls-cert/--tls-key)", () => {
+  // A throwaway self-signed certificate for 127.0.0.1 made with the openssl CLI
+  // (as scripts/lan-cert.sh does); never checked in.
+  const tls = {};
+  before(() => {
+    tls.dir = mkdtempSync(join(tmpdir(), "todo-serve-tls-"));
+    const r = spawnSync(
+      "openssl",
+      [
+        "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-keyout", join(tls.dir, "key.pem"), "-out", join(tls.dir, "cert.pem"), "-days", "1",
+        "-subj", "/CN=serve test", "-addext", "subjectAltName=IP:127.0.0.1",
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(r.status, 0, `openssl failed: ${r.error ?? r.stderr}`);
+    tls.cert = readFileSync(join(tls.dir, "cert.pem"));
+    tls.key = readFileSync(join(tls.dir, "key.pem"));
+  });
+  after(() => rmSync(tls.dir, { recursive: true, force: true }));
+
+  test("serves the page with the CSP over TLS", async () => {
+    const root = join(ctx.base, "dist");
+    const relay = "https://127.0.0.1:8787";
+    const server = createStaticServer({ root, relayOrigin: relay, tls: { cert: tls.cert, key: tls.key } });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const { port } = server.address();
+      const r = await new Promise((resolve, reject) => {
+        httpsGet({ host: "127.0.0.1", port, path: "/", ca: tls.cert }, (res) => {
+          let body = "";
+          res.on("data", (d) => (body += d));
+          res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
+        }).on("error", reject);
+      });
+      assert.equal(r.status, 200);
+      assert.equal(r.headers["content-security-policy"], cspFor(relay));
+      assert.match(r.headers["content-security-policy"], /connect-src wss:\/\/127\.0\.0\.1:8787;/);
+      assert.match(r.body, /<title>t<\/title>/);
+      // A client that does not trust the certificate is refused.
+      await assert.rejects(
+        new Promise((resolve, reject) => httpsGet({ host: "127.0.0.1", port, path: "/" }, resolve).on("error", reject)),
+        /self[- ]signed|unable to verify|certificate/i,
+      );
+    } finally {
+      server.close();
+    }
+  });
+
+  test("serve.mjs: --tls-cert and --tls-key go together, files must be readable", () => {
+    const run = (...args) =>
+      spawnSync(process.execPath, [serveJs, "--dir", join(ctx.base, "dist"), "--port", "0", ...args], {
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+    for (const args of [["--tls-cert", join(tls.dir, "cert.pem")], ["--tls-key", join(tls.dir, "key.pem")]]) {
+      const r = run(...args);
+      assert.equal(r.status, 1, r.stderr);
+      assert.match(r.stderr, /--tls-cert and --tls-key must be given together/);
+    }
+    const r = run("--tls-cert", join(tls.dir, "missing.pem"), "--tls-key", join(tls.dir, "key.pem"));
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /cannot read/);
+    assert.ok(!r.stderr.includes("PRIVATE KEY"), r.stderr);
   });
 });
