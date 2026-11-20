@@ -85,6 +85,9 @@ jobs:
         run: /bin/bash scripts/test/install_test.sh
       - name: sign-release.sh tests
         run: /bin/bash scripts/test/sign_release_test.sh
+      # scripts/showcase.sh (macOS runs it under its stock bash 3.2) against stub tools.
+      - name: showcase.sh tests
+        run: /bin/bash scripts/test/showcase_test.sh
 
   # install.ps1 under Windows PowerShell 5.1 and PowerShell 7. Pester is installed from
   # the PowerShell Gallery at a pinned version (the images' inbox Pester 3.4 is too old).
@@ -211,6 +214,12 @@ jobs:
         run: |
           command -v google-chrome || command -v chrome || command -v chromium
           npm run test:browser
+      # The one-command showcase (docs/getting-started.md) on the builds above: creates
+      # a demo vault, starts the relay and the page server, health-checks both, exits.
+      - name: showcase script (--check, reusing the builds)
+        env:
+          VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: scripts/showcase.sh --check --no-build --dir "$RUNNER_TEMP/showcase"
 
   # Builds Dockerfile.relay (cross-compiled with cargo-zigbuild) for amd64 (loaded
   # and smoke-tested) and arm64 + arm/v7 (cross-compile only; no QEMU: every RUN
