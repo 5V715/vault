@@ -112,14 +112,9 @@ beyond what Compose gives for free.
   - A WrongApp result (QR for a different app/origin than any vault on the phone)
     shows "No vault for this app" and offers to create one. Pairing never
     silently creates a vault.
-- **Replication:** targets are stored as records inside the vault's own container
-  (key prefix `vault/replicas/`), so credentials are encrypted at rest and
-  unavailable while locked.
-  - Replication runs after a session ends (and on "replicate now") while the vault
-    is still unlocked, before locking. A WorkManager job only reminds
-    ("replication pending") because it can't unlock by itself. *My call: no
-    background unlock*, since it would need a non-auth-bound key.
-  - "Wi-Fi only" uses the network capability check before starting.
+- **Replication:** see the owner decision below. Background replication runs
+  through WorkManager with the manifest key only, plus immediately after each
+  session. "Wi-Fi only" uses the network capability check before starting.
 - **Network trust:** release builds trust only system CAs. Debug builds also trust
   user CAs, for the LAN showcase. `network_security_config` sets
   `cleartextTrafficPermitted=false` everywhere except loopback in debug.
@@ -228,8 +223,8 @@ beyond what Compose gives for free.
   showcase vault (`https://192.168.x.y:8443`) and a deployed one
   (`https://todo.example`) are separate vaults.
 - **Restore:**
-  - The user types the replica credentials for the first fetch. After the
-    restore they are stored inside the container.
+  - The user types the replica credentials for the first fetch. They are then
+    sealed under the background key.
   - The container is written completely before the Keystore key is created.
   - Cancelling deletes the partial directory.
 - **Rust TLS:** Android's network security config doesn't apply to Rust
@@ -245,10 +240,19 @@ beyond what Compose gives for free.
   to a new phone loses the local vault unless it is restored from a replica with
   the recovery key. The docs say this.
 
-## Open for the owner
+## Owner decisions (2026-11-20, continued)
 
-- **Replication while locked:** see the question in chat. Default in this draft:
-  replicate only while unlocked after a session.
+- **Background replication (option B):**
+  - Replication also runs while the vault is locked, via WorkManager, optionally
+    on Wi-Fi only, whenever the device is unlocked or the job runs.
+  - It uses only the manifest key, which cannot read vault data, plus the replica
+    credentials. Both are sealed with a per-vault background Keystore key
+    (AES-GCM, `setUnlockedDeviceRequired(true)`, no user authentication), the same
+    key class as the high-water file.
+  - Replica credentials therefore live **outside** the container, sealed under
+    this key: the earlier "inside the container" idea is replaced.
+  - Someone who can misuse that key could copy ciphertext and read the replica
+    credentials, but never vault contents.
 
 ## What the builder decides
 
