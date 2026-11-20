@@ -567,7 +567,7 @@ impl VaultServer {
         };
         let responder = {
             let key = fresh_static_key()?;
-            Responder::new(*key, &offer).map_err(|_| ServerError::Handshake)?
+            Responder::from_secret(&key, &offer).map_err(|_| ServerError::Handshake)?
         };
         let url = transport::mailbox_url(&offer)?;
         let tls = self.inner.tls.clone();

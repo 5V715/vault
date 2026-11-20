@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Noise transport (`Noise_XX_25519_ChaChaPoly_SHA256`) between the browser
 //! (initiator, per-session static key shown in the QR) and the vault (responder,
-//! long-term static key), plus the short authentication string.
+//! a fresh random static key per pairing, never pinned: the SAS authenticates
+//! each session), plus the short authentication string.
 //!
 //! Handshake: `Initiator::new` -> msg1 -> `Responder::handle_msg1` -> msg2 ->
 //! `Initiator::handle_msg2` -> msg3 -> `ResponderAwaitingMsg3::handle_msg3`.
@@ -409,11 +410,16 @@ impl core::fmt::Debug for Responder {
 impl Responder {
     /// `offer` is the QR the vault scanned.
     pub fn new(vault_static_secret: [u8; 32], offer: &PairOffer) -> Result<Self> {
-        let secret = Zeroizing::new(vault_static_secret);
+        Self::from_secret(&Zeroizing::new(vault_static_secret), offer)
+    }
+
+    /// Like [`Responder::new`], borrowing the secret: no unzeroized copy of it
+    /// is made.
+    pub fn from_secret(secret: &Zeroizing<[u8; 32]>, offer: &PairOffer) -> Result<Self> {
         Ok(Self {
-            hs: state(&secret, offer, false)?,
+            hs: state(secret, offer, false)?,
             expected_remote: offer.browser_eph_pub,
-            static_public: public_of(&secret),
+            static_public: public_of(secret),
         })
     }
 
