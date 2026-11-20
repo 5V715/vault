@@ -1614,10 +1614,8 @@ async fn observer_sees_approval_and_every_new_manifest() {
         let marks = rec.marks.lock().unwrap();
         assert_eq!(marks.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2]);
     }
-    assert_eq!(
-        *rec.marks.lock().unwrap().last().unwrap(),
-        s.high_water().await.unwrap()
-    );
+    let hw = s.high_water().await.unwrap();
+    assert_eq!(*rec.marks.lock().unwrap().last().unwrap(), hw);
     close(&mut b, h).await;
     // Compaction at session end is a new manifest too.
     let hw = s.high_water().await.unwrap();
