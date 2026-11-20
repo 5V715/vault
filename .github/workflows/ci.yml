@@ -222,6 +222,17 @@ jobs:
         run: |
           command -v google-chrome || command -v chrome || command -v chromium
           npm run test:browser
+      # Image mode (the vault-todo-demo page): the --runtime-config build served by
+      # vault-relay --static-dir in headless Chrome, header CSP only, /config.json;
+      # vault-dev pairs with the text decoded from the page's QR (rqrr), an item is
+      # added, the page locks and pairs again, and the item is still there.
+      - name: image mode browser e2e (runtime config, static dir, vault-dev)
+        working-directory: examples/todo
+        env:
+          VAULT_BIN_DIR: ${{ github.workspace }}/target/debug
+        run: |
+          cargo build --locked -p vault-web --example qr_decode
+          npm run test:image
       # The one-command showcase (docs/getting-started.md) on the builds above: creates
       # a demo vault, starts the relay and the page server, health-checks both, exits.
       - name: showcase script (--check, reusing the builds)
