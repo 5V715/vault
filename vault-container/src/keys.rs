@@ -86,6 +86,33 @@ impl Crk {
         Self(random_key(rng))
     }
 
+    /// Rebuilds a CRK from its 32 raw bytes, e.g. just unwrapped from a device
+    /// keystore. The bytes are copied into zeroizing memory; the caller wipes
+    /// its own buffer.
+    #[cfg(feature = "raw-key-access")]
+    pub fn from_bytes(bytes: &[u8; KEY_LEN]) -> Self {
+        Self(Zeroizing::new(*bytes))
+    }
+
+    /// As [`Crk::from_bytes`] for a slice; anything but 32 bytes is
+    /// [`Error::Crypto`].
+    #[cfg(feature = "raw-key-access")]
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let mut k = Zeroizing::new([0u8; KEY_LEN]);
+        if bytes.len() != KEY_LEN {
+            return Err(Error::Crypto);
+        }
+        k.copy_from_slice(bytes);
+        Ok(Self(k))
+    }
+
+    /// A zeroizing copy of the raw key, for wrapping it under a device key
+    /// (the Android Keystore). Every copy is a secret: wrap it and drop it.
+    #[cfg(feature = "raw-key-access")]
+    pub fn to_bytes(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(*self.0)
+    }
+
     /// Derives the subkeys via HKDF-SHA256.
     pub fn subkeys(&self) -> Subkeys {
         Subkeys {
@@ -353,6 +380,21 @@ mod tests {
         let shown = rk.to_display();
         let messy = format!("\t{}\n", shown.replace('-', "\u{a0}"));
         assert_eq!(RecoveryKey::parse(&messy).unwrap().to_display(), shown);
+    }
+
+    #[cfg(feature = "raw-key-access")]
+    #[test]
+    fn crk_raw_bytes_roundtrip() {
+        let crk = Crk::generate_with(&mut rng(7));
+        let bytes = crk.to_bytes();
+        let back = Crk::from_bytes(&bytes);
+        assert_eq!(crk.subkeys().manifest[..], back.subkeys().manifest[..]);
+        assert_eq!(back.to_bytes()[..], bytes[..]);
+        assert_eq!(format!("{back:?}"), "Crk(<redacted>)");
+        assert!(Crk::from_slice(&bytes[..31]).is_err());
+        assert!(Crk::from_slice(&[0u8; 33]).is_err());
+        let s = Crk::from_slice(&bytes[..]).unwrap();
+        assert_eq!(s.to_bytes()[..], bytes[..]);
     }
 
     fn kat_crk() -> Crk {

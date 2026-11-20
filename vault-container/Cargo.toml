@@ -9,6 +9,9 @@ rust-version.workspace = true
 default = ["cli"]
 # The `vaultctl` command-line tool; embedders (Android) build with `default-features = false`.
 cli = ["dep:clap", "dep:rpassword", "dep:qrcode", "dep:argon2"]
+# `Crk::from_bytes` / `Crk::to_bytes`: the raw root key, for hosts that wrap it
+# under a device key (vault-ffi: the Android Keystore). Nothing else needs it.
+raw-key-access = []
 
 [[bin]]
 name = "vaultctl"
