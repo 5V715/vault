@@ -48,4 +48,18 @@ describe("build.mjs arguments", () => {
     }
     assert.throws(() => parseArgs(["--relay", "https://relay.example", "--page-origin"]), /needs a value/);
   });
+
+  test("--runtime-config: the relay comes from /config.json at run time (the image)", () => {
+    const o = parseArgs(["--runtime-config"]);
+    assert.equal(o.runtimeConfig, true);
+    assert.equal(o.relay, undefined);
+    assert.equal(o.dev, false);
+    assert.equal(parseArgs(["--relay", "http://127.0.0.1:8787"]).runtimeConfig, false, "baked-in builds unchanged");
+    assert.throws(() => parseArgs(["--runtime-config", "--relay", "wss://relay.example"]), /either --relay or --runtime-config/);
+    assert.throws(
+      () => parseArgs(["--runtime-config", "--page-origin", "https://todo.example"]),
+      /--page-origin/,
+    );
+    assert.throws(() => parseArgs([]), /--relay <origin> or --runtime-config/);
+  });
 });

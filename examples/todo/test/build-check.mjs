@@ -46,7 +46,7 @@ async function main() {
       assert.ok(!relJs.includes(devOnly), `release bundle contains dev-only ${JSON.stringify(devOnly)}`);
       assert.ok(devJs.includes(devOnly), `dev bundle lacks ${JSON.stringify(devOnly)}`);
     }
-    assert.ok(!/__DEV__|__RELAY_ORIGIN__/.test(relJs), "defines replaced");
+    assert.ok(!/__DEV__|__RELAY_ORIGIN__|__RUNTIME_CONFIG__/.test(relJs), "defines replaced");
     assert.ok(!/\binnerHTML\b|\bouterHTML\b|insertAdjacentHTML|document\.write/.test(relJs), "no HTML sinks in the bundle");
 
     const html = readFileSync(join(rel, "index.html"), "utf8");
@@ -64,6 +64,26 @@ async function main() {
     assert.ok(devHtml.includes("connect-src ws://127.0.0.1:8787;"));
     assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(html), "no inline script");
     assert.ok(!/<style\b|\sstyle=|\son[a-z]+=/i.test(html), "no inline style or handlers");
+
+    // --runtime-config (the image): no relay compiled in, /config.json read at
+    // start, no <meta> CSP (vault-relay sends the header).
+    const rt = join(base, "runtime");
+    await build(parseArgs(["--runtime-config", "--out", rt]));
+    assert.deepEqual(readdirSync(rt).sort(), [".build.json", "index.html", "main.js", "styles.css"]);
+    assert.deepEqual(JSON.parse(readFileSync(join(rt, ".build.json"), "utf8")), {
+      relayOrigin: null,
+      runtimeConfig: true,
+      dev: false,
+    });
+    const rtJs = readFileSync(join(rt, "main.js"), "utf8");
+    assert.ok(!/__DEV__|__RELAY_ORIGIN__|__RUNTIME_CONFIG__/.test(rtJs), "defines replaced");
+    assert.ok(rtJs.includes('"/config.json"'), "reads /config.json");
+    assert.ok(!relJs.includes("/config.json"), "baked-in builds do not fetch /config.json");
+    assert.ok(!/relay\.example|127\.0\.0\.1:8787/.test(rtJs), "no relay compiled in");
+    assert.ok(!rtJs.includes("clipboard"), "release: no clipboard");
+    const rtHtml = readFileSync(join(rt, "index.html"), "utf8");
+    assert.ok(!/Content-Security-Policy|__CSP__/.test(rtHtml), "no meta CSP in a runtime-config build");
+    assert.ok(rtHtml.includes('<script type="module" src="main.js"></script>'));
     console.log(`build-check: ok (release main.js ${relJs.length} bytes, dev ${devJs.length} bytes)`);
   } finally {
     rmSync(base, { recursive: true, force: true });

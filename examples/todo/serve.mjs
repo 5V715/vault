@@ -224,10 +224,18 @@ function main() {
     throw new Error(`${opts.dir} is not a directory: build first (npm run build:dev)`);
   }
   let built;
+  let info;
   try {
-    built = JSON.parse(readFileSync(join(opts.dir, ".build.json"), "utf8")).relayOrigin;
+    info = JSON.parse(readFileSync(join(opts.dir, ".build.json"), "utf8"));
+    built = info.relayOrigin ?? undefined;
   } catch {
     built = undefined;
+  }
+  if (info?.runtimeConfig) {
+    throw new Error(
+      `${opts.dir} is a --runtime-config build (it reads /config.json): serve it with ` +
+        "vault-relay --static-dir (docs/deploy-todo-demo.md), or rebuild with --relay",
+    );
   }
   const relay = opts.relay ?? built;
   if (!relay) throw new Error("no relay origin: build with build.mjs --relay <origin>, or pass --relay");
