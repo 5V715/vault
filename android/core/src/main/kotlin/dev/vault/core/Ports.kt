@@ -2,8 +2,8 @@
 package dev.vault.core
 
 /**
- * The vaults on this phone: one directory per [VaultIdentity] under
- * `noBackupFilesDir/vaults/<directoryName>/` (the app implements it; tests fake it).
+ * The vaults on this phone, one per [VaultIdentity] (the app keeps each under
+ * `noBackupFilesDir/vaults/<random id>/` with its identity sealed; tests fake it).
  */
 interface VaultRepository {
     fun list(): List<VaultIdentity>

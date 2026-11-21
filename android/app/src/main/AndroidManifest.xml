@@ -7,7 +7,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- The screen-lock prompt that unwraps each vault's key (BiometricPrompt). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
     <application
+        android:name=".VaultApp"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="@string/app_name"
@@ -17,8 +21,11 @@
         android:usesCleartextTraffic="false"
         tools:targetApi="31">
 
+        <!-- configChanges: a running create or restore lives in this activity's
+             composition; rotating must not cancel it (and wipe what it wrote). -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

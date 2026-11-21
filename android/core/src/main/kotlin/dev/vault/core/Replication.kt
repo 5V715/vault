@@ -26,7 +26,7 @@ sealed interface ReplicaOutcome {
     /** The replica holds a newer, forked or foreign state. Nothing was written. */
     data class Diverged(val replicaSeq: Long?, val primarySeq: Long) : ReplicaOutcome
 
-    /** The local vault took the replica's state; [rollback]: the replica had been rolled back first. */
+    /** A diverged replica was overwritten after the user confirmed; [rollback]: it had been rolled back. */
     data class Adopted(val seq: Long, val rollback: Boolean) : ReplicaOutcome
 
     data class Failed(val error: String) : ReplicaOutcome
@@ -115,7 +115,7 @@ object ReplicationPolicy {
                     "Replica $id had been rolled back (found ${o.foundSeq ?: "nothing"}, expected ${o.lastSeenSeq}); " +
                         "it was repaired to ${o.seq}."
                 is ReplicaOutcome.Adopted ->
-                    if (o.rollback) "Replica $id had been rolled back before its state was adopted." else null
+                    if (o.rollback) "Replica $id had been rolled back before it was overwritten." else null
                 else -> null
             }
         }

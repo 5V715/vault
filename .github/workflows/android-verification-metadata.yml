@@ -47,7 +47,7 @@ jobs:
         working-directory: android
         run: >-
           ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256
-          :core:test testDebugUnitTest lint assembleDebug assembleRelease :ffi:assembleDebugAndroidTest
+          :core:test testDebugUnitTest lint assembleDebug assembleRelease :ffi:assembleDebugAndroidTest :app:assembleDebugAndroidTest
           :app:dependencies
       - name: enable KVM
         run: |
@@ -61,7 +61,7 @@ jobs:
         working-directory: android
         run: >-
           ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256
-          -Pvault.abis=x86_64 :ffi:assembleDebug :ffi:assembleDebugAndroidTest
+          -Pvault.abis=x86_64 :ffi:assembleDebug :ffi:assembleDebugAndroidTest :app:assembleDebugAndroidTest
       # Same as ci.yml's emulator job: the runner's free disk is below what the
       # emulator's userdata partition needs unless unused toolchains are removed.
       - name: free disk space for the emulator
@@ -83,7 +83,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           working-directory: android
-          script: ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest
+          script: ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest :app:connectedDebugAndroidTest
       - name: summary
         run: |
           f=android/gradle/verification-metadata.xml

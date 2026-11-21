@@ -102,7 +102,7 @@ jobs:
       - name: JVM tests, lint, debug and unsigned release APKs, FFI test APK
         run: >-
           android/ci/gradle.sh --stacktrace
-          :core:test testDebugUnitTest lint assembleDebug assembleRelease :ffi:assembleDebugAndroidTest
+          :core:test testDebugUnitTest lint assembleDebug assembleRelease :ffi:assembleDebugAndroidTest :app:assembleDebugAndroidTest
       - name: no Google Play Services or Firebase in the app
         shell: bash
         run: |
@@ -165,8 +165,8 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: build the FFI test APK (x86_64 only)
-        run: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:assembleDebugAndroidTest
+      - name: build the test APKs (x86_64 only)
+        run: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:assembleDebugAndroidTest :app:assembleDebugAndroidTest
       # The API 36 image needs about 7.4 GB for its userdata partition at the
       # default size; the runner had 5.4 GB left. The Rust target dir is not
       # needed any more (cargoNdk's outputs are in android/ffi/build and stay
@@ -191,7 +191,7 @@ jobs:
           disable-animations: true
           # One line: the action runs each script line as its own shell command.
           # On failure the script prints the failed tests' stack traces and logcat.
-          script: android/ci/connected-test.sh -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest
+          script: android/ci/connected-test.sh -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest :app:connectedDebugAndroidTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

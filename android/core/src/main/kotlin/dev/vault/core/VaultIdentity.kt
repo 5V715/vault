@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 package dev.vault.core
 
-import java.security.MessageDigest
-
 /** A checked value: [Valid] or [Invalid] with a reason to show the user. */
 sealed interface Checked<out T> {
     data class Valid<T>(val value: T) : Checked<T>
@@ -20,20 +18,6 @@ sealed interface Checked<out T> {
  * through [of].
  */
 class VaultIdentity private constructor(val appId: String, val origin: String) {
-    /**
-     * The vault's directory under `noBackupFilesDir/vaults/`: 32 hex characters
-     * of SHA-256 over the pair, so one identity maps to one directory and no
-     * browser-supplied text ends up in a path.
-     */
-    val directoryName: String by lazy {
-        val d = MessageDigest.getInstance("SHA-256")
-        d.update("vault/identity/v1\u0000".toByteArray(Charsets.US_ASCII))
-        d.update(appId.toByteArray(Charsets.US_ASCII))
-        d.update(0)
-        d.update(origin.toByteArray(Charsets.US_ASCII))
-        d.digest().copyOf(16).joinToString("") { "%02x".format(it) }
-    }
-
     override fun equals(other: Any?): Boolean =
         other is VaultIdentity && other.appId == appId && other.origin == origin
 

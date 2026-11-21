@@ -39,19 +39,13 @@ class VaultIdentityTest {
         val b = VaultIdentity.of("todo", "https://todo.example")
         assertEquals(b, a)
         assertEquals("https://todo.example", (a as Checked.Valid).value.origin)
-        assertEquals(
-            (a.value).directoryName,
-            (b as Checked.Valid).value.directoryName,
-        )
+        b as Checked.Valid
         // The LAN showcase and the deployed demo are separate vaults.
         val lan = VaultIdentity.of("todo", "https://192.168.1.20:8443") as Checked.Valid
         assertNotEquals(lan.value, b.value)
-        assertNotEquals(lan.value.directoryName, b.value.directoryName)
         // A different app on the same origin is a different vault too.
         val other = VaultIdentity.of("notes", "https://todo.example") as Checked.Valid
-        assertNotEquals(other.value.directoryName, b.value.directoryName)
-        // Directory names are fixed-length lower-case hex (safe as a path segment).
-        assertTrue(Regex("^[0-9a-f]{32}$").matches(b.value.directoryName))
+        assertNotEquals(other.value, b.value)
     }
 
     @Test

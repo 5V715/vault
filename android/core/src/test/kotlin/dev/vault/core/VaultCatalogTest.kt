@@ -8,11 +8,11 @@ import org.junit.Test
 
 class VaultCatalogTest {
     private class FakeRepository : VaultRepository {
-        val dirs = linkedMapOf<String, VaultIdentity>()
+        val dirs = mutableListOf<VaultIdentity>()
 
-        override fun list(): List<VaultIdentity> = dirs.values.toList()
+        override fun list(): List<VaultIdentity> = dirs.toList()
 
-        override fun exists(identity: VaultIdentity): Boolean = identity.directoryName in dirs
+        override fun exists(identity: VaultIdentity): Boolean = identity in dirs
     }
 
     private fun id(app: String, origin: String) = (VaultIdentity.of(app, origin) as Checked.Valid).value
@@ -21,7 +21,7 @@ class VaultCatalogTest {
     fun an_offer_finds_its_vault_by_exact_identity() {
         val repo = FakeRepository()
         val todo = id("todo", "https://todo.example")
-        repo.dirs[todo.directoryName] = todo
+        repo.dirs += todo
         val catalog = VaultCatalog(repo)
 
         assertEquals(todo, catalog.vaultFor(Offer("todo", "https://todo.example", "relay.example")))
@@ -38,8 +38,8 @@ class VaultCatalogTest {
         val repo = FakeRepository()
         val b = id("todo", "https://todo.example")
         val a = id("signal-web", "https://signal.example")
-        repo.dirs[b.directoryName] = b
-        repo.dirs[a.directoryName] = a
+        repo.dirs += b
+        repo.dirs += a
         val catalog = VaultCatalog(repo)
         assertEquals(listOf(a, b), catalog.list())
 
