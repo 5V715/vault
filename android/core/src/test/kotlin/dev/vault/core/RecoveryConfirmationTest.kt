@@ -30,6 +30,11 @@ class RecoveryConfirmationTest {
         assertFalse(c.check(right.take(3)))
         assertFalse(c.check(right.reversed()))
         assertFalse(c.check(right.map { "" }))
+        // ASCII only, like the Rust parser: dotless ı (U+0131) is not I.
+        val withI = (0 until 50).map { RecoveryConfirmation.start(key, Random(it))!! }
+            .first { cc -> cc.indices.any { 'I' in groups[it] } }
+        assertFalse(withI.check(withI.indices.map { groups[it].replace('I', '\u0131') }))
+        assertTrue(withI.check(withI.indices.map { groups[it].replace('I', 'i') }))
 
         // Different randomness picks different groups (not always the same four).
         val picks = (0 until 50).map { RecoveryConfirmation.start(key, Random(it))!!.indices }.toSet()

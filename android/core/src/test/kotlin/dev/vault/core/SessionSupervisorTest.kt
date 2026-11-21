@@ -19,11 +19,11 @@ class SessionSupervisorTest {
         s.onSessionActive(b, 2)
         // vault-server ends an idle session; that vault locks (drops its CRK), the
         // other keeps serving, so the service stays.
-        assertEquals(listOf(Action.Lock(a)), s.onSessionEnded(a, 1, EndReason.IdleTimeout))
+        assertEquals(listOf(Action.Lock(a)), s.onSessionEnded(a, 1))
         // The last session ending locks and stops the service.
-        assertEquals(listOf(Action.Lock(b), Action.StopService), s.onSessionEnded(b, 2, EndReason.IdleTimeout))
+        assertEquals(listOf(Action.Lock(b), Action.StopService), s.onSessionEnded(b, 2))
         // The end that the lock itself causes is a no-op.
-        assertEquals(emptyList<Action>(), s.onSessionEnded(b, 2, EndReason.Locked))
+        assertEquals(emptyList<Action>(), s.onSessionEnded(b, 2))
 
         // The idle timeout handed to vault-server (FactoryConfig.idleTimeoutSecs).
         assertEquals(15L * 60, LockSettings().idleTimeoutSecs)
@@ -36,12 +36,15 @@ class SessionSupervisorTest {
     @Test
     fun any_session_end_locks_its_vault() {
         // An unlocked vault without a session would keep its CRK in memory.
-        for (reason in EndReason.entries.filter { it != EndReason.Locked }) {
-            val s = SessionSupervisor { LockSettings() }
-            s.onPairingStarted(a)
-            s.onSessionActive(a, 1)
-            assertEquals(reason.name, listOf(Action.Lock(a), Action.StopService), s.onSessionEnded(a, 1, reason))
-        }
+        val one = SessionSupervisor { LockSettings() }
+        one.onPairingStarted(a)
+        one.onSessionActive(a, 1)
+        // A stale session id changes nothing.
+        assertEquals(emptyList<Action>(), one.onSessionEnded(a, 99))
+        assertEquals(listOf(Action.Lock(a), Action.StopService), one.onSessionEnded(a, 1))
+        // A late SessionActive after a stop leaves no ghost entry.
+        one.onSessionActive(a, 2)
+        assertTrue(one.isIdle)
         // A pairing that never became active: no session, nothing unlocked, but
         // the service started at scan time must stop.
         val s = SessionSupervisor { LockSettings() }
@@ -84,5 +87,7 @@ class SessionSupervisorTest {
             s.onStop(),
         )
         assertTrue(s.isIdle)
+        // Stop is the kill switch: it stops the service even when nothing is tracked.
+        assertEquals(listOf(Action.StopService), s.onStop())
     }
 }

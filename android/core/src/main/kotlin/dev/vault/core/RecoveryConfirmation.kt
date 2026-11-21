@@ -52,7 +52,9 @@ class RecoveryConfirmation private constructor(
                     c == '0' -> append('O')
                     c == '1' -> append('I')
                     c == '8' -> append('B')
-                    else -> append(c.uppercaseChar())
+                    // ASCII only, like the Rust parser: no Unicode case folding (ı → I).
+                    c in 'a'..'z' -> append(c - 32)
+                    else -> append(c)
                 }
             }
         }

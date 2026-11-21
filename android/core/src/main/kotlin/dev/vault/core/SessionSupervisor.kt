@@ -53,8 +53,9 @@ class SessionSupervisor(private val settings: () -> LockSettings) {
         if (vaultId !in vaults) vaults[vaultId] = null
     }
 
+    /** A session became active; ignored for a vault that is not pairing (already stopped). */
     fun onSessionActive(vaultId: String, sessionId: Long): List<Action> {
-        vaults[vaultId] = sessionId
+        if (vaultId in vaults) vaults[vaultId] = sessionId
         return emptyList()
     }
 
@@ -65,7 +66,7 @@ class SessionSupervisor(private val settings: () -> LockSettings) {
         return listOf(Action.Lock(vaultId)) + stopIfIdle()
     }
 
-    fun onSessionEnded(vaultId: String, sessionId: Long, @Suppress("UNUSED_PARAMETER") reason: EndReason): List<Action> {
+    fun onSessionEnded(vaultId: String, sessionId: Long): List<Action> {
         if (vaults[vaultId] != sessionId) return emptyList()
         vaults.remove(vaultId)
         return listOf(Action.Lock(vaultId)) + stopIfIdle()
@@ -78,8 +79,11 @@ class SessionSupervisor(private val settings: () -> LockSettings) {
             vaults.filterValues { it == null }.keys.map { Action.DenyPending(it) }
         }
 
-    /** The notification's Stop action. */
-    fun onStop(): List<Action> = stopAll()
+    /**
+     * The notification's Stop action: the user's kill switch, so it always stops
+     * the service, even if this supervisor believes nothing runs.
+     */
+    fun onStop(): List<Action> = stopAll().ifEmpty { listOf(Action.StopService) }
 
     private fun stopAll(): List<Action> {
         if (vaults.isEmpty()) return emptyList()
