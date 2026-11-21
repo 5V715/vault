@@ -54,13 +54,26 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # Same as ci.yml's emulator job: the runner's free disk is below what the
+      # emulator's userdata partition needs unless unused toolchains are removed.
+      - name: free disk space for the emulator
+        run: |
+          df -h / "$HOME"
+          rm -rf target
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/system-images/android-2*
+          df -h / "$HOME"
       - name: add the instrumented-test artifacts (emulator, API 30)
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 30
           arch: x86_64
           target: google_apis
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          cores: 4
+          ram-size: 4096M
+          disk-size: 4096M
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           working-directory: android
           script: ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest
