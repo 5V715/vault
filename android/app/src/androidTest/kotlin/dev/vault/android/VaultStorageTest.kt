@@ -117,7 +117,7 @@ class VaultStorageTest {
             assertEquals(KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT, info.purposes)
             assertArrayEquals(arrayOf(KeyProperties.BLOCK_MODE_GCM), info.blockModes)
             assertTrue(info.isUserAuthenticationRequired)
-            if (Build.VERSION.SDK_INT >= 31) assertTrue(info.isUnlockedDeviceRequired)
+            if (Build.VERSION.SDK_INT >= 37) assertTrue(info.isUnlockedDeviceRequired) // getter added in API 37 (missing on 36, CI run 44942366695)
             // Timeout 0: every use needs its own prompt with a CryptoObject.
             assertEquals(0, info.userAuthenticationValidityDurationSeconds)
             assertEquals(
@@ -151,9 +151,9 @@ class VaultStorageTest {
             assertEquals(256, info.keySize)
             assertArrayEquals(arrayOf(KeyProperties.BLOCK_MODE_GCM), info.blockModes)
             // No user authentication: replication and the high-water mark need it
-            // while the vault is locked; only an unlocked device (checked on API 31+).
+            // while the vault is locked; only an unlocked device (checked on API 37+).
             assertFalse(info.isUserAuthenticationRequired)
-            if (Build.VERSION.SDK_INT >= 31) assertTrue(info.isUnlockedDeviceRequired)
+            if (Build.VERSION.SDK_INT >= 37) assertTrue(info.isUnlockedDeviceRequired) // getter added in API 37 (missing on 36, CI run 44942366695)
 
             val secret = ByteArray(32) { it.toByte() }
             val sealed = keys.sealBackground(id, VaultDir.KIND_MANIFEST_KEY, secret.copyOf())
