@@ -162,23 +162,40 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: build the FFI test APK (x86_64 only)
         run: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:assembleDebugAndroidTest
+      # The API 36 image needs about 7.4 GB for its userdata partition at the
+      # default size; the runner had 5.4 GB left. The Rust target dir is not
+      # needed any more (cargoNdk's outputs are in android/ffi/build and stay
+      # up to date), nor are toolchains this job never uses.
+      - name: free disk space for the emulator
+        run: |
+          df -h / "$HOME"
+          rm -rf target
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/system-images/android-2*
+          df -h / "$HOME"
       - uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
           target: google_apis
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          cores: 4
+          ram-size: 4096M
+          disk-size: 4096M
+          emulator-boot-timeout: 900
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           # One line: the action runs each script line as its own shell command.
-          script: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest
+          # On failure the script prints the failed tests' stack traces and logcat.
+          script: android/ci/connected-test.sh -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: android-emulator-${{ matrix.api-level }}-reports
           path: |
-            android/ffi/build/reports/androidTests/
-            android/ffi/build/outputs/androidTest-results/
-          if-no-files-found: ignore
+            android/**/build/reports/androidTests/**
+            android/**/build/outputs/androidTest-results/**
+            android/build/connected-logcat.txt
+          if-no-files-found: warn
 
   # The three shipped binaries (vaultctl, vault-dev, vault-relay) on the other
   # desktop platforms. Linux is covered by the `rust` job above.
