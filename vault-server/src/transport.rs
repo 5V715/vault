@@ -245,9 +245,20 @@ impl Channel {
         }
     }
 
-    /// Send a close frame (best effort) and drop the connection.
+    /// End the connection cleanly: send the close frame, then read and discard
+    /// whatever the peer still sends until its own close (or EOF), so no unread
+    /// data is left in the TCP receive buffer. Dropping a socket with unread data
+    /// makes Windows send an RST, which can discard a final notice still in flight
+    /// to the peer. The whole shutdown is capped by `CLOSE_TIMEOUT`, so a peer that
+    /// never answers cannot hold the task.
     pub(crate) async fn close(mut self) {
-        let _ = tokio::time::timeout(CLOSE_TIMEOUT, self.ws.close(None)).await;
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+            if self.ws.close(None).await.is_err() {
+                return;
+            }
+            while let Some(Ok(_)) = self.ws.next().await {}
+        })
+        .await;
     }
 }
 

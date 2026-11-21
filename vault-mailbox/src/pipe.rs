@@ -229,7 +229,9 @@ pub(crate) async fn run(
                 Waited::End(code, reason) => {
                     // Release the id first so a joiner cannot pair with a dead waiter.
                     drop(slot);
-                    close_ws(&mut ws, code, reason).await;
+                    let deadline = tokio::time::Instant::now() + CLOSE_SEND_TIMEOUT;
+                    close_ws(&mut ws, code, reason, deadline).await;
+                    drain(&mut ws, deadline).await;
                     tracing::debug!(mailbox = %tag, "mailbox ended unpaired");
                     return;
                 }
@@ -328,7 +330,10 @@ pub(crate) async fn run(
         Fin::Peer(code, reason) => (code, reason),
     };
     drop(tx);
-    close_ws(&mut sink, code, reason).await;
+    // One cap for the whole shutdown: close frame, then drain the client.
+    let deadline = tokio::time::Instant::now() + CLOSE_SEND_TIMEOUT;
+    close_ws(&mut sink, code, reason, deadline).await;
+    drain(&mut stream, deadline).await;
     tracing::debug!(
         mailbox = %tag,
         bytes_in = bytes_in.load(Ordering::Relaxed),
@@ -337,13 +342,30 @@ pub(crate) async fn run(
     );
 }
 
-async fn close_ws<S>(ws: &mut S, code: CloseCode, reason: &'static str)
-where
+async fn close_ws<S>(
+    ws: &mut S,
+    code: CloseCode,
+    reason: &'static str,
+    deadline: tokio::time::Instant,
+) where
     S: futures_util::Sink<Message> + Unpin,
 {
     let frame = Message::Close(Some(CloseFrame {
         code,
         reason: reason.into(),
     }));
-    let _ = tokio::time::timeout(CLOSE_SEND_TIMEOUT, ws.send(frame)).await;
+    let _ = tokio::time::timeout_at(deadline, ws.send(frame)).await;
+}
+
+/// Read and discard what the client still sends until its close, EOF or the
+/// deadline. Dropping a socket with unread data makes Windows send an RST, which
+/// can discard frames (the final notice) still in flight to the client.
+async fn drain<S>(ws: &mut S, deadline: tokio::time::Instant)
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let _ = tokio::time::timeout_at(deadline, async {
+        while let Some(Ok(_)) = ws.next().await {}
+    })
+    .await;
 }

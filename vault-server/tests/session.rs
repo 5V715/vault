@@ -1001,21 +1001,11 @@ async fn ping_is_answered_in_every_state() {
     assert_eq!(expect_response(&mut b, open).await, ResponseBody::Approved);
     assert_eq!(b.call(RequestBody::Ping).await, ResponseBody::Ok);
     // Pings keep the connection alive but do not count as activity.
-    let started = tokio::time::Instant::now();
     let ended_idle = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match b.call_any(RequestBody::Ping).await {
                 Some(VaultMessage::Response(r)) => assert_eq!(r.body, ResponseBody::Ok),
                 Some(VaultMessage::Notice(n)) => return Some(n),
-                // The pings straddle the idle deadline, so one is sent just as the vault
-                // ends the session and closes. On Windows, data sent to a connection that
-                // is being closed makes the peer reset it, and a reset discards what the
-                // client has not read yet, i.e. the notice (CI run 44560647812). The close
-                // must still not come before the idle timeout, and the vault's own end
-                // reason is asserted below. On Unix the notice is always delivered.
-                None if cfg!(windows) && started.elapsed() >= Duration::from_millis(450) => {
-                    return None;
-                }
                 None => panic!("closed without notice"),
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1023,14 +1013,12 @@ async fn ping_is_answered_in_every_state() {
     })
     .await
     .expect("pings must not reset the idle timeout");
-    if let Some(n) = ended_idle {
-        assert_eq!(
-            n,
-            Notice::SessionTerminated {
-                reason: "idle".into()
-            }
-        );
-    }
+    assert_eq!(
+        ended_idle,
+        Some(Notice::SessionTerminated {
+            reason: "idle".into()
+        })
+    );
     assert_eq!(ended(h).await, EndReason::IdleTimeout);
 }
 
@@ -1225,9 +1213,6 @@ async fn binding_rechecked_after_handshake() {
     };
     let (mut b, h) = pair_hooked(&s, &relay, swap).await;
     // The vault sends the notice right after the handshake, unasked, and closes.
-    // Nothing is sent first: a request racing that close would arrive at a socket
-    // that is being dropped with unread data, and the resulting TCP reset makes
-    // Windows discard the notice before the test reads it (the old flake).
     assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::WrongApp)));
     b.expect_closed().await;
     assert_eq!(ended(h).await, EndReason::WrongApp);
@@ -1251,6 +1236,30 @@ async fn binding_rechecked_before_prompt() {
     assert_eq!(r, Some(VaultMessage::Notice(Notice::WrongApp)));
     assert_eq!(ended(h).await, EndReason::WrongApp);
     assert!(approver.calls().is_empty(), "approver must not be asked");
+}
+
+/// The vault ends a session with a notice while the client's last frames are still
+/// unread. Dropping the socket with unread data makes Windows reset the connection
+/// and discard the notice in flight, so the vault must drain the client first.
+#[tokio::test(flavor = "multi_thread")]
+async fn final_notice_survives_unread_client_data() {
+    let relay = relay().await;
+    let approver = Auto::new(true);
+    let s = server(approver.clone(), ServerConfig::default()).await;
+    let (mut b, h) = pair(&s, &relay).await;
+    s.unlock(other_container().await).await;
+    // The first request makes the vault end the session with WrongApp; the pings
+    // behind it are never read by the vault's session loop.
+    b.send(RequestBody::OpenSession {
+        device_name: "A".into(),
+    })
+    .await;
+    for _ in 0..8 {
+        b.send(RequestBody::Ping).await;
+    }
+    assert_eq!(b.recv().await, Some(VaultMessage::Notice(Notice::WrongApp)));
+    b.expect_closed().await;
+    assert_eq!(ended(h).await, EndReason::WrongApp);
 }
 
 /// The container is swapped while the prompt is shown: a "yes" for the old
