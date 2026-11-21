@@ -15,6 +15,8 @@ android {
         version = release(compileMajor) { minorApiLevel = compileMinor }
     }
     buildToolsVersion = libs.versions.buildTools.get()
+    // Same NDK the toolchain action installs; AGP's native strip/merge tasks use it.
+    ndkVersion = libs.versions.ndk.get()
 
     defaultConfig {
         applicationId = "dev.vault.android"

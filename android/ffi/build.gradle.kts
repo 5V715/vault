@@ -23,6 +23,7 @@ android {
     compileSdk {
         version = release(compileMajor) { minorApiLevel = compileMinor }
     }
+    buildToolsVersion = libs.versions.buildTools.get()
     ndkVersion = libs.versions.ndk.get()
 
     defaultConfig {
