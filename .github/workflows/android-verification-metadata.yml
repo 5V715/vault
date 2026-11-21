@@ -83,6 +83,17 @@ jobs:
           test -s "$f"
           echo "components: $(grep -c '<component ' "$f")"
           sha256sum "$f"
+      # The file also goes into the log (base64 between markers, plus its sha256),
+      # for maintainers whose environment can read job logs but not artifact
+      # storage. Extract with: gh run view <id> --log | sed -n ... | base64 -d,
+      # then compare the sha256 with the one printed above.
+      - name: verification metadata in the log (base64)
+        run: |
+          f=android/gradle/verification-metadata.xml
+          echo "VERIFICATION-METADATA-SHA256 $(sha256sum "$f" | cut -d' ' -f1)"
+          echo "-----BEGIN VERIFICATION-METADATA-----"
+          base64 -w 76 "$f"
+          echo "-----END VERIFICATION-METADATA-----"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: verification-metadata
