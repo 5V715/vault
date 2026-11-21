@@ -1,0 +1,12 @@
+# app_id vectors shared by vault-proto and android/core: input<TAB>ok or input<TAB>!
+todo	ok
+signal-web	ok
+0demo.app-1	ok
+a234567890123456789012345678901234567890123456789012345678901234	ok
+a2345678901234567890123456789012345678901234567890123456789012345	!
+Todo	!
+-todo	!
+.todo	!
+todo_app	!
+todo app	!
+tödo	!

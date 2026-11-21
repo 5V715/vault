@@ -19,12 +19,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import dev.vault.android.R
-import dev.vault.core.VaultSummary
+import dev.vault.core.VaultIdentity
 
 /** The start screen: every vault on this phone, by app id and origin. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun VaultsScreen(vaults: List<VaultSummary>, modifier: Modifier = Modifier) {
+fun VaultsScreen(vaults: List<VaultIdentity>, modifier: Modifier = Modifier) {
     Scaffold(
         modifier = modifier,
         topBar = { TopAppBar(title = { Text(stringResource(R.string.vaults_title)) }) },
@@ -41,7 +41,7 @@ fun VaultsScreen(vaults: List<VaultSummary>, modifier: Modifier = Modifier) {
             }
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
-                items(vaults, key = { it.id }) { vault ->
+                items(vaults, key = { it.directoryName }) { vault ->
                     ListItem(
                         headlineContent = { Text(vault.appId) },
                         supportingContent = { Text(vault.origin) },

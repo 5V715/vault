@@ -22,3 +22,11 @@ kotlin {
 dependencies {
     testImplementation(libs.junit)
 }
+
+// The binding rules are a port of vault_proto::binding: both sides run the shared
+// vectors in vault-proto/tests/vectors (VaultIdentityTest).
+val bindingVectors = rootDir.resolve("../vault-proto/tests/vectors")
+tasks.test {
+    inputs.dir(bindingVectors).withPathSensitivity(PathSensitivity.RELATIVE)
+    systemProperty("vault.vectors", bindingVectors.absolutePath)
+}
