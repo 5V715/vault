@@ -54,12 +54,19 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # Build everything the emulator step needs while no emulator is running:
+      # compiling the Rust core and Gradle next to a booted emulator exhausted
+      # the runner's memory (the job died silently mid-compile).
+      - name: build the x86_64 androidTest APKs before the emulator starts
+        working-directory: android
+        run: >-
+          ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256
+          -Pvault.abis=x86_64 :ffi:assembleDebug :ffi:assembleDebugAndroidTest
       # Same as ci.yml's emulator job: the runner's free disk is below what the
       # emulator's userdata partition needs unless unused toolchains are removed.
       - name: free disk space for the emulator
         run: |
           df -h / "$HOME"
-          rm -rf target
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
             /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/system-images/android-2*
           df -h / "$HOME"
@@ -69,8 +76,8 @@ jobs:
           api-level: 30
           arch: x86_64
           target: google_apis
-          cores: 4
-          ram-size: 4096M
+          cores: 2
+          ram-size: 3072M
           disk-size: 4096M
           emulator-boot-timeout: 900
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -no-metrics
