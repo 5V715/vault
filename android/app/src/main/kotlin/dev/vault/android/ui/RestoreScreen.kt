@@ -129,7 +129,7 @@ fun RewrapScreen(manager: VaultManager, presence: UserPresence, dir: VaultDir, i
     VaultScaffold("Re-wrap with recovery key", onBack.takeIf { !working }) {
         Text("${identity.appId} at ${identity.origin}", style = MaterialTheme.typography.titleMedium)
         Text(
-            "A new fingerprint or a changed screen lock invalidated this vault's unlock key. " +
+            "Removing the screen lock invalidated this vault's unlock key. " +
                 "Enter the recovery key to protect the vault with the current screen lock again.",
         )
         if (working) {

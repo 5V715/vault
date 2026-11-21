@@ -61,7 +61,7 @@ fun VaultDetailScreen(
     VaultScaffold(entry.identity.appId, onBack) {
         Text(entry.identity.origin, style = MaterialTheme.typography.titleMedium)
         if (needsRewrap) {
-            ErrorText("The unlock key was invalidated by a new fingerprint or screen lock. The vault can't be unlocked until it is re-wrapped.")
+            ErrorText("The unlock key was invalidated because the screen lock was removed. The vault can't be unlocked until it is re-wrapped.")
             Button(onClick = onRewrap, modifier = Modifier.fillMaxWidth()) { Text("Re-wrap with recovery key") }
         }
         HorizontalDivider()

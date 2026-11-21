@@ -94,7 +94,7 @@ fun CreateScreen(
                 Text("Recovery key", style = MaterialTheme.typography.titleLarge)
                 Text(
                     "Write it down on paper and keep it safe. It is the only way to restore this vault on " +
-                        "another phone, or after a new fingerprint or screen lock. It is shown only now.",
+                        "another phone, or after the screen lock was removed. It is shown only now.",
                 )
                 Text(
                     s.created.recoveryKey.split('-').chunked(4).joinToString("\n") { it.joinToString("  ") },

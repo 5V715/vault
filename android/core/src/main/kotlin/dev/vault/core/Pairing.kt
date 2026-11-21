@@ -60,10 +60,10 @@ sealed interface PairingOutcome {
         override val message = "Pairing cancelled"
     }
 
-    /** K_auth was invalidated (new biometric, screen lock removed): re-wrap first. */
+    /** K_auth was invalidated (the screen lock was removed): re-wrap first. */
     data object KeyInvalidated : PairingOutcome {
         override val message =
-            "The vault's unlock key was invalidated by a new fingerprint or screen lock. Re-wrap it with the recovery key."
+            "The vault's unlock key was invalidated because the screen lock was removed. Re-wrap it with the recovery key."
     }
 
     data object Expired : PairingOutcome {

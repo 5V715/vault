@@ -15,7 +15,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/** K_auth needs re-wrapping: a new biometric was enrolled or the screen lock removed. */
+/** K_auth needs re-wrapping: the screen lock was removed (or the key is gone). */
 class AuthKeyInvalidatedException(cause: Throwable? = null) :
     GeneralSecurityException("the vault's unlock key was invalidated; re-wrap with the recovery key", cause)
 
@@ -24,7 +24,9 @@ class AuthKeyInvalidatedException(cause: Throwable? = null) :
  *
  * - **K_auth** (`vault.<id>.auth`) wraps the CRK. AES-256-GCM, every use needs a
  *   BiometricPrompt (BIOMETRIC_STRONG or the device credential, timeout 0), the
- *   device unlocked; invalidated by a new biometric or a removed screen lock;
+ *   device unlocked; invalidated when the screen lock is removed (not by a
+ *   new biometric: a key the PIN also unlocks stays valid, and enrolling a
+ *   biometric needs the PIN anyway; owner decision 2026-11-21);
  *   StrongBox when available.
  * - **K_bg** (`vault.<id>.bg`) seals the high-water mark, the manifest key, the
  *   replica credentials and the vault identity. AES-256-GCM, no user
@@ -69,7 +71,6 @@ class VaultKeys(
                     0,
                     KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
                 )
-                setInvalidatedByBiometricEnrollment(true)
             }
         }
     }

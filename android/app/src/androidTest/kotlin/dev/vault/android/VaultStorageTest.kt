@@ -111,7 +111,9 @@ class VaultStorageTest {
                 KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
                 info.userAuthenticationType,
             )
-            assertTrue(info.isInvalidatedByBiometricEnrollment)
+            // Not asserted: isInvalidatedByBiometricEnrollment. A key that the
+            // device credential also unlocks is not invalidated by a new
+            // biometric (owner decision 2026-11-21: fingerprint or PIN).
             // Usable means "not invalidated": the key still needs a prompt.
             assertTrue(real.isAuthKeyUsable(id))
             // Without a prompt the key does not encrypt.
@@ -190,7 +192,7 @@ class VaultStorageTest {
         val before = manager.unwrapCrk(created.dir, presence)
         assertFalse(manager.needsRewrap(created.dir))
 
-        // A new biometric or a removed screen lock invalidates K_auth; on an
+        // Removing the screen lock invalidates K_auth; on an
         // emulator the closest stand-in is the key disappearing.
         KeyStore.getInstance(VaultKeys.ANDROID_KEYSTORE).apply { load(null) }.deleteEntry(keys.authAlias(created.dir.id))
         assertTrue(manager.needsRewrap(created.dir))

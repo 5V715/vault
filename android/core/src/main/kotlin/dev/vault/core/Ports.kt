@@ -26,7 +26,7 @@ interface VaultKeyStore {
     /** Deletes both keys (vault deletion, or before a re-wrap creates new ones). */
     fun deleteKeys(vaultId: String)
 
-    /** False when K_auth is missing or permanently invalidated (new biometric). */
+    /** False when K_auth is missing or permanently invalidated (screen lock removed). */
     fun isAuthKeyUsable(vaultId: String): Boolean
 
     /** Seals [plaintext] with K_bg (AES-256-GCM, fresh nonce). */

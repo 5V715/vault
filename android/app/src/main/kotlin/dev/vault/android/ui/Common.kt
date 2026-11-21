@@ -112,7 +112,7 @@ fun ErrorText(text: String) {
 fun Throwable.userMessage(): String = when (this) {
     is PresenceCancelledException -> "Cancelled at the unlock prompt. Nothing was kept."
     is DuplicateVaultException -> message ?: "This vault already exists."
-    is AuthKeyInvalidatedException -> "The unlock key was invalidated (new fingerprint or screen lock). Re-wrap with the recovery key."
+    is AuthKeyInvalidatedException -> "The unlock key was invalidated because the screen lock was removed. Re-wrap with the recovery key."
     is FfiException.RecoveryKeyTypo -> "The recovery key has a typo (checksum mismatch)."
     is FfiException.WrongKey -> "This recovery key does not open this vault, or the data is damaged."
     is FfiException.NotFound -> "No vault was found at this location."

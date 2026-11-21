@@ -86,7 +86,7 @@ beyond what Compose gives for free.
   backup, encrypted by the container itself.
 - **Keystore:** per vault, an AES-256-GCM key
   (`setUserAuthenticationParameters(0, BIOMETRIC_STRONG | DEVICE_CREDENTIAL)`,
-  `setUnlockedDeviceRequired(true)`, `setInvalidatedByBiometricEnrollment(true)`,
+  `setUnlockedDeviceRequired(true)`,
   StrongBox when `FEATURE_STRONGBOX_KEYSTORE` is available, else TEE). It wraps
   the CRK; the wrapped CRK lives next to the container. Auth timeout 0 means
   every unlock needs a BiometricPrompt with a CryptoObject. The approval prompt
@@ -204,9 +204,12 @@ beyond what Compose gives for free.
   is updated on every commit during a session. A restore starts with the
   replica's sequence as its floor (trust on first restore, as `vaultctl restore`
   does today).
-- **Unlock path:** only `open_with_crk` with the Keystore-wrapped CRK. Enrolling
-  a new biometric or removing the screen lock invalidates the key (*my call:
-  maximum security*). The app then offers **"Re-wrap with recovery key"**:
+- **Unlock path:** only `open_with_crk` with the Keystore-wrapped CRK. Removing
+  the screen lock invalidates the key. *(Owner decision 2026-11-21: a new
+  biometric does not. Android only invalidates biometric-only keys on
+  enrollment; this key also accepts the PIN, which is required to enroll a
+  biometric and already unlocks the key, so invalidation would add nothing.)*
+  The app then offers **"Re-wrap with recovery key"**:
   `open_with_recovery` on the local container, then a new Keystore key. This flow
   is added to the goals and screens.
 - **Approver timing:** the approval wait equals the offer lifetime (60 s). If the
