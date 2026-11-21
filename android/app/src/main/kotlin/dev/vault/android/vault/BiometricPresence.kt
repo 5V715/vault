@@ -7,6 +7,9 @@ import android.hardware.biometrics.BiometricPrompt
 import android.os.CancellationSignal
 import javax.crypto.Cipher
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
@@ -20,7 +23,15 @@ class BiometricPresence(private val context: Context) : UserPresence {
 
     override suspend fun confirm(title: String): Boolean = prompt(title, null) != null
 
+    /**
+     * Shows the prompt (on the main thread). Returns the result, null if the
+     * user cancelled; throws [PresenceUnavailableException] for a lockout or a
+     * missing screen lock, so those aren't reported as "cancelled".
+     */
     private suspend fun prompt(title: String, crypto: BiometricPrompt.CryptoObject?): BiometricPrompt.AuthenticationResult? =
+        withContext(Dispatchers.Main) { show(title, crypto) }
+
+    private suspend fun show(title: String, crypto: BiometricPrompt.CryptoObject?): BiometricPrompt.AuthenticationResult? =
         suspendCancellableCoroutine { cont ->
             val signal = CancellationSignal()
             cont.invokeOnCancellation { signal.cancel() }
@@ -34,8 +45,18 @@ class BiometricPresence(private val context: Context) : UserPresence {
                 }
 
                 override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    // Cancelled, lockout, no credential.
-                    if (cont.isActive) cont.resume(null)
+                    if (!cont.isActive) return
+                    when (errorCode) {
+                        BiometricPrompt.BIOMETRIC_ERROR_LOCKOUT,
+                        BiometricPrompt.BIOMETRIC_ERROR_LOCKOUT_PERMANENT,
+                        -> cont.resumeWithException(PresenceUnavailableException(locked = true))
+                        BiometricPrompt.BIOMETRIC_ERROR_NO_DEVICE_CREDENTIAL,
+                        BiometricPrompt.BIOMETRIC_ERROR_HW_UNAVAILABLE,
+                        BiometricPrompt.BIOMETRIC_ERROR_HW_NOT_PRESENT,
+                        -> cont.resumeWithException(PresenceUnavailableException(locked = false))
+                        // User or system cancel, timeout: treated as "cancelled".
+                        else -> cont.resume(null)
+                    }
                 }
                 // onAuthenticationFailed: one bad attempt; the prompt stays open.
             }

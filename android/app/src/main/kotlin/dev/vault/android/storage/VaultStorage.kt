@@ -33,7 +33,11 @@ class VaultDir(val root: File) {
 
     fun sealed(kind: String): File = File(root, "$kind.sealed")
 
-    /** Whether the vault is complete (the last file a create or restore writes). */
+    /**
+     * Whether the vault is complete. The identity file is written last: after
+     * the recovery key was confirmed (create) or the CRK wrapped (restore).
+     * Anything else is removed by [VaultStorage.sweepIncomplete].
+     */
     val isComplete: Boolean get() = wrappedCrk.isFile && sealed(KIND_IDENTITY).isFile
 
     companion object {
@@ -47,13 +51,14 @@ class VaultDir(val root: File) {
 /** Writes [bytes] to [file] atomically: a temporary file, fsync, then rename. */
 fun writeAtomically(file: File, bytes: ByteArray) {
     val tmp = File(file.parentFile, ".${file.name}.tmp")
-    FileOutputStream(tmp).use { out ->
-        out.write(bytes)
-        out.fd.sync()
-    }
-    if (!tmp.renameTo(file)) {
+    try {
+        FileOutputStream(tmp).use { out ->
+            out.write(bytes)
+            out.fd.sync()
+        }
+        if (!tmp.renameTo(file)) throw java.io.IOException("cannot replace ${file.name}")
+    } finally {
         tmp.delete()
-        throw java.io.IOException("cannot replace ${file.name}")
     }
 }
 
@@ -65,11 +70,24 @@ class VaultStorage(context: Context, private val keys: VaultKeys) : VaultReposit
     /** A new, empty vault directory with a fresh random id. */
     fun newVaultDir(): VaultDir {
         vaultsRoot.mkdirs()
-        while (true) {
+        repeat(8) {
             val id = ByteArray(16).also(random::nextBytes).joinToString("") { "%02x".format(it) }
             val dir = File(vaultsRoot, id)
             if (dir.mkdir()) return VaultDir(dir)
         }
+        throw java.io.IOException("cannot create a vault directory (storage full?)")
+    }
+
+    /**
+     * Removes what an interrupted create or restore left: incomplete vault
+     * directories, and Keystore keys without a vault directory. Run once at
+     * process start, before any create or restore can be in flight.
+     */
+    fun sweepIncomplete() {
+        val dirs = (vaultsRoot.listFiles() ?: emptyArray()).filter { it.isDirectory && ID.matches(it.name) }
+        for (d in dirs.map(::VaultDir).filterNot { it.isComplete }) runCatching { delete(d) }
+        val present = dirs.filter { it.exists() }.map { it.name }.toSet()
+        for (id in keys.vaultIdsWithKeys() - present) keys.deleteKeys(id)
     }
 
     /** A new random replica id (16 hex characters). */
@@ -118,10 +136,16 @@ class VaultStorage(context: Context, private val keys: VaultKeys) : VaultReposit
         return keys.openBackground(dir.id, kind, f.readBytes())
     }
 
-    /** Deletes a vault's files and keys (failed create/restore, or delete). */
+    /**
+     * Deletes a vault's files and keys (failed create/restore, or delete). The
+     * identity file goes first, so a partial failure leaves an incomplete
+     * directory (swept at the next start), never a vault without keys.
+     */
     fun delete(dir: VaultDir) {
-        dir.root.deleteRecursively()
+        dir.sealed(VaultDir.KIND_IDENTITY).delete()
+        val gone = dir.root.deleteRecursively()
         keys.deleteKeys(dir.id)
+        if (!gone) throw java.io.IOException("could not delete every vault file")
     }
 
     /** The high-water store vault-ffi calls for [dir]. */

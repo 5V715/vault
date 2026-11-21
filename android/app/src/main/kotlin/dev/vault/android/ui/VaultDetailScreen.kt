@@ -21,9 +21,7 @@ import dev.vault.android.vault.UserPresence
 import dev.vault.android.vault.VaultManager
 import java.text.DateFormat
 import java.util.Date
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import uniffi.vault_ffi.VaultStats
 
 /**
@@ -46,10 +44,16 @@ fun VaultDetailScreen(
     var confirmDelete by remember { mutableStateOf(false) }
     var typedAppId by remember { mutableStateOf("") }
     var deleteError by remember { mutableStateOf<String?>(null) }
+    var deleting by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(entry.dir.id) {
-        needsRewrap = withContext(Dispatchers.IO) { manager.needsRewrap(entry.dir) }
+        needsRewrap = try {
+            manager.needsRewrap(entry.dir)
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            false
+        }
         try {
             stats = manager.stats(entry.dir)
         } catch (e: Exception) {
@@ -92,16 +96,24 @@ fun VaultDetailScreen(
             deleteError?.let { ErrorText(it) }
             Button(
                 onClick = {
+                    deleting = true
                     scope.launch {
-                        if (presence.confirm("Delete ${entry.identity.appId}")) {
-                            withContext(Dispatchers.IO) { manager.delete(entry.dir) }
-                            onDeleted()
-                        } else {
-                            deleteError = "Not confirmed at the screen-lock prompt."
+                        try {
+                            if (presence.confirm("Delete ${entry.identity.appId}")) {
+                                manager.delete(entry.dir)
+                                onDeleted()
+                            } else {
+                                deleteError = "Not confirmed at the screen-lock prompt."
+                            }
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            deleteError = e.userMessage()
+                        } finally {
+                            deleting = false
                         }
                     }
                 },
-                enabled = typedAppId == entry.identity.appId,
+                enabled = typedAppId == entry.identity.appId && !deleting,
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Delete for good") }
@@ -110,9 +122,10 @@ fun VaultDetailScreen(
     }
 }
 
+/** Metric (SI) units: 1 kB = 1000 B. */
 private fun formatBytes(n: Long): String = when {
-    n >= 1 shl 30 -> "%.1f GB".format(n / (1 shl 30).toDouble())
-    n >= 1 shl 20 -> "%.1f MB".format(n / (1 shl 20).toDouble())
-    n >= 1 shl 10 -> "%.1f kB".format(n / (1 shl 10).toDouble())
+    n >= 1_000_000_000 -> "%.1f GB".format(n / 1e9)
+    n >= 1_000_000 -> "%.1f MB".format(n / 1e6)
+    n >= 1_000 -> "%.1f kB".format(n / 1e3)
     else -> "$n B"
 }

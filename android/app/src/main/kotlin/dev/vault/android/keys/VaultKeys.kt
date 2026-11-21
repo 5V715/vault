@@ -19,6 +19,9 @@ import javax.crypto.spec.GCMParameterSpec
 class AuthKeyInvalidatedException(cause: Throwable? = null) :
     GeneralSecurityException("the vault's unlock key was invalidated; re-wrap with the recovery key", cause)
 
+/** K_bg is gone (app data partly lost): the sealed files can't be read any more. */
+class BackgroundKeyMissingException : GeneralSecurityException("the vault's background key is missing")
+
 /**
  * The two per-vault AndroidKeyStore keys (spec "Keystore"):
  *
@@ -80,13 +83,30 @@ class VaultKeys(
         keyStore.deleteEntry(bgAlias(vaultId))
     }
 
-    override fun isAuthKeyUsable(vaultId: String): Boolean = try {
-        Cipher.getInstance(TRANSFORMATION).init(Cipher.ENCRYPT_MODE, key(authAlias(vaultId)))
-        true
-    } catch (e: GeneralSecurityException) {
-        // Missing, or KeyPermanentlyInvalidatedException. A key that merely
-        // needs authentication still initializes.
-        false
+    /** Deletes only K_auth (a re-wrap whose prompt was cancelled). */
+    fun deleteAuthKey(vaultId: String) = keyStore.deleteEntry(authAlias(vaultId))
+
+    /** The vault ids that have at least one key here (for the startup sweep). */
+    fun vaultIdsWithKeys(): Set<String> =
+        keyStore.aliases().toList().mapNotNull { ALIAS.matchEntire(it)?.groupValues?.get(1) }.toSet()
+
+    /**
+     * False only when K_auth is missing or permanently invalidated: the vault
+     * then needs a re-wrap. Other (transient) Keystore errors are thrown, so
+     * they are not mistaken for "re-wrap". A key that merely needs
+     * authentication initializes fine; the operation is aborted at once.
+     */
+    override fun isAuthKeyUsable(vaultId: String): Boolean {
+        val k = keyStore.getKey(authAlias(vaultId), null) as? SecretKey ?: return false
+        return try {
+            val c = Cipher.getInstance(TRANSFORMATION)
+            c.init(Cipher.ENCRYPT_MODE, k)
+            // Ends the Keystore operation init started (it fails without auth).
+            runCatching { c.doFinal() }
+            true
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            false
+        }
     }
 
     /**
@@ -119,15 +139,18 @@ class VaultKeys(
     /** Seals a K_bg file of [kind] (its name), bound to the kind and the vault. */
     fun sealBackground(vaultId: String, kind: String, plaintext: ByteArray): ByteArray {
         val c = Cipher.getInstance(TRANSFORMATION)
-        c.init(Cipher.ENCRYPT_MODE, key(bgAlias(vaultId)))
+        c.init(Cipher.ENCRYPT_MODE, bgKey(vaultId))
         return finishSeal(c, aad(kind, vaultId), plaintext)
     }
 
     fun openBackground(vaultId: String, kind: String, sealed: ByteArray): ByteArray {
         val c = Cipher.getInstance(TRANSFORMATION)
-        c.init(Cipher.DECRYPT_MODE, key(bgAlias(vaultId)), GCMParameterSpec(TAG_BITS, iv(sealed)))
+        c.init(Cipher.DECRYPT_MODE, bgKey(vaultId), GCMParameterSpec(TAG_BITS, iv(sealed)))
         return finishOpen(c, aad(kind, vaultId), sealed)
     }
+
+    private fun bgKey(vaultId: String): SecretKey =
+        keyStore.getKey(bgAlias(vaultId), null) as? SecretKey ?: throw BackgroundKeyMissingException()
 
     /** The key's alias names, for tests (KeyInfo checks). */
     fun authAlias(vaultId: String) = "vault.$vaultId.auth"
@@ -160,13 +183,22 @@ class VaultKeys(
             .apply(configure)
             .build()
         val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
-        try {
-            gen.init(spec(strongBox))
-            gen.generateKey()
-        } catch (e: StrongBoxUnavailableException) {
-            gen.init(spec(false))
-            gen.generateKey()
+        if (strongBox) {
+            try {
+                gen.init(spec(true))
+                gen.generateKey()
+                return
+            } catch (e: StrongBoxUnavailableException) {
+                // Fall back to the TEE below.
+            } catch (e: java.security.ProviderException) {
+                // Some StrongBox implementations reject these parameters.
+            } catch (e: java.security.InvalidAlgorithmParameterException) {
+                // Same, reported at init.
+            }
+            keyStore.deleteEntry(alias)
         }
+        gen.init(spec(false))
+        gen.generateKey()
     }
 
     private fun finishSeal(cipher: Cipher, aad: ByteArray, plaintext: ByteArray): ByteArray {
@@ -194,6 +226,7 @@ class VaultKeys(
 
     companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private val ALIAS = Regex("^vault\\.([0-9a-f]{32})\\.(auth|bg)$")
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val TAG_BITS = 128
         private const val IV_BYTES = 12

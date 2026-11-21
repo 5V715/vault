@@ -11,6 +11,7 @@ import dev.vault.core.Checked
 import dev.vault.core.LockSettings
 import dev.vault.core.VaultIdentity
 import javax.crypto.Cipher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import uniffi.vault_ffi.FactoryConfig
@@ -33,6 +34,10 @@ interface UserPresence {
 
 /** The user cancelled the BiometricPrompt: nothing was changed or kept. */
 class PresenceCancelledException : Exception("cancelled at the unlock prompt")
+
+/** The prompt can't be passed now: [locked] after too many attempts, else no screen lock. */
+class PresenceUnavailableException(val locked: Boolean) :
+    Exception(if (locked) "too many attempts" else "no screen lock")
 
 /** A vault for this app and origin already exists on the phone. */
 class DuplicateVaultException(val identity: VaultIdentity) :
@@ -57,17 +62,21 @@ class VaultManager(
         ),
     )
 
-    /** A new vault: what the create screen shows next. Drop it after the check. */
+    /**
+     * A new vault whose recovery key is being shown and checked. It is not
+     * complete (not listed, swept at the next start) until [confirmCreated].
+     */
     class Created(val dir: VaultDir, val identity: VaultIdentity, val recoveryKey: String)
 
     /**
      * Creates a vault for [identity]. Order: K_bg (vault-ffi saves the first
      * high-water mark during create), the container, the manifest key sealed,
-     * K_auth, the CRK wrapped after a BiometricPrompt, the identity file last
-     * (it marks the vault complete). Any failure or cancellation deletes
+     * K_auth, the CRK wrapped after a BiometricPrompt. The identity file, which
+     * marks the vault complete, is written by [confirmCreated] once the user
+     * has confirmed the recovery key. Any failure or cancellation deletes
      * everything written so far.
      */
-    suspend fun create(identity: VaultIdentity, presence: UserPresence): Created {
+    suspend fun create(identity: VaultIdentity, presence: UserPresence): Created = withContext(Dispatchers.IO) {
         if (storage.exists(identity)) throw DuplicateVaultException(identity)
         val dir = storage.newVaultDir()
         try {
@@ -82,12 +91,22 @@ class VaultManager(
                 created.manifestKey.fill(0)
                 created.handle.close()
             }
-            storage.writeIdentity(dir, identity)
-            return Created(dir, identity, created.recoveryKey)
+            Created(dir, identity, created.recoveryKey)
         } catch (t: Throwable) {
-            withContext(NonCancellable) { storage.delete(dir) }
+            discard(dir)
             throw t
         }
+    }
+
+    /** The user confirmed the recovery key: the vault becomes complete and listed. */
+    suspend fun confirmCreated(created: Created) = withContext(Dispatchers.IO) {
+        if (storage.exists(created.identity)) throw DuplicateVaultException(created.identity)
+        storage.writeIdentity(created.dir, created.identity)
+    }
+
+    /** Deletes a partial vault; never replaces the error that led here. */
+    private suspend fun discard(dir: VaultDir) = withContext(NonCancellable + Dispatchers.IO) {
+        runCatching { storage.delete(dir) }
     }
 
     /**
@@ -97,7 +116,7 @@ class VaultManager(
      * before K_auth is created; K_bg exists from the start because vault-ffi
      * saves the high-water mark during the restore.
      */
-    suspend fun restore(source: ReplicaTarget, recoveryKey: String, presence: UserPresence): VaultIdentity {
+    suspend fun restore(source: ReplicaTarget, recoveryKey: String, presence: UserPresence): VaultIdentity = withContext(Dispatchers.IO) {
         val dir = storage.newVaultDir()
         // The replica's stable id: its anti-rollback mark and config entry use it.
         val sourceId = storage.newReplicaId()
@@ -123,23 +142,24 @@ class VaultManager(
                 crk.fill(0)
             }
             storage.writeIdentity(dir, identity)
-            return identity
+            identity
         } catch (t: Throwable) {
-            withContext(NonCancellable) { storage.delete(dir) }
+            discard(dir)
             throw t
         }
     }
 
-    /** Whether [dir]'s K_auth still works; false means "Re-wrap with recovery key". */
-    fun needsRewrap(dir: VaultDir): Boolean = !keys.isAuthKeyUsable(dir.id)
+    /** Whether [dir]'s K_auth is gone or invalidated: "Re-wrap with recovery key". */
+    suspend fun needsRewrap(dir: VaultDir): Boolean = withContext(Dispatchers.IO) { !keys.isAuthKeyUsable(dir.id) }
 
     /**
      * Re-wrap after K_auth was invalidated: the recovery key opens the local
      * container (against its high-water mark), then a new K_auth (replacing the
-     * invalidated one) wraps the CRK. Cancelling at the prompt leaves the vault
-     * needing a re-wrap, as before.
+     * invalidated one) wraps the CRK. If the prompt is cancelled or anything
+     * fails, the new K_auth is deleted again, so the vault still shows
+     * "Re-wrap" (the wrapped file is replaced only on success).
      */
-    suspend fun rewrap(dir: VaultDir, recoveryKey: String, presence: UserPresence) {
+    suspend fun rewrap(dir: VaultDir, recoveryKey: String, presence: UserPresence) = withContext(Dispatchers.IO) {
         val crk = factory.rewrapWithRecoveryKey(dir.container.path, recoveryKey, storage.highWaterStore(dir))
         try {
             wrapAndStoreCrk(dir, crk, presence)
@@ -153,11 +173,11 @@ class VaultManager(
      * vault-ffi and wipes it at once. Throws [AuthKeyInvalidatedException] when
      * a re-wrap is needed, [PresenceCancelledException] on cancel.
      */
-    suspend fun unwrapCrk(dir: VaultDir, presence: UserPresence): ByteArray {
+    suspend fun unwrapCrk(dir: VaultDir, presence: UserPresence): ByteArray = withContext(Dispatchers.IO) {
         val wrapped = dir.wrappedCrk.readBytes()
         val cipher = presence.authenticate(UNLOCK_TITLE, keys.authCipherForUnwrap(dir.id, wrapped))
             ?: throw PresenceCancelledException()
-        return keys.unwrapCrk(dir.id, cipher, wrapped)
+        keys.unwrapCrk(dir.id, cipher, wrapped)
     }
 
     /** Opens [dir] locked, for stats; the caller closes the handle. */
@@ -166,13 +186,20 @@ class VaultManager(
     suspend fun stats(dir: VaultDir): VaultStats = open(dir).use { it.stats() }
 
     /** Deletes a vault and its keys. The UI asks for auth and the typed app id first. */
-    fun delete(dir: VaultDir) = storage.delete(dir)
+    suspend fun delete(dir: VaultDir) = withContext(Dispatchers.IO) { storage.delete(dir) }
 
     private suspend fun wrapAndStoreCrk(dir: VaultDir, crk: ByteArray, presence: UserPresence) {
         keys.createAuthKey(dir.id)
-        val cipher = presence.authenticate(PROTECT_TITLE, keys.authCipherForWrap(dir.id))
-            ?: throw PresenceCancelledException()
-        writeAtomically(dir.wrappedCrk, keys.wrapCrk(dir.id, cipher, crk))
+        try {
+            val cipher = presence.authenticate(PROTECT_TITLE, keys.authCipherForWrap(dir.id))
+                ?: throw PresenceCancelledException()
+            writeAtomically(dir.wrappedCrk, keys.wrapCrk(dir.id, cipher, crk))
+        } catch (t: Throwable) {
+            // The wrapped file (if any) is under the old key: K_auth must not
+            // look usable, or the vault would hide its re-wrap entry.
+            withContext(NonCancellable) { runCatching { keys.deleteAuthKey(dir.id) } }
+            throw t
+        }
     }
 
     override fun close() = factory.close()

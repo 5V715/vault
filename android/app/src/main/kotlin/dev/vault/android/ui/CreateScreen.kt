@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package dev.vault.android.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -58,9 +59,12 @@ fun CreateScreen(
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
-    // Leaving before the key is confirmed is allowed only on the form: the vault
-    // exists once the key is shown, so Back is hidden from then on.
-    val back = if (step == CreateStep.Form) onBack else null
+    // Leaving is allowed only on the form and when done. While working, and
+    // while the key is shown and checked, Back (button and system) does nothing:
+    // the vault becomes complete only after the check (confirmCreated); an
+    // abandoned one is removed at the next start.
+    val back = if (step == CreateStep.Form || step == CreateStep.Done) onBack else null
+    BackHandler(enabled = back == null) {}
     VaultScaffold("Create a vault", back) {
         when (val s = step) {
             CreateStep.Form -> {
@@ -102,8 +106,11 @@ fun CreateScreen(
                 )
                 Button(
                     onClick = {
-                        val check = RecoveryConfirmation.start(s.created.recoveryKey, SecureRandom().asKotlinRandom())
-                        step = if (check != null) CreateStep.Confirm(s.created, check) else CreateStep.Done
+                        // vault-container always shows 16 groups of 4; anything else is a bug.
+                        val check = checkNotNull(RecoveryConfirmation.start(s.created.recoveryKey, SecureRandom().asKotlinRandom())) {
+                            "unexpected recovery key format"
+                        }
+                        step = CreateStep.Confirm(s.created, check)
                     },
                     modifier = Modifier.fillMaxWidth(),
                 ) { Text("I wrote it down") }
@@ -111,8 +118,21 @@ fun CreateScreen(
             is CreateStep.Confirm -> ConfirmGroups(
                 check = s.check,
                 onBackToKey = { step = CreateStep.ShowKey(s.created) },
-                onConfirmed = { step = CreateStep.Done },
+                onConfirmed = {
+                    step = CreateStep.Working
+                    scope.launch {
+                        step = try {
+                            manager.confirmCreated(s.created)
+                            CreateStep.Done
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            error = e.userMessage()
+                            CreateStep.Confirm(s.created, s.check)
+                        }
+                    }
+                },
             )
+            error?.takeIf { step is CreateStep.Confirm }?.let { ErrorText(it) }
             CreateStep.Done -> {
                 Text("The vault is ready.", style = MaterialTheme.typography.titleLarge)
                 Text("Scan a pairing code in the browser app to use it.")

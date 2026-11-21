@@ -26,8 +26,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.vault.android.keys.AuthKeyInvalidatedException
+import dev.vault.android.keys.BackgroundKeyMissingException
 import dev.vault.android.vault.DuplicateVaultException
 import dev.vault.android.vault.PresenceCancelledException
+import dev.vault.android.vault.PresenceUnavailableException
 import uniffi.vault_ffi.FfiException
 
 /** A screen with a title, a Back action and scrollable content. */
@@ -111,6 +113,14 @@ fun ErrorText(text: String) {
 /** What a failed operation tells the user. Never includes secrets or raw details. */
 fun Throwable.userMessage(): String = when (this) {
     is PresenceCancelledException -> "Cancelled at the unlock prompt. Nothing was kept."
+    is PresenceUnavailableException ->
+        if (locked) {
+            "Too many attempts. Unlock the phone with its PIN, then try again."
+        } else {
+            "Set a screen lock (PIN, pattern or password) first. The vault needs it."
+        }
+    is BackgroundKeyMissingException -> "This vault's storage key is missing; restore it from a replica."
+    is javax.crypto.AEADBadTagException -> "A vault file is damaged or was altered. Restore the vault from a replica."
     is DuplicateVaultException -> message ?: "This vault already exists."
     is AuthKeyInvalidatedException -> "The unlock key was invalidated because the screen lock was removed. Re-wrap with the recovery key."
     is FfiException.RecoveryKeyTypo -> "The recovery key has a typo (checksum mismatch)."

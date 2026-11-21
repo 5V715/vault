@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package dev.vault.android.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
@@ -48,6 +49,8 @@ fun RestoreScreen(manager: VaultManager, presence: UserPresence, onDone: () -> U
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
+    // System Back while restoring would cancel it by leaving; use Cancel instead.
+    BackHandler(enabled = job != null) {}
     VaultScaffold("Restore a vault", onBack.takeIf { job == null }) {
         val done = restored
         when {
@@ -104,8 +107,13 @@ fun RestoreScreen(manager: VaultManager, presence: UserPresence, onDone: () -> U
                                 recoveryKey = ""
                                 secret = ""
                             } catch (e: kotlinx.coroutines.CancellationException) {
+                                // Cancel button (or leaving): forget what was typed.
+                                recoveryKey = ""
+                                secret = ""
                                 error = "Restore cancelled. Nothing was kept."
+                                throw e
                             } catch (e: Exception) {
+                                // Kept for correcting a typo; gone when the screen is left.
                                 error = e.userMessage()
                             } finally {
                                 job = null
@@ -126,6 +134,7 @@ fun RewrapScreen(manager: VaultManager, presence: UserPresence, dir: VaultDir, i
     var working by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    BackHandler(enabled = working) {}
     VaultScaffold("Re-wrap with recovery key", onBack.takeIf { !working }) {
         Text("${identity.appId} at ${identity.origin}", style = MaterialTheme.typography.titleMedium)
         Text(

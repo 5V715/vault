@@ -65,6 +65,7 @@ private fun App(app: VaultApp, presence: BiometricPresence) {
 
     LaunchedEffect(reload) {
         vaults = withContext(Dispatchers.IO) {
+            app.sweepOnce()
             app.storage.vaultDirs()
                 .mapNotNull { dir -> app.storage.identityOf(dir)?.let { VaultEntry(dir, it) } }
                 .sortedWith(compareBy({ it.identity.appId }, { it.identity.origin }))

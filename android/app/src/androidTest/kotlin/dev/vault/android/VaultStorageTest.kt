@@ -2,6 +2,7 @@
 package dev.vault.android
 
 import android.content.Context
+import android.os.Build
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import android.view.WindowManager
@@ -23,7 +24,11 @@ import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.AfterClass
 import org.junit.Assert.assertArrayEquals
@@ -78,10 +83,13 @@ class VaultStorageTest {
 
     @After
     fun tearDown() {
-        storage.vaultDirs().forEach(storage::delete)
         File(context.noBackupFilesDir, "vaults").deleteRecursively()
+        // Also the keys of vaults a failing test left incomplete.
+        keys.vaultIdsWithKeys().forEach(keys::deleteKeys)
         manager.close()
     }
+
+    private fun id(app: String, origin: String) = (VaultIdentity.of(app, origin) as Checked.Valid).value
 
     private fun keyInfo(alias: String): KeyInfo {
         val ks = KeyStore.getInstance(VaultKeys.ANDROID_KEYSTORE).apply { load(null) }
@@ -89,6 +97,10 @@ class VaultStorageTest {
         return SecretKeyFactory.getInstance(key.algorithm, VaultKeys.ANDROID_KEYSTORE)
             .getKeySpec(key, KeyInfo::class.java) as KeyInfo
     }
+
+    /** Create and confirm (complete) a vault. */
+    private suspend fun createComplete(id: VaultIdentity = identity, presence: UserPresence = AutoPresence()): VaultManager.Created =
+        manager.create(id, presence).also { manager.confirmCreated(it) }
 
     private fun aliases(): List<String> =
         KeyStore.getInstance(VaultKeys.ANDROID_KEYSTORE).apply { load(null) }.aliases().toList()
@@ -105,6 +117,7 @@ class VaultStorageTest {
             assertEquals(KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT, info.purposes)
             assertArrayEquals(arrayOf(KeyProperties.BLOCK_MODE_GCM), info.blockModes)
             assertTrue(info.isUserAuthenticationRequired)
+            if (Build.VERSION.SDK_INT >= 31) assertTrue(info.isUnlockedDeviceRequired)
             // Timeout 0: every use needs its own prompt with a CryptoObject.
             assertEquals(0, info.userAuthenticationValidityDurationSeconds)
             assertEquals(
@@ -138,8 +151,9 @@ class VaultStorageTest {
             assertEquals(256, info.keySize)
             assertArrayEquals(arrayOf(KeyProperties.BLOCK_MODE_GCM), info.blockModes)
             // No user authentication: replication and the high-water mark need it
-            // while the vault is locked (setUnlockedDeviceRequired has no KeyInfo getter).
+            // while the vault is locked; only an unlocked device (checked on API 31+).
             assertFalse(info.isUserAuthenticationRequired)
+            if (Build.VERSION.SDK_INT >= 31) assertTrue(info.isUnlockedDeviceRequired)
 
             val secret = ByteArray(32) { it.toByte() }
             val sealed = keys.sealBackground(id, VaultDir.KIND_MANIFEST_KEY, secret.copyOf())
@@ -161,7 +175,7 @@ class VaultStorageTest {
     @Test
     fun wrap_unwrap_crk_with_device_credential_test_key() = runBlocking<Unit> {
         val presence = AutoPresence()
-        val created = manager.create(identity, presence)
+        val created = createComplete(presence = presence)
         val crk = manager.unwrapCrk(created.dir, presence)
         try {
             assertEquals(32, crk.size)
@@ -188,7 +202,7 @@ class VaultStorageTest {
     @Test
     fun rewrap_after_key_invalidation() = runBlocking<Unit> {
         val presence = AutoPresence()
-        val created = manager.create(identity, presence)
+        val created = createComplete(presence = presence)
         val before = manager.unwrapCrk(created.dir, presence)
         assertFalse(manager.needsRewrap(created.dir))
 
@@ -202,11 +216,20 @@ class VaultStorageTest {
         } catch (e: AuthKeyInvalidatedException) {
             // expected
         }
-        // A wrong recovery key changes nothing.
+        // A wrong recovery key (a valid one, of another vault) changes nothing.
+        val other = createComplete(id("notes", "https://notes.example"), presence)
         try {
-            manager.rewrap(created.dir, "AAAA-".repeat(15) + "AAAA", presence)
-            fail("re-wrapped with a wrong recovery key")
-        } catch (e: Exception) {
+            manager.rewrap(created.dir, other.recoveryKey, presence)
+            fail("re-wrapped with another vault's recovery key")
+        } catch (e: uniffi.vault_ffi.FfiException.WrongKey) {
+            assertTrue(manager.needsRewrap(created.dir))
+        }
+        // Cancelling the prompt keeps the vault in "needs re-wrap" (and keeps the
+        // re-wrap entry visible) instead of leaving a fresh, useless key.
+        try {
+            manager.rewrap(created.dir, created.recoveryKey, AutoPresence(pass = false))
+            fail("re-wrapped without passing the prompt")
+        } catch (e: PresenceCancelledException) {
             assertTrue(manager.needsRewrap(created.dir))
         }
 
@@ -221,7 +244,7 @@ class VaultStorageTest {
     @Test
     fun files_in_no_backup_dir() = runBlocking<Unit> {
         val outside = snapshot(context.dataDir)
-        val created = manager.create(identity, AutoPresence())
+        val created = createComplete()
 
         // Everything the vault wrote is under noBackupFilesDir/vaults/<id>/.
         val root = created.dir.root.canonicalFile
@@ -263,7 +286,7 @@ class VaultStorageTest {
     @Test
     fun restore_from_a_replica_and_keep_its_credentials() = runBlocking<Unit> {
         val presence = AutoPresence()
-        val created = manager.create(identity, presence)
+        val created = createComplete(presence = presence)
         val crk = manager.unwrapCrk(created.dir, presence)
         val replicaDir = File(context.noBackupFilesDir, "replica-test").apply { deleteRecursively() }
         try {
@@ -298,18 +321,74 @@ class VaultStorageTest {
                 assertEquals(1, storage.vaultDirs().size)
                 assertEquals(1, File(context.noBackupFilesDir, "vaults").list()!!.size)
             }
-            // A wrong recovery key leaves nothing behind either.
-            storage.delete(dir)
+            // A wrong recovery key (valid, of another vault) fails after the
+            // download started, and leaves nothing behind either.
+            val otherKey = createComplete(id("notes", "https://notes.example"), presence).recoveryKey
+            storage.vaultDirs().forEach(storage::delete)
+            val aliasesBefore = aliases().toSet()
             try {
-                manager.restore(target, "AAAA-".repeat(15) + "AAAA", presence)
-                fail("restored with a wrong recovery key")
-            } catch (e: Exception) {
+                manager.restore(target, otherKey, presence)
+                fail("restored with another vault's recovery key")
+            } catch (e: uniffi.vault_ffi.FfiException) {
                 assertNull(File(context.noBackupFilesDir, "vaults").list()?.firstOrNull())
+                assertEquals(aliasesBefore, aliases().toSet())
             }
         } finally {
             crk.fill(0)
             replicaDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun unconfirmed_and_interrupted_vaults_are_swept() = runBlocking<Unit> {
+        // Created, recovery key never confirmed (app killed on the key screen).
+        val unconfirmed = manager.create(identity, AutoPresence())
+        assertFalse(storage.exists(identity))
+        assertTrue(unconfirmed.dir.root.exists())
+        // A key whose vault directory is gone (cleanup raced a cancelled task).
+        keys.createBackgroundKey("abcdefabcdefabcdefabcdefabcdefab")
+        val complete = createComplete(id("notes", "https://notes.example"))
+
+        storage.sweepIncomplete()
+        assertFalse(unconfirmed.dir.root.exists())
+        assertFalse(keys.vaultIdsWithKeys().contains(unconfirmed.dir.id))
+        assertFalse(keys.vaultIdsWithKeys().contains("abcdefabcdefabcdefabcdefabcdefab"))
+        // Complete vaults are untouched.
+        assertTrue(complete.dir.isComplete)
+        assertTrue(keys.vaultIdsWithKeys().contains(complete.dir.id))
+        // And the identity can be created again.
+        createComplete()
+        assertEquals(2, storage.list().size)
+    }
+
+    @Test
+    fun cancelled_coroutine_leaves_nothing() = runBlocking<Unit> {
+        val before = aliases().toSet()
+        // The prompt never answers; the user leaves the screen.
+        val waiting = object : UserPresence {
+            override suspend fun authenticate(title: String, cipher: Cipher): Cipher? = kotlinx.coroutines.awaitCancellation()
+
+            override suspend fun confirm(title: String): Boolean = false
+        }
+        val job = launch(kotlinx.coroutines.Dispatchers.Default) { manager.create(identity, waiting) }
+        // Wait until the create reached the prompt (the container exists).
+        withTimeout(30_000) {
+            while (File(context.noBackupFilesDir, "vaults").listFiles()?.any { File(it, "crk.wrapped").exists() || File(it, "manifest-key.sealed").exists() } != true) delay(20)
+        }
+        job.cancelAndJoin()
+        assertNull(File(context.noBackupFilesDir, "vaults").list()?.firstOrNull())
+        assertEquals(before, aliases().toSet())
+    }
+
+    @Test
+    fun replica_config_round_trip() {
+        val replicas = listOf(
+            NamedReplica("a1", ReplicaTarget.S3("https://s3.example", "eu-central-1", "b", "p/", "AKID", "s3cr\"et\n", true)),
+            NamedReplica("b2", ReplicaTarget.WebDav("https://cloud.example/remote.php/dav/files/u/vault", "u", "pässwörd")),
+            NamedReplica("c3", ReplicaTarget.Local("/data/x")),
+        )
+        assertEquals(replicas, ReplicaConfig.decode(ReplicaConfig.encode(replicas)))
+        assertThrows { ReplicaConfig.decode("{\"v\":2,\"replicas\":[]}".toByteArray()) }
     }
 
     @Test
@@ -328,7 +407,8 @@ class VaultStorageTest {
             .filter { it.isFile }
             .map { it.canonicalPath }
             // Runtime caches the platform and the test harness write.
-            .filterNot { "/code_cache/" in it || "/cache/" in it || "/app_webview/" in it }
+            // The ART/JIT cache; everything else (cacheDir included) counts.
+            .filterNot { "/code_cache/" in it }
             .toSet()
 
     private fun ByteArray.indexOfSlice(needle: ByteArray): Int =
