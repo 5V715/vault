@@ -25,13 +25,5 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!-- androidx.profileinstaller (pulled in by Compose) adds an exported
-             receiver that lets other apps trigger profile installs. A sideloaded
-             app has no use for it; check-apks.sh asserts MainActivity is the only
-             exported component. -->
-        <receiver
-            android:name="androidx.profileinstaller.ProfileInstallReceiver"
-            tools:node="remove" />
     </application>
 </manifest>

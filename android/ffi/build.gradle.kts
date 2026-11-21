@@ -74,8 +74,20 @@ abstract class CargoNdkBuild : DefaultTask() {
     @get:Input
     abstract val ndkVersionKey: Property<String>
 
-    @get:Input
+    // Raw candidates (no script-captured lambdas, which the configuration cache
+    // cannot serialize); the build-relevant subset below is the cache key.
+    @get:Internal
     abstract val rustEnv: MapProperty<String, String>
+
+    @get:Input
+    val relevantRustEnv: Map<String, String>
+        get() {
+            val ignored = Regex(
+                "^(CARGO_HOME|CARGO_TARGET_DIR|CARGO_INCREMENTAL|CARGO_TERM_.*|CARGO_NET_.*|CARGO_HTTP_.*|" +
+                    "CARGO_REGISTR(Y|IES).*|CARGO_BUILD_JOBS|CARGO_LOG.*|RUSTUP_HOME|RUSTUP_(DIST|UPDATE).*|RUST_BACKTRACE|RUST_LOG)$",
+            )
+            return rustEnv.get().filterKeys { key -> !ignored.matches(key) }.toSortedMap()
+        }
 
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NAME_ONLY)
@@ -144,8 +156,20 @@ abstract class UniffiBindgen : DefaultTask() {
     @get:Input
     abstract val ndkVersionKey: Property<String>
 
-    @get:Input
+    // Raw candidates (no script-captured lambdas, which the configuration cache
+    // cannot serialize); the build-relevant subset below is the cache key.
+    @get:Internal
     abstract val rustEnv: MapProperty<String, String>
+
+    @get:Input
+    val relevantRustEnv: Map<String, String>
+        get() {
+            val ignored = Regex(
+                "^(CARGO_HOME|CARGO_TARGET_DIR|CARGO_INCREMENTAL|CARGO_TERM_.*|CARGO_NET_.*|CARGO_HTTP_.*|" +
+                    "CARGO_REGISTR(Y|IES).*|CARGO_BUILD_JOBS|CARGO_LOG.*|RUSTUP_HOME|RUSTUP_(DIST|UPDATE).*|RUST_BACKTRACE|RUST_LOG)$",
+            )
+            return rustEnv.get().filterKeys { key -> !ignored.matches(key) }.toSortedMap()
+        }
 
     @get:InputFiles
     @get:PathSensitive(PathSensitivity.NAME_ONLY)
@@ -201,17 +225,9 @@ val rustInputs: FileCollection = files(
 val targetAbis: Provider<List<String>> = providers.gradleProperty("vault.abis")
     .orElse("arm64-v8a,armeabi-v7a,x86_64")
     .map { list -> list.split(',').map(String::trim).filter(String::isNotEmpty) }
-// Environment that can change cargo's/rustc's/cc's output (not machine-local
-// paths, credentials, or terminal/network knobs). Read lazily: configuration-cache safe.
-val rustEnvIgnored = Regex(
-    "^(CARGO_HOME|CARGO_TARGET_DIR|CARGO_INCREMENTAL|CARGO_TERM_.*|CARGO_NET_.*|CARGO_HTTP_.*|" +
-        "CARGO_REGISTR(Y|IES).*|CARGO_BUILD_JOBS|CARGO_LOG.*|RUSTUP_HOME|RUSTUP_(DIST|UPDATE).*|RUST_BACKTRACE|RUST_LOG)$",
-)
+// Environment that can change cargo's/rustc's/cc's output; the tasks drop
+// machine-local and credential variables themselves (relevantRustEnv).
 val rustEnvPrefixes = listOf("CARGO_", "RUST", "CC_", "CXX_", "AR_", "CFLAGS", "CXXFLAGS", "BINDGEN_")
-val rustEnvironment: Provider<Map<String, String>> = rustEnvPrefixes
-    .map { prefix -> providers.environmentVariablesPrefixedBy(prefix) }
-    .reduce { acc, next -> acc.zip(next) { a, b -> a + b } }
-    .map { env -> env.filterKeys { key -> !rustEnvIgnored.matches(key) }.toSortedMap() }
 // cargo reads config.toml (or the legacy `config`) from the workspace root and `.cargo/` below it.
 val cargoConfigFiles: FileCollection = files(
     workspace.file(".cargo/config.toml").asFile,
@@ -239,7 +255,7 @@ androidComponents {
             cargo.set(cargoCommand)
             cargoNdkVersion.set(pinnedCargoNdk)
             ndkVersionKey.set(pinnedNdk)
-            rustEnv.set(rustEnvironment)
+            rustEnvPrefixes.forEach { prefix -> rustEnv.putAll(providers.environmentVariablesPrefixedBy(prefix)) }
             cargoConfig.from(cargoConfigFiles)
             rustToolchainFile.set(workspace.file("rust-toolchain.toml"))
         }
@@ -251,7 +267,7 @@ androidComponents {
             cargo.set(cargoCommand)
             cargoNdkVersion.set(pinnedCargoNdk)
             ndkVersionKey.set(pinnedNdk)
-            rustEnv.set(rustEnvironment)
+            rustEnvPrefixes.forEach { prefix -> rustEnv.putAll(providers.environmentVariablesPrefixedBy(prefix)) }
             cargoConfig.from(cargoConfigFiles)
             rustToolchainFile.set(workspace.file("rust-toolchain.toml"))
         }
