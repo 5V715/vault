@@ -38,9 +38,9 @@ assert_only_launcher_exported() {
   local dump=$1 label=$2 comps exported
   comps="$(manifest_components "$dump")"
   [ -n "$comps" ] || fail "$label: found no components in the manifest dump (aapt2 output format changed?)"
-  echo "$comps" | grep -qE '^activity ([A-Za-z0-9_.]*\.)?MainActivity ' || fail "$label: MainActivity is not in the manifest"
+  grep -qE '^activity ([A-Za-z0-9_.]*\.)?MainActivity ' <<<"$comps" || fail "$label: MainActivity is not in the manifest"
   exported="$(echo "$comps" | awk '$3 == "true" { print $1 " " $2 }')"
-  echo "$exported" | grep -qxE 'activity ([A-Za-z0-9_.]*\.)?MainActivity' ||
+  grep -qxE 'activity ([A-Za-z0-9_.]*\.)?MainActivity' <<<"$exported" ||
     fail "$label: MainActivity is not exported (it is the launcher)"
   [ "$(echo "$exported" | wc -l)" -eq 1 ] ||
     fail "$label: exported=true is allowed only on MainActivity, but the merged manifest also exports: $(echo "$exported" | grep -vE 'MainActivity$' | tr '\n' ';')"
@@ -69,10 +69,10 @@ assert_extraction_rules_exclude_all() {
                if (n == "path") path = quoted(attr_val($0))
                if (dom != "" && path != "") { print section, "exclude", dom, path; dom = ""; path = "" } }' "$dump")"
   for section in cloud-backup device-transfer; do
-    echo "$lines" | grep -q "^$section " || fail "$label: data extraction rules have no <$section> section"
-    echo "$lines" | grep -q "^$section include" && fail "$label: <$section> has an <include>"
+    grep -q "^$section " <<<"$lines" || fail "$label: data extraction rules have no <$section> section"
+    grep -q "^$section include" <<<"$lines" && fail "$label: <$section> has an <include>"
     for domain in root file database sharedpref external device_root device_file device_database device_sharedpref; do
-      echo "$lines" | grep -qx "$section exclude $domain \\." ||
+      grep -qx "$section exclude $domain \\." <<<"$lines" ||
         fail "$label: <$section> does not exclude domain '$domain' (path \".\")"
     done
   done
