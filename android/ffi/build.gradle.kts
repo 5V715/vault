@@ -8,7 +8,8 @@
 //     the built library and writes the Kotlin bindings (package uniffi.vault_ffi)
 //     into a generated source directory.
 // Both are cacheable: their inputs are the Rust sources, Cargo.lock and the
-// toolchain pins. `-Pvault.abis=x86_64` limits the ABIs (emulator runs).
+// toolchain pins, cargo-ndk and NDK versions, .cargo/config.toml and the Rust-affecting
+// environment (RUSTFLAGS, CARGO_*, ...). `-Pvault.abis=x86_64` limits the ABIs (emulator runs).
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 
@@ -65,6 +66,25 @@ abstract class CargoNdkBuild : DefaultTask() {
     @get:Internal
     abstract val ndkDir: DirectoryProperty
 
+    // Everything besides the sources that changes the output, so the build cache
+    // never hands one build's artifacts to a run with other inputs.
+    @get:Input
+    abstract val cargoNdkVersion: Property<String>
+
+    @get:Input
+    abstract val ndkVersionKey: Property<String>
+
+    @get:Input
+    abstract val rustEnv: MapProperty<String, String>
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val cargoConfig: ConfigurableFileCollection
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val rustToolchainFile: RegularFileProperty
+
     @get:Internal
     abstract val workspaceDir: DirectoryProperty
 
@@ -116,6 +136,25 @@ abstract class UniffiBindgen : DefaultTask() {
     @get:PathSensitive(PathSensitivity.NONE)
     abstract val library: RegularFileProperty
 
+    // Everything besides the sources that changes the output, so the build cache
+    // never hands one build's artifacts to a run with other inputs.
+    @get:Input
+    abstract val cargoNdkVersion: Property<String>
+
+    @get:Input
+    abstract val ndkVersionKey: Property<String>
+
+    @get:Input
+    abstract val rustEnv: MapProperty<String, String>
+
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val cargoConfig: ConfigurableFileCollection
+
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val rustToolchainFile: RegularFileProperty
+
     @get:Internal
     abstract val workspaceDir: DirectoryProperty
 
@@ -162,6 +201,25 @@ val rustInputs: FileCollection = files(
 val targetAbis: Provider<List<String>> = providers.gradleProperty("vault.abis")
     .orElse("arm64-v8a,armeabi-v7a,x86_64")
     .map { list -> list.split(',').map(String::trim).filter(String::isNotEmpty) }
+// Environment that can change cargo's/rustc's/cc's output (not machine-local
+// paths, credentials, or terminal/network knobs). Read lazily: configuration-cache safe.
+val rustEnvIgnored = Regex(
+    "^(CARGO_HOME|CARGO_TARGET_DIR|CARGO_INCREMENTAL|CARGO_TERM_.*|CARGO_NET_.*|CARGO_HTTP_.*|" +
+        "CARGO_REGISTR(Y|IES).*|CARGO_BUILD_JOBS|CARGO_LOG.*|RUSTUP_HOME|RUSTUP_(DIST|UPDATE).*|RUST_BACKTRACE|RUST_LOG)$",
+)
+val rustEnvPrefixes = listOf("CARGO_", "RUST", "CC_", "CXX_", "AR_", "CFLAGS", "CXXFLAGS", "BINDGEN_")
+val rustEnvironment: Provider<Map<String, String>> = rustEnvPrefixes
+    .map { prefix -> providers.environmentVariablesPrefixedBy(prefix) }
+    .reduce { acc, next -> acc.zip(next) { a, b -> a + b } }
+    .map { env -> env.filterKeys { key -> !rustEnvIgnored.matches(key) }.toSortedMap() }
+// cargo reads config.toml (or the legacy `config`) from the workspace root and `.cargo/` below it.
+val cargoConfigFiles: FileCollection = files(
+    workspace.file(".cargo/config.toml").asFile,
+    workspace.file(".cargo/config").asFile,
+    rootProject.layout.projectDirectory.file(".cargo/config.toml").asFile,
+    rootProject.layout.projectDirectory.file(".cargo/config").asFile,
+)
+val pinnedCargoNdk = libs.versions.cargoNdk.get()
 val cargoCommand: Provider<String> = providers.gradleProperty("vault.cargo").orElse("cargo")
 val minSdkLevel = libs.versions.minSdk.get().toInt()
 val pinnedNdk = libs.versions.ndk.get()
@@ -179,6 +237,11 @@ androidComponents {
             ndkDir.set(ndkDirectory)
             workspaceDir.set(workspace)
             cargo.set(cargoCommand)
+            cargoNdkVersion.set(pinnedCargoNdk)
+            ndkVersionKey.set(pinnedNdk)
+            rustEnv.set(rustEnvironment)
+            cargoConfig.from(cargoConfigFiles)
+            rustToolchainFile.set(workspace.file("rust-toolchain.toml"))
         }
         val bindings = tasks.register<UniffiBindgen>("uniffiBindgen$suffix") {
             description = "Generates the vault-ffi Kotlin bindings for ${variant.name}."
@@ -186,6 +249,11 @@ androidComponents {
             library.set(native.flatMap { t -> t.outputDir.file(targetAbis.map { "${it.first()}/libvault_ffi.so" }) })
             workspaceDir.set(workspace)
             cargo.set(cargoCommand)
+            cargoNdkVersion.set(pinnedCargoNdk)
+            ndkVersionKey.set(pinnedNdk)
+            rustEnv.set(rustEnvironment)
+            cargoConfig.from(cargoConfigFiles)
+            rustToolchainFile.set(workspace.file("rust-toolchain.toml"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(native, CargoNdkBuild::outputDir)
         variant.sources.kotlin?.addGeneratedSourceDirectory(bindings, UniffiBindgen::outputDir)
