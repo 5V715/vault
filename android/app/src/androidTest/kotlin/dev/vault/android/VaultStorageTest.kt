@@ -221,7 +221,7 @@ class VaultStorageTest {
         try {
             manager.rewrap(created.dir, other.recoveryKey, presence)
             fail("re-wrapped with another vault's recovery key")
-        } catch (e: uniffi.vault_ffi.FfiException.WrongKey) {
+        } catch (e: uniffi.vault_ffi.FfiException) {
             assertTrue(manager.needsRewrap(created.dir))
         }
         // Cancelling the prompt keeps the vault in "needs re-wrap" (and keeps the

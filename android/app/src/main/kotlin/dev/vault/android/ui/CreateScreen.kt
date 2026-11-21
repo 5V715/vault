@@ -5,6 +5,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -131,8 +132,17 @@ fun CreateScreen(
                         }
                     }
                 },
+                error = error,
+                onDiscard = {
+                    // A way out if confirming keeps failing (Back is blocked here).
+                    step = CreateStep.Working
+                    scope.launch {
+                        manager.discardCreated(s.created)
+                        error = null
+                        onBack()
+                    }
+                },
             )
-            error?.takeIf { step is CreateStep.Confirm }?.let { ErrorText(it) }
             CreateStep.Done -> {
                 Text("The vault is ready.", style = MaterialTheme.typography.titleLarge)
                 Text("Scan a pairing code in the browser app to use it.")
@@ -143,7 +153,13 @@ fun CreateScreen(
 }
 
 @Composable
-private fun ConfirmGroups(check: RecoveryConfirmation, onBackToKey: (() -> Unit)?, onConfirmed: () -> Unit) {
+private fun ConfirmGroups(
+    check: RecoveryConfirmation,
+    onBackToKey: (() -> Unit)?,
+    onConfirmed: () -> Unit,
+    error: String?,
+    onDiscard: () -> Unit,
+) {
     val answers = remember(check) { mutableStateListOf(*Array(check.indices.size) { "" }) }
     var wrong by remember(check) { mutableStateOf(false) }
     Text("Check your copy", style = MaterialTheme.typography.titleLarge)
@@ -157,4 +173,8 @@ private fun ConfirmGroups(check: RecoveryConfirmation, onBackToKey: (() -> Unit)
         modifier = Modifier.fillMaxWidth(),
     ) { Text("Check") }
     onBackToKey?.let { Button(onClick = it) { Text("Show the key again") } }
+    if (error != null) {
+        ErrorText(error)
+        OutlinedButton(onClick = onDiscard, modifier = Modifier.fillMaxWidth()) { Text("Discard this vault") }
+    }
 }

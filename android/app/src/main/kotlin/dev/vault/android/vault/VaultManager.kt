@@ -104,6 +104,11 @@ class VaultManager(
         storage.writeIdentity(created.dir, created.identity)
     }
 
+    /** The user gave up on a new vault before confirming its recovery key. */
+    suspend fun discardCreated(created: Created) {
+        discard(created.dir)
+    }
+
     /** Deletes a partial vault; never replaces the error that led here. */
     private suspend fun discard(dir: VaultDir) = withContext(NonCancellable + Dispatchers.IO) {
         runCatching { storage.delete(dir) }
@@ -150,7 +155,11 @@ class VaultManager(
     }
 
     /** Whether [dir]'s K_auth is gone or invalidated: "Re-wrap with recovery key". */
-    suspend fun needsRewrap(dir: VaultDir): Boolean = withContext(Dispatchers.IO) { !keys.isAuthKeyUsable(dir.id) }
+    suspend fun needsRewrap(dir: VaultDir): Boolean = withContext(Dispatchers.IO) {
+        // A re-wrap that never finished (process killed at the prompt) left a
+        // new K_auth that does not open the old wrapped file.
+        dir.rewrapPending.exists() || !keys.isAuthKeyUsable(dir.id)
+    }
 
     /**
      * Re-wrap after K_auth was invalidated: the recovery key opens the local
@@ -189,11 +198,15 @@ class VaultManager(
     suspend fun delete(dir: VaultDir) = withContext(Dispatchers.IO) { storage.delete(dir) }
 
     private suspend fun wrapAndStoreCrk(dir: VaultDir, crk: ByteArray, presence: UserPresence) {
+        // Marks "K_auth and crk.wrapped may not match" until the new file is in
+        // place, even if the process dies in between (then needsRewrap is true).
+        writeAtomically(dir.rewrapPending, ByteArray(0))
         keys.createAuthKey(dir.id)
         try {
             val cipher = presence.authenticate(PROTECT_TITLE, keys.authCipherForWrap(dir.id))
                 ?: throw PresenceCancelledException()
             writeAtomically(dir.wrappedCrk, keys.wrapCrk(dir.id, cipher, crk))
+            if (!dir.rewrapPending.delete()) throw java.io.IOException("cannot clear the re-wrap marker")
         } catch (t: Throwable) {
             // The wrapped file (if any) is under the old key: K_auth must not
             // look usable, or the vault would hide its re-wrap entry.

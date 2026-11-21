@@ -31,6 +31,9 @@ class VaultDir(val root: File) {
     val container: File get() = File(root, "container")
     val wrappedCrk: File get() = File(root, "crk.wrapped")
 
+    /** Present while a (re-)wrap of the CRK is unfinished. */
+    val rewrapPending: File get() = File(root, "rewrap.pending")
+
     fun sealed(kind: String): File = File(root, "$kind.sealed")
 
     /**
@@ -84,10 +87,16 @@ class VaultStorage(context: Context, private val keys: VaultKeys) : VaultReposit
      * process start, before any create or restore can be in flight.
      */
     fun sweepIncomplete() {
-        val dirs = (vaultsRoot.listFiles() ?: emptyArray()).filter { it.isDirectory && ID.matches(it.name) }
+        if (!vaultsRoot.exists()) vaultsRoot.mkdirs()
+        // A failed listing must never look like "no vaults": that would delete
+        // every vault's keys.
+        val entries = vaultsRoot.listFiles() ?: return
+        val dirs = entries.filter { it.isDirectory && ID.matches(it.name) }
         for (d in dirs.map(::VaultDir).filterNot { it.isComplete }) runCatching { delete(d) }
-        val present = dirs.filter { it.exists() }.map { it.name }.toSet()
-        for (id in keys.vaultIdsWithKeys() - present) keys.deleteKeys(id)
+        // Keys are deleted only when their directory is verifiably gone.
+        for (id in keys.vaultIdsWithKeys()) {
+            if (!File(vaultsRoot, id).exists()) keys.deleteKeys(id)
+        }
     }
 
     /** A new random replica id (16 hex characters). */
