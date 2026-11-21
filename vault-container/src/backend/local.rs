@@ -99,7 +99,39 @@ struct LockGuard(File);
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        // Closing the file releases the lock too; unlock explicitly anyway.
+        let _ = unlock(&self.0);
+    }
+}
+
+/// Exclusive advisory lock on `f`, blocking until it is granted. Unix (Android
+/// included): `flock(LOCK_EX)`, since std's `File::lock` returns `Unsupported`
+/// on Android. Elsewhere (Windows): std's `File::lock` (`LockFileEx`).
+fn lock_exclusive(f: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FlockOperation, flock};
+        loop {
+            match flock(f, FlockOperation::LockExclusive) {
+                Err(rustix::io::Errno::INTR) => continue,
+                r => return r.map_err(io::Error::from),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        f.lock()
+    }
+}
+
+fn unlock(f: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        rustix::fs::flock(f, rustix::fs::FlockOperation::Unlock).map_err(io::Error::from)
+    }
+    #[cfg(not(unix))]
+    {
+        f.unlock()
     }
 }
 
@@ -144,7 +176,7 @@ impl LocalBackend {
             .truncate(false)
             .open(self.root.join(LOCK_FILE))
             .map_err(io_err)?;
-        f.lock().map_err(io_err)?;
+        lock_exclusive(&f).map_err(io_err)?;
         Ok(LockGuard(f))
     }
 
@@ -244,5 +276,38 @@ impl ContainerBackend for LocalBackend {
             Ok(names)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Two backends over one directory (as two processes would have): while
+    /// one holds the lock, the other blocks until it is released.
+    #[test]
+    fn local_backend_lock_excludes_second_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = LocalBackend::open_blocking(dir.path()).unwrap();
+        let b = LocalBackend::open_blocking(dir.path()).unwrap();
+        let held = a.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let g = b.lock().unwrap();
+            tx.send(()).unwrap();
+            drop(g);
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "second opener got the lock while it was held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("second opener did not get the lock after release");
+        t.join().unwrap();
+        // Released on drop: it can be taken again.
+        drop(a.lock().unwrap());
     }
 }

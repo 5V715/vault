@@ -63,6 +63,9 @@ jobs:
           set -eo pipefail
           set -x
           cargo ndk --platform 30 -t arm64-v8a -t armeabi-v7a -t x86_64 build -p vault-ffi --release --locked
+          # vault-container on Android on its own (as vault-ffi embeds it, plus its
+          # tests): the local backend's flock path is the Unix one there.
+          cargo ndk --platform 30 -t arm64-v8a -t x86_64 check -p vault-container --no-default-features --lib --tests --locked
           out="$(mktemp -d)"
           cargo run -p vault-ffi --features bindgen --bin uniffi-bindgen --locked -- \
             generate --library target/aarch64-linux-android/release/libvault_ffi.so --language kotlin --no-format --out-dir "$out"

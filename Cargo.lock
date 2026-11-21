@@ -2663,6 +2663,7 @@ dependencies = [
  "rand_chacha",
  "reqwest",
  "rpassword",
+ "rustix",
  "serde",
  "sha2",
  "subtle",

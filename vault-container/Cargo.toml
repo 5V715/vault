@@ -41,6 +41,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 quick-xml = "0.38"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
+# The advisory lock on `<root>/.lock` (flock; std's `File::lock` is unsupported
+# on Android). Windows uses std's `File::lock` (LockFileEx).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs"] }
+
 [dev-dependencies]
 rand_chacha = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net"] }
