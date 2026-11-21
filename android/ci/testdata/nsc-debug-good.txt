@@ -1,0 +1,17 @@
+N: (xml)
+  E: network-security-config (line=7)
+    E: base-config (line=8)
+      A: cleartextTrafficPermitted="false" (Raw: "false")
+      E: trust-anchors (line=9)
+        E: certificates (line=10)
+          A: src="system" (Raw: "system")
+        E: certificates (line=11)
+          A: src="user" (Raw: "user")
+    E: domain-config (line=13)
+      A: cleartextTrafficPermitted="true" (Raw: "true")
+      E: domain (line=14)
+        A: includeSubdomains="false" (Raw: "false")
+        T: 'localhost'
+      E: domain (line=15)
+        A: includeSubdomains="false" (Raw: "false")
+        T: '127.0.0.1'

@@ -113,6 +113,8 @@ jobs:
             exit 1
           fi
           grep -cE 'net\.java\.dev\.jna:jna|androidx\.compose\.material3:material3' /tmp/app-deps.txt
+      - name: APK checker self-test (the assertions fail on bad manifests)
+        run: android/ci/check-apks-selftest.sh
       - name: APK contents and hardening
         run: android/ci/check-apks.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

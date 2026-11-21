@@ -1,0 +1,24 @@
+N: android=http://schemas.android.com/apk/res/android (line=2)
+  E: manifest (line=2)
+    A: http://schemas.android.com/apk/res/android:versionCode(0x0101021b)=1
+    E: application (line=9)
+      A: http://schemas.android.com/apk/res/android:label(0x01010001)=@0x7f0f001b
+      A: http://schemas.android.com/apk/res/android:allowBackup(0x01010280)=false
+      A: http://schemas.android.com/apk/res/android:usesCleartextTraffic(0x010104ec)=false
+      E: activity (line=18)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="dev.vault.android.MainActivity" (Raw: "dev.vault.android.MainActivity")
+        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+        E: intent-filter (line=21)
+          E: action (line=22)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.action.MAIN" (Raw: "android.intent.action.MAIN")
+          E: category (line=23)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="android.intent.category.LAUNCHER" (Raw: "android.intent.category.LAUNCHER")
+      E: provider (line=30)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.startup.InitializationProvider" (Raw: "androidx.startup.InitializationProvider")
+        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
+      E: receiver (line=40)
+        A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.profileinstaller.ProfileInstallReceiver" (Raw: "androidx.profileinstaller.ProfileInstallReceiver")
+        A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
+        E: intent-filter (line=45)
+          E: action (line=46)
+            A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.profileinstaller.action.INSTALL_PROFILE" (Raw: "androidx.profileinstaller.action.INSTALL_PROFILE")
