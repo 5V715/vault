@@ -25,5 +25,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- androidx.profileinstaller (pulled in transitively by Compose) adds an
+             exported receiver that lets other apps trigger profile installs. A
+             sideloaded vault has no use for it, and check-apks.sh asserts that
+             MainActivity is the only exported component. Lint's MissingClass check
+             doesn't see the class on its debug classpath, although the release
+             merged manifest contains it (CI run 44906389916), hence the ignore. -->
+        <receiver
+            android:name="androidx.profileinstaller.ProfileInstallReceiver"
+            tools:ignore="MissingClass"
+            tools:node="remove" />
     </application>
 </manifest>
