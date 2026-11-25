@@ -334,7 +334,8 @@ class PairingTest {
                 .onEnter { !java.nio.file.Files.isSymbolicLink(it.toPath()) }
                 .filter { it.isFile }
                 .toList()
-            assertTrue(files.any { it.path.startsWith(dir.root.path) })
+            val vaultRoot = dir.root.canonicalPath + File.separator
+            assertTrue(files.any { it.canonicalPath.startsWith(vaultRoot) })
             val needles = mapOf(
                 "the CRK" to crk,
                 "vault data" to marker.toByteArray(),

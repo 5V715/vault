@@ -25,6 +25,23 @@ if [ -n "${VAULT_STAND_IN:-}" ]; then
 fi
 ci/gradle.sh --stacktrace "${extra[@]}" "$@"
 rc=$?
+
+# Every instrumented test's result, passed ones included (the job log is the
+# record of which tests ran; skipped ones are not passes).
+echo "::group::instrumented test results"
+python3 - <<'PY'
+import glob, xml.etree.ElementTree as ET
+for f in sorted(glob.glob("*/build/outputs/androidTest-results/connected/**/*.xml", recursive=True)):
+    for case in ET.parse(f).getroot().iter("testcase"):
+        if case.find("skipped") is not None:
+            status = "SKIPPED"
+        elif case.find("failure") is not None or case.find("error") is not None:
+            status = "FAILED"
+        else:
+            status = "passed"
+        print(f"{status:8} {case.get('classname')}.{case.get('name')} ({case.get('time')} s)")
+PY
+echo "::endgroup::"
 [ "$rc" = 0 ] && exit 0
 
 if [ -n "${VAULT_STAND_IN_LOG:-}" ] && [ -f "$VAULT_STAND_IN_LOG" ]; then
