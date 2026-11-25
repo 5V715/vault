@@ -62,6 +62,17 @@ jobs:
         run: >-
           ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256
           -Pvault.abis=x86_64 :ffi:assembleDebug :ffi:assembleDebugAndroidTest :app:assembleDebugAndroidTest
+      # The pairing tests' browser stand-in, as in ci.yml's emulator job.
+      - name: build and start the browser stand-in (host)
+        run: |
+          cargo build --locked -p vault-client --example browser_stand_in
+          nohup target/debug/examples/browser_stand_in 47100 47101 > "$RUNNER_TEMP/stand-in.log" 2>&1 &
+          for _ in $(seq 50); do
+            curl -fsS http://127.0.0.1:47101/healthz && exit 0
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/stand-in.log"
+          exit 1
       # Same as ci.yml's emulator job: the runner's free disk is below what the
       # emulator's userdata partition needs unless unused toolchains are removed.
       - name: free disk space for the emulator
@@ -83,7 +94,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           working-directory: android
-          script: ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest :app:connectedDebugAndroidTest
+          script: adb reverse tcp:47100 tcp:47100 && adb reverse tcp:47101 tcp:47101 && ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 -Pandroid.testInstrumentationRunnerArguments.standIn=47101 :ffi:connectedDebugAndroidTest :app:connectedDebugAndroidTest
       - name: summary
         run: |
           f=android/gradle/verification-metadata.xml

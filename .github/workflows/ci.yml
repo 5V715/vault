@@ -133,9 +133,9 @@ jobs:
             android/*/build/test-results/
           if-no-files-found: ignore
 
-  # The FFI smoke test (ffi_loads_and_creates_vault) on x86_64 emulators: the
-  # oldest supported API level (minSdk 30) and a recent one. Only the x86_64
-  # library is built here.
+  # The instrumented tests (FFI smoke test, Keystore and storage flows, pairing
+  # against the browser stand-in) on x86_64 emulators: the oldest supported API
+  # level (minSdk 30) and a recent one. Only the x86_64 library is built here.
   android-emulator:
     name: android emulator (API ${{ matrix.api-level }})
     runs-on: ubuntu-latest
@@ -167,6 +167,13 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: build the test APKs (x86_64 only)
         run: android/ci/gradle.sh --stacktrace -Pvault.abis=x86_64 :ffi:assembleDebugAndroidTest :app:assembleDebugAndroidTest
+      # The pairing tests' browser: a relay plus the browser side of a pairing
+      # (vault-client, native) on the host, driven by the tests over a control
+      # port; connected-test.sh forwards both ports into the emulator.
+      - name: build the browser stand-in (host)
+        run: |
+          cargo build --locked -p vault-client --example browser_stand_in
+          cp target/debug/examples/browser_stand_in "$RUNNER_TEMP/browser_stand_in"
       # The API 36 image needs about 7.4 GB for its userdata partition at the
       # default size; the runner had 5.4 GB left. The Rust target dir is not
       # needed any more (cargoNdk's outputs are in android/ffi/build and stay
@@ -178,7 +185,19 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift \
             /usr/local/share/boost /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/system-images/android-2*
           df -h / "$HOME"
+      - name: start the browser stand-in (relay 127.0.0.1:47100, control 127.0.0.1:47101)
+        run: |
+          nohup "$RUNNER_TEMP/browser_stand_in" 47100 47101 > "$RUNNER_TEMP/stand-in.log" 2>&1 &
+          for _ in $(seq 50); do
+            curl -fsS http://127.0.0.1:47101/healthz && exit 0
+            sleep 0.2
+          done
+          cat "$RUNNER_TEMP/stand-in.log"
+          exit 1
       - uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          VAULT_STAND_IN: "47100 47101"
+          VAULT_STAND_IN_LOG: ${{ runner.temp }}/stand-in.log
         with:
           api-level: ${{ matrix.api-level }}
           arch: x86_64
@@ -200,6 +219,7 @@ jobs:
             android/**/build/reports/androidTests/**
             android/**/build/outputs/androidTest-results/**
             android/build/connected-logcat.txt
+            ${{ runner.temp }}/stand-in.log
           if-no-files-found: warn
 
   # The three shipped binaries (vaultctl, vault-dev, vault-relay) on the other

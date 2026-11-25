@@ -5,12 +5,33 @@
 # trace from the XML results and the relevant logcat lines (also saved to
 # build/connected-logcat.txt for the uploaded artifacts). Arguments go to Gradle
 # (android/ci/gradle.sh), e.g. -Pvault.abis=x86_64 :ffi:connectedDebugAndroidTest.
+#
+# VAULT_STAND_IN="<relay port> <control port>": the browser stand-in
+# (vault-client/examples/browser_stand_in.rs) runs on the host on those ports.
+# Both are forwarded into the emulator with `adb reverse`, so the app reaches
+# them on its own 127.0.0.1 (the only host plain ws:// is allowed for), and the
+# control port goes to the pairing tests as the instrumentation argument standIn.
+# VAULT_STAND_IN_LOG: its log, printed on failure.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 adb logcat -c || true
-ci/gradle.sh --stacktrace "$@"
+extra=()
+if [ -n "${VAULT_STAND_IN:-}" ]; then
+  read -r relay_port control_port <<<"$VAULT_STAND_IN"
+  for p in "$relay_port" "$control_port"; do
+    adb reverse "tcp:$p" "tcp:$p" || { echo "connected-test: adb reverse tcp:$p failed" >&2; exit 1; }
+  done
+  extra+=("-Pandroid.testInstrumentationRunnerArguments.standIn=$control_port")
+fi
+ci/gradle.sh --stacktrace "${extra[@]}" "$@"
 rc=$?
 [ "$rc" = 0 ] && exit 0
+
+if [ -n "${VAULT_STAND_IN_LOG:-}" ] && [ -f "$VAULT_STAND_IN_LOG" ]; then
+  echo "::group::browser stand-in log"
+  tail -n 200 "$VAULT_STAND_IN_LOG"
+  echo "::endgroup::"
+fi
 
 echo "::group::failed instrumented tests (stack traces)"
 python3 - <<'PY'
