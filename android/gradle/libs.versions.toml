@@ -21,6 +21,10 @@ activityCompose = "1.13.0"
 kotlinxCoroutines = "1.11.0"
 # UniFFI's Kotlin runtime; the Android AAR carries libjnidispatch for each ABI.
 jna = "5.19.1"
+# QR scanning (spec "QR scanning"): CameraX for the preview and frames, ZXing's
+# core decoder (Apache-2.0, plain Java). No Play Services / ML Kit.
+camerax = "1.4.2"
+zxing = "3.5.3"
 junit = "4.13.2"
 androidxTestCore = "1.7.0"
 androidxTestRunner = "1.7.0"
@@ -34,6 +38,11 @@ activity-compose = { module = "androidx.activity:activity-compose", version.ref 
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+camera-core = { module = "androidx.camera:camera-core", version.ref = "camerax" }
+camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "camerax" }
+camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camerax" }
+camera-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
+zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
 junit = { module = "junit:junit", version.ref = "junit" }
 androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTestCore" }
 androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidxTestRunner" }
