@@ -17,12 +17,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import dev.vault.android.R
+import dev.vault.android.pairing.RunningSession
 import dev.vault.android.storage.VaultDir
 import dev.vault.core.VaultIdentity
 
@@ -37,13 +39,26 @@ fun VaultsScreen(
     onOpen: (VaultEntry) -> Unit,
     onCreate: () -> Unit,
     onRestore: () -> Unit,
+    onScan: () -> Unit,
+    sessions: List<RunningSession>,
+    onStopSession: (vaultId: String) -> Unit,
     modifier: Modifier = Modifier,
+    footer: @Composable () -> Unit = {},
 ) {
     Scaffold(
         modifier = modifier,
         topBar = { TopAppBar(title = { Text(stringResource(R.string.vaults_title)) }) },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            for (session in sessions) {
+                ListItem(
+                    overlineContent = { Text("Session running") },
+                    headlineContent = { Text(session.identity.origin) },
+                    supportingContent = { Text("${session.identity.appId} · ${session.deviceName} · ${sinceText(session.sinceMillis)}") },
+                    trailingContent = { TextButton(onClick = { onStopSession(session.vaultId) }) { Text("Stop") } },
+                )
+                HorizontalDivider()
+            }
             when {
                 vaults == null -> Column(Modifier.padding(16.dp)) { Working("Loading…") }
                 vaults.isEmpty() -> Text(
@@ -66,8 +81,12 @@ fun VaultsScreen(
                 modifier = Modifier.fillMaxWidth().padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Button(onClick = onCreate, modifier = Modifier.fillMaxWidth()) { Text("Create a vault") }
+                if (!vaults.isNullOrEmpty()) {
+                    Button(onClick = onScan, modifier = Modifier.fillMaxWidth()) { Text("Scan a pairing code") }
+                }
+                OutlinedButton(onClick = onCreate, modifier = Modifier.fillMaxWidth()) { Text("Create a vault") }
                 OutlinedButton(onClick = onRestore, modifier = Modifier.fillMaxWidth()) { Text("Restore a vault") }
+                footer()
             }
         }
     }

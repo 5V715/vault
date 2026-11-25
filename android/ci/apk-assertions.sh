@@ -100,3 +100,20 @@ assert_debug_nsc_loopback_only() {
     fail "$label: debug NSC lists no loopback domain (aapt2 output format changed?)"
   fi
 }
+
+# The debug-only "import CA" setting (src/debug's DebugCa, label "Import a CA
+# certificate") is in the debug dex files and absent from release. The dump is
+# the APK's classes*.dex concatenated (`unzip -p <apk> 'classes*.dex'`).
+DEBUG_CA_MARKER='Import a CA certificate'
+assert_dex_has_debug_ca_setting() {
+  local dump=$1 label=$2
+  [ -s "$dump" ] || fail "$label: no dex content to inspect"
+  grep -aqF "$DEBUG_CA_MARKER" "$dump" || fail "$label: the debug-only import CA setting is missing"
+}
+assert_dex_lacks_debug_ca_setting() {
+  local dump=$1 label=$2
+  [ -s "$dump" ] || fail "$label: no dex content to inspect"
+  if grep -aqF "$DEBUG_CA_MARKER" "$dump"; then
+    fail "$label: contains the debug-only import CA setting"
+  fi
+}

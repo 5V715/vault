@@ -5,7 +5,7 @@
 # network-security hardening as packaged (release: system CAs only, no cleartext;
 # debug: user CAs added, cleartext to loopback only), exported=true only on the
 # launcher MainActivity, release not debuggable, data extraction rules excluding
-# every domain. The assertions live in apk-assertions.sh (self-tested by
+# every domain, and the debug-only "import CA" setting absent from release. The assertions live in apk-assertions.sh (self-tested by
 # check-apks-selftest.sh). Needs ANDROID_HOME and ANDROID_BUILD_TOOLS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -64,6 +64,12 @@ grep -q '"user"' /tmp/nsc-release.txt && fail "release trusts user CAs"
 grep -q '"system"' /tmp/nsc-release.txt || fail "release does not trust system CAs"
 grep -qiE 'cleartextTrafficPermitted.*true' /tmp/nsc-release.txt && fail "release permits cleartext"
 grep -q 'domain-config' /tmp/nsc-release.txt && fail "release has a domain-config"
+
+echo "== debug-only import CA setting (debug: present, release: absent)"
+unzip -p "$debug" 'classes*.dex' > /tmp/dex-debug.bin
+unzip -p "$release" 'classes*.dex' > /tmp/dex-release.bin
+assert_dex_has_debug_ca_setting /tmp/dex-debug.bin "$debug"
+assert_dex_lacks_debug_ca_setting /tmp/dex-release.bin "$release"
 
 echo "== debug network security config"
 nsc "$debug" | tee /tmp/nsc-debug.txt

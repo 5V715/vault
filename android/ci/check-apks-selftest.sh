@@ -43,6 +43,12 @@ expect_fail assert_debug_nsc_loopback_only nsc-debug-bad-domain.txt 'non-loopbac
 expect_fail assert_debug_nsc_loopback_only nsc-debug-bad-base.txt 'base-config permits cleartext'
 expect_fail assert_debug_nsc_loopback_only nsc-debug-no-user-cas.txt 'does not trust user CAs'
 
+expect_pass assert_dex_has_debug_ca_setting dex-debug-ca.bin
+expect_fail assert_dex_has_debug_ca_setting dex-no-debug-ca.bin 'import CA setting is missing'
+expect_pass assert_dex_lacks_debug_ca_setting dex-no-debug-ca.bin
+expect_fail assert_dex_lacks_debug_ca_setting dex-debug-ca.bin 'contains the debug-only import CA setting'
+expect_fail assert_dex_lacks_debug_ca_setting empty.bin 'no dex content'
+
 if [ "$errors" -ne 0 ]; then
   echo "check-apks-selftest: $errors failure(s)" >&2
   exit 1

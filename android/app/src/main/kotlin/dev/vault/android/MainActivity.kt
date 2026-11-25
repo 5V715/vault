@@ -9,15 +9,19 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.LifecycleOwner
 import dev.vault.android.vault.BiometricPresence
 import dev.vault.android.ui.CreateScreen
+import dev.vault.android.ui.PairingScreen
 import dev.vault.android.ui.RestoreScreen
 import dev.vault.android.ui.RewrapScreen
+import dev.vault.android.ui.ScanScreen
 import dev.vault.android.ui.VaultDetailScreen
 import dev.vault.android.ui.VaultEntry
 import dev.vault.android.ui.VaultTheme
@@ -36,6 +40,11 @@ private sealed interface Screen {
     data class Detail(val entry: VaultEntry) : Screen
 
     data class Rewrap(val entry: VaultEntry) : Screen
+
+    data object Scan : Screen
+
+    /** The pairing in progress or just ended ([dev.vault.android.pairing.PairingCoordinator.pairing]). */
+    data object Pairing : Screen
 }
 
 class MainActivity : ComponentActivity() {
@@ -50,18 +59,30 @@ class MainActivity : ComponentActivity() {
         val presence = BiometricPresence(this)
         setContent {
             VaultTheme {
-                App(app, presence)
+                App(app, presence, this)
             }
         }
+    }
+
+    /**
+     * Leaving the app (or the activity dying) while an approval is pending is
+     * a denial; before the browser connected it cancels the pairing. Running
+     * sessions are held by the foreground service and go on.
+     */
+    override fun onStop() {
+        super.onStop()
+        (application as VaultApp).pairing.backgrounded()
     }
 }
 
 @Composable
-private fun App(app: VaultApp, presence: BiometricPresence) {
+private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwner) {
     var screen by remember { mutableStateOf<Screen>(Screen.List) }
     var vaults by remember { mutableStateOf<List<VaultEntry>?>(null) }
     var reload by remember { mutableIntStateOf(0) }
     val catalog = remember { VaultCatalog(app.storage) }
+    val pairing = remember { app.pairing }
+    val sessions by pairing.running.collectAsState()
 
     LaunchedEffect(reload) {
         vaults = withContext(Dispatchers.IO) {
@@ -75,7 +96,7 @@ private fun App(app: VaultApp, presence: BiometricPresence) {
         reload++
         screen = Screen.List
     }
-    BackHandler(enabled = screen is Screen.Detail || screen is Screen.Rewrap) {
+    BackHandler(enabled = screen is Screen.Detail || screen is Screen.Rewrap || screen is Screen.Scan) {
         screen = when (val s = screen) {
             is Screen.Rewrap -> Screen.Detail(s.entry)
             else -> Screen.List
@@ -88,6 +109,10 @@ private fun App(app: VaultApp, presence: BiometricPresence) {
             onOpen = { screen = Screen.Detail(it) },
             onCreate = { screen = Screen.Create() },
             onRestore = { screen = Screen.Restore },
+            onScan = { screen = Screen.Scan },
+            sessions = sessions,
+            onStopSession = pairing::stopSession,
+            footer = { DebugCa.Setting(app.keys) },
         )
         is Screen.Create -> CreateScreen(
             manager = app.manager,
@@ -115,5 +140,38 @@ private fun App(app: VaultApp, presence: BiometricPresence) {
             onDone = { screen = Screen.Detail(s.entry) },
             onBack = { screen = Screen.Detail(s.entry) },
         )
+        Screen.Scan -> ScanScreen(
+            pairing = pairing,
+            lifecycleOwner = owner,
+            onStarted = { screen = Screen.Pairing },
+            onBack = ::home,
+        )
+        Screen.Pairing -> {
+            val view by pairing.pairing.collectAsState()
+            val v = view
+            if (v == null) {
+                LaunchedEffect(Unit) { home() }
+            } else {
+                PairingScreen(
+                    view = v,
+                    onApprove = { pairing.approve(presence) },
+                    onDeny = pairing::deny,
+                    onStop = pairing::stopSession,
+                    onCreate = { offer ->
+                        pairing.dismiss()
+                        screen = Screen.Create(offer.appId, offer.origin)
+                    },
+                    onRewrap = { id ->
+                        pairing.dismiss()
+                        val entry = vaults?.firstOrNull { it.dir.id == id }
+                        screen = if (entry != null) Screen.Rewrap(entry) else Screen.List
+                    },
+                    onDone = {
+                        pairing.dismiss()
+                        home()
+                    },
+                )
+            }
+        }
     }
 }
