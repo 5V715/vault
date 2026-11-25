@@ -342,7 +342,13 @@ class PairingTest {
                 "the recovery key" to recoveryKey.toByteArray(),
             )
             for (f in files) {
-                val bytes = f.readBytes()
+                // A temporary file of an atomic write (a high-water save after
+                // the commit) may be gone already; what it held is in its target.
+                val bytes = try {
+                    f.readBytes()
+                } catch (e: java.io.FileNotFoundException) {
+                    continue
+                }
                 for ((what, needle) in needles) {
                     assertFalse("$what in clear in ${f.relativeTo(context.dataDir)}", bytes.contains(needle))
                 }
@@ -352,7 +358,11 @@ class PairingTest {
             // (A copy, because this process still holds the container.)
             death.deleteRecursively()
             val copy = VaultDir(File(death, dir.id))
-            assertTrue(dir.root.copyRecursively(copy.root))
+            assertTrue(
+                dir.root.copyRecursively(copy.root) { _, e ->
+                    if (e is NoSuchFileException) OnErrorAction.SKIP else throw e
+                },
+            )
             VaultManager(storage, keys).use { fresh ->
                 runBlocking { fresh.open(copy) }.use { h ->
                     assertTrue(h.isLocked())
