@@ -145,6 +145,12 @@ class PairingMachine {
 
         data object ConnectFailed : Event
 
+        /**
+         * `serve_offer` failed because the relay mailbox was already taken
+         * (after the approver was warned, if the warning got through).
+         */
+        data object MailboxTaken : Event
+
         /** The user cancelled while the browser had not connected yet. */
         data object UserCancelled : Event
 
@@ -227,6 +233,10 @@ class PairingMachine {
                     emptyList()
                 }
                 Event.ConnectFailed -> end(s.vault, PairingOutcome.RelayUnreachable)
+                Event.MailboxTaken -> {
+                    end(s.vault, PairingOutcome.MailboxTaken)
+                    listOf(Effect.CancelServe)
+                }
                 // Leaving the app before the browser connects abandons the pairing,
                 // so a request can't become approvable behind the user's back.
                 Event.UserCancelled, Event.UserDenied, Event.Backgrounded -> {
@@ -251,6 +261,9 @@ class PairingMachine {
                     s.vault,
                     if (s.request.mailboxTaken) PairingOutcome.MailboxTaken else PairingOutcome.Denied(byUser = false),
                 )
+                // Only a mailbox-taken warning can be on screen here (serve_offer
+                // reports it after asking); answer it if it is still waiting.
+                Event.MailboxTaken -> deny(s.vault, PairingOutcome.MailboxTaken)
                 // Rust cancelled the prompt (timeout, browser gone): no answer needed.
                 is Event.SessionEnded -> end(s.vault, beforePrompt(event.reason, null))
                 else -> emptyList()

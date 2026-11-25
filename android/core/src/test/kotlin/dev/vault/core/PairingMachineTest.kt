@@ -142,6 +142,29 @@ class PairingMachineTest {
     }
 
     @Test
+    fun mailbox_taken_reported_by_serve_offer_ends_the_pairing() {
+        // serve_offer failed with MailboxTaken before the warning reached the screen.
+        val early = Run()
+        early.on(Event.Scanned(offer, vault = identity))
+        early.effects.clear()
+        assertEquals(State.Ended(identity, PairingOutcome.MailboxTaken), early.on(Event.MailboxTaken))
+        assertEquals(listOf(Effect.CancelServe), early.effects)
+        // While the warning is shown: it is answered (deny), never approved.
+        val shown = Run()
+        toPrompt(shown, request.copy(deviceName = "", sas = "", mailboxTaken = true))
+        shown.effects.clear()
+        assertEquals(State.Ended(identity, PairingOutcome.MailboxTaken), shown.on(Event.MailboxTaken))
+        assertEquals(listOf(Effect.AnswerDeny), shown.effects)
+        // After the user denied, the report changes nothing.
+        val denied = Run()
+        toPrompt(denied, request.copy(deviceName = "", sas = "", mailboxTaken = true))
+        denied.on(Event.UserDenied)
+        denied.effects.clear()
+        assertEquals(State.Ended(identity, PairingOutcome.MailboxTaken), denied.on(Event.MailboxTaken))
+        assertEquals(emptyList<Effect>(), denied.effects)
+    }
+
+    @Test
     fun scan_errors_end_with_a_clear_message() {
         val noVault = Run()
         assertEquals(
