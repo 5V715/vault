@@ -7,6 +7,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- The relay (pairing, sessions) and the replicas: all TLS, from Rust. -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- The screen-lock prompt that unwraps each vault's key (BiometricPrompt). -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <!-- Scanning the pairing code (CameraX + ZXing on the device; no Play Services). -->
@@ -66,5 +68,20 @@
             android:name="androidx.profileinstaller.ProfileInstallReceiver"
             tools:ignore="MissingClass"
             tools:node="remove" />
+
+        <!-- profileinstaller's startup initializer writes files/profileInstalled
+             a few seconds after launch: app data outside the vault directories
+             (VaultStorageTest.files_in_no_backup_dir caught it, CI run
+             45692890745). The app ships no baseline profile it needs. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:ignore="MissingClass"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+                tools:node="remove" />
+        </provider>
     </application>
 </manifest>
