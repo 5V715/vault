@@ -23,11 +23,24 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 adb logcat -c || true
 extra=()
+root=""
 if [ -n "${VAULT_STAND_IN:-}" ]; then
   read -r relay_port control_port <<<"$VAULT_STAND_IN"
+  # The process-death check kills the app with kill -9, which needs root
+  # (run-as can't on API 30: "unknown pid", CI run 45742058742); the emulator
+  # images are rootable. adbd restarts as root here, before the reverse
+  # forwards exist (a restart later drops them: CI run 45744117861).
+  echo "adb root: $(adb root 2>&1)"
+  adb wait-for-device
+  for _ in $(seq 30); do
+    [ "$(adb shell id -u 2>/dev/null | tr -d '\r')" = 0 ] && { root=1; break; }
+    sleep 1
+  done
+  echo "adb shell runs as root: ${root:-no}"
   for p in "$relay_port" "$control_port"; do
     adb reverse "tcp:$p" "tcp:$p" || { echo "connected-test: adb reverse tcp:$p failed" >&2; exit 1; }
   done
+  adb reverse --list
   extra+=("-Pandroid.testInstrumentationRunnerArguments.standIn=$control_port")
 fi
 death_class=dev.vault.android.pairing.ProcessDeathTest
@@ -49,17 +62,6 @@ process_death() {
   local props=() a pid state out
   for a in "$@"; do [[ $a == -P* ]] && props+=("$a"); done
   ci/gradle.sh --stacktrace "${props[@]}" :app:installDebug :app:installDebugAndroidTest || { death_fail "install failed"; return 1; }
-  # kill -9 of another uid's process needs root (run-as can't on API 30:
-  # "unknown pid", CI run 45742058742). The emulator images are rootable;
-  # restarting adbd drops the reverse forwards, so they are set again.
-  local root=""
-  if adb root 2>&1 | grep -qiE 'restarting adbd as root|already running as root'; then
-    adb wait-for-device
-    for _ in $(seq 30); do [ "$(adb shell id -u | tr -d '\r')" = 0 ] && { root=1; break; }; sleep 1; done
-    for p in "$relay_port" "$control_port"; do
-      adb reverse "tcp:$p" "tcp:$p" || { death_fail "adb reverse tcp:$p after adb root failed"; return 1; }
-    done
-  fi
   adb shell am instrument -w -e standIn "$control_port" -e processDeathPhase setup \
     -e class "$death_class#process_death_setup" "$runner" > build/process-death-setup.txt 2>&1 &
   local inst=$!
