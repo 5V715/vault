@@ -18,6 +18,7 @@ import dev.vault.android.MainActivity
 import dev.vault.android.R
 import dev.vault.android.VaultApp
 import dev.vault.core.SessionNotice
+import java.lang.ref.WeakReference
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -62,6 +63,7 @@ class SessionService : Service() {
             registerReceiver(screenOff, filter)
         }
         coordinator.attach(this)
+        live = WeakReference(this)
         runningState.value = true
     }
 
@@ -85,6 +87,7 @@ class SessionService : Service() {
     override fun onDestroy() {
         unregisterReceiver(screenOff)
         coordinator.detach(this, requested = stopping)
+        if (live?.get() === this) live = null
         runningState.value = false
         super.onDestroy()
     }
@@ -150,6 +153,15 @@ class SessionService : Service() {
         const val START_MODE = Service.START_NOT_STICKY
 
         private val runningState = MutableStateFlow(false)
+
+        @Volatile
+        private var live: WeakReference<SessionService>? = null
+
+        /**
+         * The running instance's foreground service type as the system holds
+         * it (0 when not in the foreground), or null without an instance.
+         */
+        fun liveForegroundServiceType(): Int? = live?.get()?.foregroundServiceType
 
         /** Whether the service exists (between onCreate and onDestroy). */
         val running: StateFlow<Boolean> = runningState.asStateFlow()

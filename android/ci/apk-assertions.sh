@@ -101,19 +101,25 @@ assert_debug_nsc_loopback_only() {
   fi
 }
 
-# The debug-only "import CA" setting (src/debug's DebugCa, label "Import a CA
-# certificate") is in the debug dex files and absent from release. The dump is
-# the APK's classes*.dex concatenated (`unzip -p <apk> 'classes*.dex'`).
-DEBUG_CA_MARKER='Import a CA certificate'
-assert_dex_has_debug_ca_setting() {
-  local dump=$1 label=$2
+# Debug-only code (src/debug: the "import CA" setting and the instrumented
+# tests' coordinator hook) is in the debug dex files and absent from release.
+# Each marker is a string that only that code holds: the CA setting's label and
+# its sealed file name, and the hook's function name. The dump is the APK's
+# classes*.dex concatenated (`unzip -p <apk> 'classes*.dex'`).
+DEBUG_ONLY_MARKERS=('Import a CA certificate' 'debug-extra-ca.sealed' 'replacePairingForTest')
+assert_dex_has_debug_only_code() {
+  local dump=$1 label=$2 m
   [ -s "$dump" ] || fail "$label: no dex content to inspect"
-  grep -aqF "$DEBUG_CA_MARKER" "$dump" || fail "$label: the debug-only import CA setting is missing"
+  for m in "${DEBUG_ONLY_MARKERS[@]}"; do
+    grep -aqF "$m" "$dump" || fail "$label: debug-only code is missing (no '$m')"
+  done
 }
-assert_dex_lacks_debug_ca_setting() {
-  local dump=$1 label=$2
+assert_dex_lacks_debug_only_code() {
+  local dump=$1 label=$2 m
   [ -s "$dump" ] || fail "$label: no dex content to inspect"
-  if grep -aqF "$DEBUG_CA_MARKER" "$dump"; then
-    fail "$label: contains the debug-only import CA setting"
-  fi
+  for m in "${DEBUG_ONLY_MARKERS[@]}"; do
+    if grep -aqF "$m" "$dump"; then
+      fail "$label: contains debug-only code ('$m')"
+    fi
+  done
 }

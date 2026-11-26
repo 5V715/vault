@@ -182,11 +182,23 @@ class VaultManager(
      * vault-ffi and wipes it at once. Throws [AuthKeyInvalidatedException] when
      * a re-wrap is needed, [PresenceCancelledException] on cancel.
      */
-    suspend fun unwrapCrk(dir: VaultDir, presence: UserPresence): ByteArray = withContext(Dispatchers.IO) {
-        val wrapped = dir.wrappedCrk.readBytes()
-        val cipher = presence.authenticate(UNLOCK_TITLE, keys.authCipherForUnwrap(dir.id, wrapped))
-            ?: throw PresenceCancelledException()
-        keys.unwrapCrk(dir.id, cipher, wrapped)
+    suspend fun unwrapCrk(dir: VaultDir, presence: UserPresence): ByteArray {
+        // Held outside withContext: if the caller is cancelled after the
+        // decryption, withContext throws on the way back and its result
+        // would be dropped without being wiped.
+        var crk: ByteArray? = null
+        try {
+            withContext(Dispatchers.IO) {
+                val wrapped = dir.wrappedCrk.readBytes()
+                val cipher = presence.authenticate(UNLOCK_TITLE, keys.authCipherForUnwrap(dir.id, wrapped))
+                    ?: throw PresenceCancelledException()
+                crk = keys.unwrapCrk(dir.id, cipher, wrapped)
+            }
+            return checkNotNull(crk)
+        } catch (t: Throwable) {
+            crk?.fill(0)
+            throw t
+        }
     }
 
     /** Opens [dir] locked, for stats; the caller closes the handle. */

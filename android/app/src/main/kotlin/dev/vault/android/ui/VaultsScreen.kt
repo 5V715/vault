@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import dev.vault.android.R
 import dev.vault.android.pairing.RunningSession
 import dev.vault.android.storage.VaultDir
+import dev.vault.core.Untrusted
 import dev.vault.core.VaultIdentity
 
 /** A vault on this phone: its files and its identity. */
@@ -52,9 +53,10 @@ fun VaultsScreen(
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             for (session in sessions) {
                 ListItem(
-                    overlineContent = { Text("Session running") },
+                    overlineContent = { Text("Session running · ${session.identity.appId} · ${sinceText(session.sinceMillis)}") },
                     headlineContent = { Text(session.identity.origin) },
-                    supportingContent = { Text("${session.identity.appId} · ${session.deviceName} · ${sinceText(session.sinceMillis)}") },
+                    // Browser-supplied: escaped, and in its own Text so it can't reorder the rest.
+                    supportingContent = { Text(Untrusted.display(session.deviceName)) },
                     trailingContent = { TextButton(onClick = { onStopSession(session.vaultId) }) { Text("Stop") } },
                 )
                 HorizontalDivider()

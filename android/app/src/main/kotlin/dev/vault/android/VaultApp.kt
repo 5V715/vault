@@ -26,20 +26,12 @@ class VaultApp : Application() {
 
     private val defaultPairing: PairingCoordinator by lazy { PairingCoordinator(this, manager, storage) { lockSettings } }
 
-    @Volatile
-    private var testPairing: PairingCoordinator? = null
-
-    /** Pairings and sessions (held while [dev.vault.android.pairing.SessionService] runs). */
-    val pairing: PairingCoordinator get() = testPairing ?: defaultPairing
-
     /**
-     * Instrumented tests only: route the service and the screens to a
-     * coordinator built over test keys (null restores the app's own). It
-     * swaps which keys and vaults are used; it cannot approve anything.
+     * Pairings and sessions (held while [dev.vault.android.pairing.SessionService]
+     * runs). Debug builds let instrumented tests substitute a coordinator over
+     * test keys ([DebugHooks]); in release the override is the constant null.
      */
-    fun replacePairingForTest(coordinator: PairingCoordinator?) {
-        testPairing = coordinator
-    }
+    val pairing: PairingCoordinator get() = DebugHooks.pairingOverride ?: defaultPairing
 
     private val swept = AtomicBoolean(false)
 

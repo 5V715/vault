@@ -22,6 +22,7 @@ import dev.vault.core.ApprovalRequest
 import dev.vault.core.Offer
 import dev.vault.core.PairingMachine.State
 import dev.vault.core.PairingOutcome
+import dev.vault.core.Untrusted
 
 /**
  * A pairing from the scan to the session: waiting for the browser, the
@@ -75,17 +76,19 @@ fun PairingScreen(
     }
 }
 
+/** App id and origin, escaped: an unmatched offer's come straight from the QR. */
 @Composable
 private fun Identity(appId: String, origin: String) {
-    Text(origin, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+    Text(Untrusted.display(origin), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
     Field("App", appId)
 }
 
+/** One labelled value, escaped ([Untrusted.display]): every value here is browser- or QR-supplied. */
 @Composable
 private fun Field(label: String, value: String) {
     Column {
         Text(label, style = MaterialTheme.typography.labelMedium)
-        Text(value.ifEmpty { "—" }, style = MaterialTheme.typography.bodyLarge)
+        Text(if (value.isEmpty()) "—" else Untrusted.display(value), style = MaterialTheme.typography.bodyLarge)
     }
 }
 

@@ -184,7 +184,14 @@ class PairingCoordinator(
     }
 
     private val entries = LinkedHashMap<String, Entry>()
-    private var focusedId: String? = null
+
+    /** Vault id → the job locking and closing a removed entry's handle. */
+    private val closing = HashMap<String, Job>()
+    /**
+     * The pairing on screen, by object: a vault's ended entry (still closing)
+     * and a new pairing of the same vault share its id but not this.
+     */
+    private var focused: Entry? = null
     private var service: SessionService? = null
 
     private val queue = ArrayDeque<Pair<Entry, Event>>()
@@ -219,20 +226,20 @@ class PairingCoordinator(
         if (found == null) {
             val m = PairingMachine()
             m.on(Event.Scanned(offer, vault = null))
-            focusedId = null
+            focused = null
             pairingState.value = PairingView(null, m.state)
             return@withContext ScanResult.Started
         }
         val (dir, identity) = found
         if (entries.containsKey(dir.id)) {
             // One session per vault: this one already pairs or serves a browser.
-            focusedId = null
+            focused = null
             pairingState.value = PairingView(dir.id, State.Ended(identity, PairingOutcome.Busy))
             return@withContext ScanResult.Started
         }
         val e = Entry(dir, identity, code.payload)
         entries[e.id] = e
-        focusedId = e.id
+        focused = e
         post(e, Event.Scanned(offer, vault = identity))
         ScanResult.Started
     }
@@ -240,7 +247,7 @@ class PairingCoordinator(
     /** "Codes match — approve": the BiometricPrompt ([presence]) unwraps the CRK first. */
     fun approve(presence: UserPresence) {
         scope.launch {
-            val e = focused() ?: return@launch
+            val e = focused ?: return@launch
             e.presence = presence
             post(e, Event.UserApproved)
         }
@@ -248,7 +255,7 @@ class PairingCoordinator(
 
     /** "Deny", or cancel while waiting for the browser. */
     fun deny() {
-        scope.launch { focused()?.let { post(it, Event.UserDenied) } }
+        scope.launch { focused?.let { post(it, Event.UserDenied) } }
     }
 
     /** The app's screen left the foreground: pending approvals are denied. */
@@ -270,12 +277,12 @@ class PairingCoordinator(
 
     /** The notification's Stop: locks every vault and stops the service. */
     fun stopAll() {
-        scope.launch { perform(supervisor.onStop()) }
+        scope.launch { perform(supervisor.onStop(), forced = true) }
     }
 
     /** The screen turned off: lock everything (setting) or at least deny pending approvals. */
     fun onScreenOff() {
-        scope.launch { perform(supervisor.onScreenOff()) }
+        scope.launch { perform(supervisor.onScreenOff(), forced = true) }
     }
 
     /** Clears an ended pairing from the screen. */
@@ -283,7 +290,7 @@ class PairingCoordinator(
         scope.launch {
             if (pairingState.value?.state is State.Ended) {
                 pairingState.value = null
-                focusedId = null
+                focused = null
             }
         }
     }
@@ -309,10 +316,8 @@ class PairingCoordinator(
      */
     internal fun detach(s: SessionService, requested: Boolean) {
         if (service === s) service = null
-        if (!requested) perform(supervisor.onStop())
+        if (!requested) perform(supervisor.onStop(), forced = true)
     }
-
-    private fun focused(): Entry? = focusedId?.let { entries[it] }
 
     private fun rejected(malformed: Boolean): ScanResult.Rejected {
         val m = PairingMachine()
@@ -364,7 +369,7 @@ class PairingCoordinator(
                 },
             )
         }
-        if (e.id == focusedId) pairingState.value = PairingView(e.id, after)
+        if (e === focused) pairingState.value = PairingView(e.id, after)
         publish()
     }
 
@@ -403,6 +408,10 @@ class PairingCoordinator(
     }
 
     private suspend fun serve(e: Entry) {
+        // The vault's previous pairing may still be closing its handle (the
+        // container allows one): wait for it.
+        closing[e.id]?.join()
+        if (e.closed) return
         val handle = try {
             manager.open(e.dir)
         } catch (c: CancellationException) {
@@ -424,6 +433,10 @@ class PairingCoordinator(
         } catch (x: FfiException.MailboxTaken) {
             e.sessionOver.complete(Unit)
             post(e, Event.MailboxTaken)
+        } catch (x: FfiException.Timeout) {
+            // The relay answered but no browser did in time: an old code.
+            e.sessionOver.complete(Unit)
+            post(e, Event.OfferExpired)
         } catch (x: Exception) {
             e.sessionOver.complete(Unit)
             post(e, Event.ConnectFailed)
@@ -455,6 +468,9 @@ class PairingCoordinator(
             Event.UnwrapCancelled
         } catch (x: Exception) {
             Event.UnwrapFailed
+        } finally {
+            // The prompt is over: don't keep the screen's activity alive for the session.
+            e.presence = null
         }
         post(e, event)
     }
@@ -479,11 +495,12 @@ class PairingCoordinator(
         slot.answer(answer)
     }
 
-    private fun perform(actions: List<SessionSupervisor.Action>) {
+    /** [forced]: Stop, screen off, the service gone: vaults lock at once, without the deny grace. */
+    private fun perform(actions: List<SessionSupervisor.Action>, forced: Boolean = false) {
         for (a in actions) {
             when (a) {
                 is SessionSupervisor.Action.DenyPending -> entries[a.vaultId]?.let { post(it, Event.Backgrounded) }
-                is SessionSupervisor.Action.Lock -> entries.remove(a.vaultId)?.let(::close)
+                is SessionSupervisor.Action.Lock -> entries.remove(a.vaultId)?.let { close(it, forced) }
                 SessionSupervisor.Action.StopService -> service?.shutdown()
             }
         }
@@ -491,7 +508,7 @@ class PairingCoordinator(
     }
 
     /** Locks and releases [e]'s vault: its session ends, the CRK and keys are dropped. */
-    private fun close(e: Entry) {
+    private fun close(e: Entry, forced: Boolean) {
         e.closed = true
         e.serveJob?.cancel()
         e.unwrapJob?.cancel()
@@ -505,8 +522,8 @@ class PairingCoordinator(
         // tells the browser so itself; locking at once would end the session
         // as "locked" instead. Forced ends (Stop, screen off, a running
         // session) lock at once. The vault was never unlocked in between.
-        val graceful = e.machine.state is State.Ended && e.answered && !e.sessionOver.isCompleted
-        scope.launch {
+        val graceful = !forced && e.machine.state is State.Ended && e.answered && !e.sessionOver.isCompleted
+        val job = scope.launch {
             withContext(NonCancellable) {
                 if (graceful) withTimeoutOrNull(ANSWER_GRACE_MS) { e.sessionOver.await() }
                 if (h != null) {
@@ -522,6 +539,8 @@ class PairingCoordinator(
             // Usually already reported by the listener; ignored once ended.
             post(e, Event.SessionEnded(EndReason.Locked))
         }
+        closing[e.id] = job
+        job.invokeOnCompletion { scope.launch { if (closing[e.id] === job) closing.remove(e.id) } }
     }
 
     private fun publish() {

@@ -2,6 +2,10 @@
 package dev.vault.android.ui
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
@@ -31,6 +35,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import dev.vault.android.pairing.PairingCoordinator
 import dev.vault.android.pairing.QrAnalyzer
@@ -73,10 +79,25 @@ fun ScanScreen(
             notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+    // Denied for good ("don't ask again"): the request returns at once, so offer the app's settings.
+    var deniedForGood by remember { mutableStateOf(false) }
     val cameraPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         camera = ok
         cameraDenied = !ok
+        deniedForGood = !ok && (context as? Activity)?.shouldShowRequestPermissionRationale(Manifest.permission.CAMERA) == false
         if (ok) askNotifications()
+    }
+    // Back from the settings: the permission may have been granted there.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && !camera && context.granted(Manifest.permission.CAMERA)) {
+                camera = true
+                cameraDenied = false
+                askNotifications()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     LaunchedEffect(Unit) {
         if (camera) askNotifications() else cameraPermission.launch(Manifest.permission.CAMERA)
@@ -107,7 +128,15 @@ fun ScanScreen(
             cameraError -> ErrorText("No camera is available.")
             cameraDenied -> {
                 ErrorText("The camera permission is needed to scan the pairing code.")
-                Button(onClick = { cameraPermission.launch(Manifest.permission.CAMERA) }) { Text("Allow the camera") }
+                if (deniedForGood) {
+                    Button(onClick = {
+                        context.startActivity(
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)),
+                        )
+                    }) { Text("Open the app's settings") }
+                } else {
+                    Button(onClick = { cameraPermission.launch(Manifest.permission.CAMERA) }) { Text("Allow the camera") }
+                }
             }
         }
         message?.let { ErrorText(it) }
