@@ -1,7 +1,8 @@
 # Installing the prebuilt tools
 
 Each release of `5V715/vault` ships `vaultctl`, `vault-dev` and `vault-relay` prebuilt
-for five targets:
+for five targets (and the Android vault app, `vault-android-<version>.apk`: see
+[`docs/android.md`](android.md)):
 
 | Platform | Target | Archive |
 |---|---|---|
@@ -179,12 +180,17 @@ fetch the script again. Publish the new fingerprint too.
 ## Release procedure (owner)
 
 1. Tag and push: `git tag v1.2.3 && git push origin v1.2.3`. The `release` workflow
-   builds the five targets and creates a **draft** release holding the five archives and
-   `SHA256SUMS`. It never signs and never publishes. A tag with a suffix
+   builds the five targets and the unsigned Android APK, and creates a **draft** release
+   holding the five archives, `vault-android-1.2.3-unsigned.apk` and `SHA256SUMS`. It never signs and never publishes. A tag with a suffix
    (`v1.3.0-rc.1`) becomes a pre-release: the install scripts install it only when it is
    named with `--version`.
-2. Check the workflow run (the five builds, and the `SHA256SUMS` it printed).
-3. On the signing machine, with the key available:
+2. Check the workflow run (the five builds, the APK, and the `SHA256SUMS` it printed).
+3. Sign the Android APK offline first:
+   `scripts/sign-android-apk.sh v1.2.3 /media/offline/vault-android.p12`. It uploads
+   `vault-android-1.2.3.apk` and adds its line to `SHA256SUMS`, so the signature of the
+   next step covers the APK that is published. See [`docs/android.md`](android.md),
+   "Releases".
+4. On the signing machine, with the key available:
 
    ```sh
    scripts/sign-release.sh v1.2.3 /media/offline/vault-release
@@ -193,13 +199,14 @@ fetch the script again. Publish the new fingerprint too.
    The script refuses unless the trust root is a real key, `gh` is logged in, the
    release is a draft and has no `SHA256SUMS.sig` yet, and the key file is outside the
    repository (and not a symlink). It downloads `SHA256SUMS` and checks that it lists
-   exactly the five archives of that version. It prints the file and asks `y/N`, signs
+   exactly the five archives and the two APKs of that version, and that the signed APK
+   on the draft matches its line. It prints the file and asks `y/N`, signs
    with `ssh-keygen -Y sign -n vault-release` (which asks for the passphrase), and
    verifies the signature against `keys/allowed_signers`. Then it uploads
    `SHA256SUMS.sig`, checks that the draft's `SHA256SUMS` is still the file it signed,
    and publishes the release. The private key is only ever passed to `ssh-keygen` by
    path.
-4. Optionally run `install.sh --version v1.2.3 --dir "$(mktemp -d)"` to see the published
+5. Optionally run `install.sh --version v1.2.3 --dir "$(mktemp -d)"` to see the published
    release verify end to end.
 
 If anything fails before the last step, the release stays a draft and nobody can install
@@ -241,6 +248,7 @@ touches the network or a real key.
 ```sh
 scripts/test/install_test.sh         # install.sh (Linux, macOS)
 scripts/test/sign_release_test.sh    # sign-release.sh
+scripts/test/sign_android_apk_test.sh  # sign-android-apk.sh (fake apksigner; CI also runs the real one)
 scripts/test/trust_root_test.sh      # the four trust-root copies agree
 ```
 

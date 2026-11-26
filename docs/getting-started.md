@@ -111,9 +111,10 @@ scripts/showcase.sh --lan
 ```
 
 serves the page at `https://<LAN IP>:8443` and the relay at `wss://<LAN IP>:8787` so
-that a vault app on an Android phone in the same home network can pair with the page.
-(The Android vault app is not released yet; until then, `--lan --dev` below pairs the
-page with a demo vault on the computer over the same TLS setup.)
+that the Android vault app ([`docs/android.md`](android.md)) on a phone in the same home
+network can pair with the page. It has to be a **debug build** of the app, which can
+import the local CA. `--lan --dev` below pairs the page with a demo vault on the
+computer instead, over the same TLS setup.
 
 - **The LAN IP** is your computer's primary IPv4 address (Linux: the source address of
   `ip route get 1.1.1.1`; macOS: `ipconfig getifaddr` of the default route's
@@ -151,13 +152,16 @@ that opens the page or runs the vault must trust the CA once. Compare the finger
 your device shows with the printed one before you trust it, and remove the CA again
 when you no longer need it.
 
-- **Android phone (the vault app):** copy `ca.pem` to the phone, then **Settings →
-  Security → Encryption & credentials → Install a certificate → CA certificate** (the
-  path varies a little by vendor; search Settings for "CA certificate"). Android shows
-  a warning; the installed CA is listed under **Trusted credentials → User**, where
-  its details show the fingerprint. The Android vault app (not released yet) is
-  planned to trust user-installed CAs **only in its debug build**; a release build of
-  the app would not connect to the LAN relay.
+- **Android phone, the vault app:** the app's TLS (Rust) does not use Android's
+  certificate store. In a **debug build**, copy `ca.pem` to the phone and import it in
+  the app (vault list → **Debug build: extra CA for the LAN showcase** → **Import a CA
+  certificate (PEM)**), then restart the app. A release build has no such setting and
+  does not connect to the LAN relay. See [`docs/android.md`](android.md), "On your LAN".
+- **Android phone, its browser** (only if you open the page on the phone): copy
+  `ca.pem` to the phone, then **Settings → Security → Encryption & credentials →
+  Install a certificate → CA certificate** (the path varies a little by vendor; search
+  Settings for "CA certificate"). Android shows a warning; the installed CA is listed
+  under **Trusted credentials → User**, where its details show the fingerprint.
 - **Linux browser:** Chrome/Chromium: **Settings → Privacy and security → Security →
   Manage certificates** and import `ca.pem` as a trusted authority (the menu differs
   between Chrome versions), or `certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "vault
@@ -173,8 +177,8 @@ when you no longer need it.
 
 ### Pair the phone
 
-1. On the phone, create (or reset) the vault for this page in the vault app (once it
-   exists): it must be bound to the
+1. On the phone, create (or reset) the vault for this page in the vault app: it must be
+   bound to the
    app `vault-todo` and the origin the script prints, the same as
    `vaultctl init --app vault-todo --origin https://<LAN IP>:8443`.
 2. Open `https://<LAN IP>:8443` in a browser that trusts the CA (on the computer or

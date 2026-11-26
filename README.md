@@ -30,7 +30,9 @@ local run.
 Docs: `docs/integration.md` (how an app pairs with a vault and what its UI must do),
 `docs/protocol/vault.md` (wire protocol), `docs/vault/README.md` (container and CLI), `docs/design/vault.md` (design), `docs/MOVED_TESTS.md` (where each test came from),
 `docs/install.md` (prebuilt binaries: signed releases, verifying install scripts, the
-owner's signing procedure).
+owner's signing procedure), `docs/android.md` (the Android vault app: install, pairing,
+replication, recovery, releases) and `docs/android-manual-checklist.md` (what to test on
+a real phone).
 
 ```sh
 cargo test --workspace
