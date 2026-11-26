@@ -1,0 +1,110 @@
+name: publish todo-demo image
+
+# Publishes the vault-todo-demo image (to-do page + vault-relay, see
+# docs/deploy-todo-demo.md) to ghcr.io for linux/amd64, linux/arm64 and
+# linux/arm/v7 (Raspberry Pi with a 64- or 32-bit OS), but only for a commit on
+# main whose whole `ci` run passed, including the image smoke tests.
+#
+# Tags: sha-<full commit sha> always; `main` only while that commit is still the
+# tip of main, so a late run of an older commit never moves `main` backwards.
+# Deploy by digest (@sha256:...) for a fixed version.
+#
+# Provenance and an SBOM from BuildKit are attached to the image. GitHub artifact
+# attestations (gh attestation verify) are added once the repository is public:
+# for private repositories they need GitHub Enterprise Cloud. The owner's release
+# key stays offline and never signs anything in CI.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: publish-todo-image
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only a successful ci run of a push to main (never a pull request or a tag).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      # ghcr.io names must be lower case.
+      IMAGE: ghcr.io/5v715/vault-todo-demo
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: tags (main only while this commit is the tip of main)
+        id: tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)
+          [ -n "$tip" ] || { echo "::error::cannot read the tip of main"; exit 1; }
+          tags="${IMAGE}:sha-${HEAD_SHA}"
+          if [ "$tip" = "$HEAD_SHA" ]; then
+            tags="${tags},${IMAGE}:main"
+          else
+            echo "::notice::${HEAD_SHA} is no longer the tip of main (${tip}); not moving :main"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push (amd64, arm64, arm/v7)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.todo-demo
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.title=vault-todo-demo
+            org.opencontainers.image.description=vault to-do demo page and vault-relay
+            org.opencontainers.image.licenses=MIT
+      - name: summary
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          {
+            echo "### vault-todo-demo"
+            echo
+            echo "- digest: \`${IMAGE}@${DIGEST}\`"
+            echo "- tags: \`${TAGS}\`"
+            echo "- platforms: linux/amd64, linux/arm64, linux/arm/v7"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: GitHub attestation (public repositories only)
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
