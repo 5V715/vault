@@ -163,7 +163,10 @@ beyond what Compose gives for free.
   <offline keystore>` with the v2+v3 schemes), verifies, uploads the signed APK,
   then runs the existing `sign-release.sh` (SHA256SUMS now includes the APK). The
   docs give the signing-certificate fingerprint check for users (`apksigner verify
-  --print-certs`).
+  --print-certs`). *(Task 8: `scripts/sign-android-apk.sh` does the signing,
+  verification against the pinned certificate `keys/android-cert.sha256`, the upload
+  and the SHA256SUMS line before `sign-release.sh`; with minSdk 30, apksigner writes
+  only the v3 signature even with v2 enabled, so v3 is what is required.)*
 
 ## Testing strategy
 
