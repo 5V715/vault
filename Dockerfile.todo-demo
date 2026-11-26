@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 # SPDX-License-Identifier: MIT
 #
 # vault-todo-demo: the release to-do page (examples/todo) served by vault-relay
@@ -34,12 +34,13 @@
 # wasm-bindgen-cli is the version of the wasm-bindgen crate in Cargo.lock,
 # installed with its own lockfile (--locked); Rust crates come from Cargo.lock
 # (--locked) and npm packages from the package-lock.json files (npm ci, no
-# install scripts). The base images are build arguments: pass them by digest
-# (rust:1-bookworm@sha256:..., node:22-bookworm-slim@sha256:...) for a fully
-# pinned build.
+# install scripts). The base images and the Dockerfile frontend are pinned by
+# digest (the tag beside each digest is for people only); CI posts a notice when
+# upstream moved, and the pins are updated on purpose, in a commit. They stay
+# build arguments, so another digest can be passed for a one-off build.
 
-ARG RUST_IMAGE=rust:1-bookworm
-ARG NODE_IMAGE=node:22-bookworm-slim
+ARG RUST_IMAGE=rust:1-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94
+ARG NODE_IMAGE=node:22-bookworm-slim@sha256:be979e5523c76fa4d5ca4ebd3099078f220aa47ec39c48ad5b5df9314debd6eb
 
 # ---- rust: the exact compiler from rust-toolchain.toml, as the default (the file
 # itself is removed again, so rustup does not add its rustfmt/clippy components)

@@ -12,7 +12,61 @@ Both share one port (8080), plain HTTP. **TLS comes from a reverse proxy in fron
 the page is `https://todo.example` and its relay `wss://todo.example/mailbox/...`.
 Examples for [Traefik](#traefik-docker-compose) and [Caddy](#caddy) follow.
 
-The image is not published to a registry. Build it from a checkout:
+## Get the image
+
+### From GitHub's registry
+
+The `ci` workflow publishes `ghcr.io/5v715/vault-todo-demo` for
+**linux/amd64, linux/arm64 and linux/arm/v7** from pushes to `main`, as its last
+job: only when every other job of that run passed, image smoke tests included.
+Runs are serialized; a run still queued when a newer one arrives is skipped, so
+not every commit gets an image.
+
+| Tag | Meaning |
+|---|---|
+| `sha-<commit>` | a build of that commit (a re-run of the job rebuilds and replaces it) |
+| `main` | the newest published commit on `main` (moves) |
+
+Pin the **digest** for a server you don't want to change under you; it is shown in
+the run's summary: `ghcr.io/5v715/vault-todo-demo@sha256:…`. Tags can move, a
+digest can't.
+
+While the repository is private, the package is private too. Log in once on the
+host with a personal access token (classic) that has only `read:packages`:
+
+```sh
+echo "$TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+docker pull ghcr.io/5v715/vault-todo-demo:main
+```
+
+Docker keeps that token in `~/.docker/config.json`; use a token with no other scope.
+
+The image carries BuildKit provenance (`mode=max`: the exact base-image digests and
+build arguments):
+`docker buildx imagetools inspect ghcr.io/5v715/vault-todo-demo:main --format '{{ json .Provenance }}'`.
+It is not signed: the owner's release key never enters CI. Once the repository is
+public, a GitHub artifact attestation is added as well, checked with
+`gh attestation verify oci://ghcr.io/5v715/vault-todo-demo@sha256:… -R 5V715/vault`.
+
+### Raspberry Pi
+
+The same tag works on a Pi; Docker picks the platform matching its **userland**:
+
+- **Pi 3, 4, 5 and Zero 2 W with a 64-bit OS**: `linux/arm64`.
+- **Pi 2, 3, 4, 5 and Zero 2 W with a 32-bit OS**: `linux/arm/v7`.
+- **Pi 1 and Zero (W)** (ARMv6): not supported.
+
+Check what Docker will pull with `docker version --format '{{.Server.Arch}}'`
+(`arm64` or `arm`); `uname -m` shows the kernel, which can be 64-bit under a 32-bit
+userland.
+
+Install Docker with the official convenience script or your distribution's
+package, then run it as below. With Caddy on the Pi, it gets its own certificate
+if ports 80 and 443 reach it.
+
+### Build it yourself
+
+From a checkout:
 
 ```sh
 docker buildx build -f Dockerfile.todo-demo -t vault-todo-demo --load .
@@ -161,7 +215,7 @@ services:
     restart: unless-stopped
 
   todo:
-    image: vault-todo-demo # built as above
+    image: ghcr.io/5v715/vault-todo-demo:main # or @sha256:… (pinned), or vault-todo-demo if built yourself
     command: ["--trust-proxy"]
     environment:
       PUBLIC_ORIGIN: https://todo.example
@@ -194,7 +248,7 @@ Caddy gets a certificate on its own and proxies WebSocket upgrades by default.
 ```sh
 docker run -d --name todo --read-only --cap-drop ALL --security-opt no-new-privileges \
   -p 127.0.0.1:8080:8080 -e PUBLIC_ORIGIN=https://todo.example \
-  vault-todo-demo --trust-proxy
+  ghcr.io/5v715/vault-todo-demo:main --trust-proxy
 ```
 
 ```caddyfile

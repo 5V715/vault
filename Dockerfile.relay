@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 # SPDX-License-Identifier: MIT
 #
 # vault-relay (the vault mailbox relay), multi-arch:
@@ -23,7 +23,9 @@
 # linker; no per-target C toolchains, no QEMU). The final stage is `scratch`,
 # which contains no shell, so it needs no emulation either.
 
-ARG RUST_IMAGE=rust:1-bookworm
+# The base image and the Dockerfile frontend are pinned by digest (see
+# Dockerfile.todo-demo); CI posts a notice when upstream moved.
+ARG RUST_IMAGE=rust:1-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94
 
 # ---- toolchain: rust + zig + cargo-zigbuild, sources limited to vault-mailbox
 # and vault-proto (vault-relay validates allowed origins with its binding rules)
