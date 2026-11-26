@@ -49,6 +49,17 @@ process_death() {
   local props=() a pid state out
   for a in "$@"; do [[ $a == -P* ]] && props+=("$a"); done
   ci/gradle.sh --stacktrace "${props[@]}" :app:installDebug :app:installDebugAndroidTest || { death_fail "install failed"; return 1; }
+  # kill -9 of another uid's process needs root (run-as can't on API 30:
+  # "unknown pid", CI run 45742058742). The emulator images are rootable;
+  # restarting adbd drops the reverse forwards, so they are set again.
+  local root=""
+  if adb root 2>&1 | grep -qiE 'restarting adbd as root|already running as root'; then
+    adb wait-for-device
+    for _ in $(seq 30); do [ "$(adb shell id -u | tr -d '\r')" = 0 ] && { root=1; break; }; sleep 1; done
+    for p in "$relay_port" "$control_port"; do
+      adb reverse "tcp:$p" "tcp:$p" || { death_fail "adb reverse tcp:$p after adb root failed"; return 1; }
+    done
+  fi
   adb shell am instrument -w -e standIn "$control_port" -e processDeathPhase setup \
     -e class "$death_class#process_death_setup" "$runner" > build/process-death-setup.txt 2>&1 &
   local inst=$!
@@ -65,7 +76,11 @@ process_death() {
   pid="$(adb shell pidof "$pkg" | tr -d '\r')"
   [ -n "$pid" ] || { death_fail "no process for $pkg"; return 1; }
   echo "process death: kill -9 $pid ($pkg)"
-  adb shell run-as "$pkg" kill -9 "$pid" || { death_fail "kill -9 failed"; return 1; }
+  if [ -n "$root" ]; then
+    adb shell kill -9 "$pid" || { death_fail "kill -9 failed"; return 1; }
+  else
+    adb shell run-as "$pkg" kill -9 "$pid" || { death_fail "kill -9 failed (no root)"; return 1; }
+  fi
   wait "$inst"
   cat build/process-death-setup.txt
   # The setup test only ends by the kill: anything else is a failure.
