@@ -47,6 +47,9 @@ enum class ReplicationError {
     Busy,
     Network,
     DeviceLocked,
+
+    /** A replica's address, scheme or certificate is refused (Rust's checks): retrying can't help. */
+    BadTarget,
 }
 
 /** When background replication runs and what its results mean. */
@@ -92,6 +95,34 @@ object ReplicationPolicy {
         data class NeedsAttention(val problems: List<String>, override val warnings: List<String>) : RunResult
     }
 
+    /** What follows a run that did not replicate, or a run's result. */
+    sealed interface FollowUp {
+        data object None : FollowUp
+
+        /** One more run after [delaySecs], on an unmetered network when [wifiOnly]. */
+        data class Retry(val delaySecs: Long, val wifiOnly: Boolean) : FollowUp
+    }
+
+    /** The first wait for a locked phone; it doubles (capped at [PERIOD_SECS]). */
+    const val LOCKED_WAIT_SECS: Long = 15 * 60L
+
+    /**
+     * After a run that [gate] stopped. Every wait gets a later run (none may
+     * depend on another event, which may never come), never with 0 s delay.
+     * [lockedWaits]: runs in a row that found the phone locked.
+     */
+    fun afterGate(gate: Gate, wifiOnly: Boolean, lockedWaits: Int): FollowUp = when (gate) {
+        Gate.Run -> FollowUp.None
+        Gate.WaitForSessionEnd -> FollowUp.Retry(backoffSecs(0), wifiOnly)
+        Gate.WaitForNetwork, Gate.WaitForWifi -> FollowUp.Retry(backoffSecs(0), wifiOnly)
+        Gate.WaitForDeviceUnlock ->
+            FollowUp.Retry((LOCKED_WAIT_SECS shl lockedWaits.coerceIn(0, 10)).coerceAtMost(PERIOD_SECS), wifiOnly = false)
+    }
+
+    /** After a run that recorded [status]: its retry, if one is due (never after NeedsAttention). */
+    fun afterRun(status: ReplicationStatus, wifiOnly: Boolean): FollowUp =
+        status.retryDelaySecs()?.let { FollowUp.Retry(it, wifiOnly) } ?: FollowUp.None
+
     fun gate(ctx: ReplicationContext): Gate = when {
         ctx.sessionActive -> Gate.WaitForSessionEnd
         ctx.deviceLocked -> Gate.WaitForDeviceUnlock
@@ -123,7 +154,7 @@ object ReplicationPolicy {
         if (diverged.isNotEmpty()) {
             return RunResult.NeedsAttention(
                 diverged.map { (id, _) ->
-                    "Replica $id holds a different or newer vault state; nothing was written to it. Check it before adopting."
+                    "Replica $id holds a different or newer vault state (another copy may write to it); nothing was written to it. Check that replica: this app does not overwrite it."
                 },
                 warnings,
             )
@@ -144,6 +175,10 @@ object ReplicationPolicy {
         )
         ReplicationError.KeyUnavailable -> RunResult.NeedsAttention(
             listOf("The background replication key is gone. Open the vault once to set up replication again."),
+            emptyList(),
+        )
+        ReplicationError.BadTarget -> RunResult.NeedsAttention(
+            listOf("A replica's address or certificate is not accepted (https only, no user name or password in the URL). Edit the replica."),
             emptyList(),
         )
         // Waiting for a session or the device is not a failure.

@@ -5,11 +5,6 @@ package dev.vault.core
 data class VaultSettings(
     /** Background replication only on unmetered networks. */
     val wifiOnly: Boolean = false,
-    /**
-     * "Compact now": compaction needs the vault unlocked and no browser
-     * served, which only holds at the end of a session, so it runs then.
-     */
-    val compactRequested: Boolean = false,
 )
 
 /** The user typed the vault's app id exactly (delete confirmation). */
@@ -49,17 +44,12 @@ object Settings {
             listOf(
                 "v" to VERSION,
                 "wifiOnly" to s.wifiOnly.toString(),
-                "compactRequested" to s.compactRequested.toString(),
             ),
         )
 
     fun decodeVault(bytes: ByteArray): VaultSettings {
         val m = KeyValues.decode(bytes).toMap()
-        val d = VaultSettings()
-        return VaultSettings(
-            wifiOnly = m["wifiOnly"]?.toBooleanStrictOrNull() ?: d.wifiOnly,
-            compactRequested = m["compactRequested"]?.toBooleanStrictOrNull() ?: d.compactRequested,
-        )
+        return VaultSettings(wifiOnly = m["wifiOnly"]?.toBooleanStrictOrNull() ?: VaultSettings().wifiOnly)
     }
 }
 

@@ -24,11 +24,11 @@ class SettingsTest {
 
     @Test
     fun vault_settings_round_trip_and_defaults() {
-        val s = VaultSettings(wifiOnly = true, compactRequested = true)
+        val s = VaultSettings(wifiOnly = true)
         assertEquals(s, Settings.decodeVault(Settings.encode(s)))
-        val d = Settings.decodeVault(ByteArray(0))
-        assertFalse(d.wifiOnly)
-        assertFalse(d.compactRequested)
+        assertFalse(Settings.decodeVault(ByteArray(0)).wifiOnly)
+        // A file from before compaction ran at once (it had a request flag) still reads.
+        assertEquals(s, Settings.decodeVault("v=1\nwifiOnly=true\ncompactRequested=true\n".toByteArray()))
     }
 
     @Test

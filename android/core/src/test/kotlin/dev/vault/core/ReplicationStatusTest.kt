@@ -46,8 +46,7 @@ class ReplicationStatusTest {
         assertNull("never retried", s.retryDelaySecs())
         assertFalse(s.allowsAutomaticRun)
         assertTrue(s.problems.single().contains("rolled back"))
-        // "Replicate now" is the user acting: it may run again, and an Ok unblocks.
-        assertTrue(s.allowsManualRun)
+        // "Replicate now" is the user acting: an Ok unblocks.
         assertFalse(s.record(RunResult.Ok(emptyList()), nowMs = 6).blocked)
     }
 
@@ -65,5 +64,15 @@ class ReplicationStatusTest {
         )
         assertEquals(s, ReplicationStatus.decode(s.encode()))
         assertEquals(ReplicationStatus(), ReplicationStatus.decode(ByteArray(0)))
+    }
+
+    @Test
+    fun stale_when_replicas_have_not_succeeded_for_a_day() {
+        val day = ReplicationStatus.STALE_AFTER_MS
+        val ok = ReplicationStatus().record(RunResult.Ok(emptyList()), nowMs = 1_000)
+        assertFalse(ok.isStale(nowMs = 1_000 + day, hasReplicas = true))
+        assertTrue(ok.isStale(nowMs = 1_001 + day, hasReplicas = true))
+        assertFalse("no replicas, nothing to be stale", ok.isStale(nowMs = 10 * day, hasReplicas = false))
+        assertTrue("never succeeded", ReplicationStatus().isStale(nowMs = 0, hasReplicas = true))
     }
 }

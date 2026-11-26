@@ -26,8 +26,13 @@ data class ReplicationStatus(
     /** Periodic, after-session and retry runs. */
     val allowsAutomaticRun: Boolean get() = !blocked
 
-    /** "Replicate now" always may: the user has seen the problem. */
-    val allowsManualRun: Boolean get() = true
+    /**
+     * The replicas may be falling behind: no good run for over
+     * [STALE_AFTER_MS] (or never) while the vault has replicas. Shown as a
+     * warning, since a scheduler that never runs would otherwise be silent.
+     */
+    fun isStale(nowMs: Long, hasReplicas: Boolean): Boolean =
+        hasReplicas && (lastOkMs == null || nowMs - lastOkMs > STALE_AFTER_MS)
 
     /** When the next automatic retry is due, or null (none: ok, or blocked). */
     fun retryDelaySecs(): Long? = when (state) {
@@ -87,6 +92,8 @@ data class ReplicationStatus(
     )
 
     companion object {
+        const val STALE_AFTER_MS: Long = 24 * 3600 * 1000L
+
         /** Parses [encode]'s output; anything unreadable gives the empty status. */
         fun decode(bytes: ByteArray): ReplicationStatus {
             val kv = KeyValues.decode(bytes)
