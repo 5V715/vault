@@ -520,9 +520,16 @@ jobs:
         run: |
           set -euo pipefail
           # A job missing from publish-todo-image's `needs` would not block publishing.
+          # Any key at two spaces under `jobs:` is a job (quotes and comments
+          # stripped); the needs list must be a block list of the same names.
           f=.github/workflows/ci.yml
-          jobs=$(awk '/^jobs:/{j=1; next} j && /^  [a-z0-9-]+:$/{sub(/:$/,""); sub(/^  /,""); print}' "$f" | grep -vxE 'publish-todo-image|attest-todo-image' | sort)
-          needs=$(awk '/^  publish-todo-image:/{p=1; next} p && /^    needs:/{n=1; next} n && /^      - /{sub(/^      - /,""); print; next} n{exit}' "$f" | sort)
+          jobs=$(awk '/^jobs:/{j=1; next} j && /^[^ #]/{exit} j && /^  [^ #]/{l=$0; sub(/^  /,"",l); sub(/[ \t]*:.*/,"",l); gsub(/["\047]/,"",l); print l}' "$f" | grep -vxE 'publish-todo-image|attest-todo-image' | sort)
+          needs=$(awk '/^  publish-todo-image:/{p=1; next} p && /^    needs:/{n=1; next} n && /^      - /{l=$0; sub(/^      - /,"",l); sub(/[ \t]*#.*/,"",l); gsub(/["\047 \t]/,"",l); print l; next} n{exit}' "$f" | sort)
+          count=$(printf '%s\n' "$jobs" | grep -c .)
+          if [ "$count" -lt 12 ]; then
+            echo "::error::found only $count jobs in $f; the job parser is out of date"
+            exit 1
+          fi
           if [ "$jobs" != "$needs" ]; then
             echo "::error::publish-todo-image needs must list exactly the other jobs"
             diff <(echo "$jobs") <(echo "$needs") || true
