@@ -82,7 +82,7 @@ class ScannerTest {
         keys = VaultKeys(context, requireAuth = false)
         val storage = VaultStorage(context, keys)
         manager = VaultManager(storage, keys)
-        coordinator = PairingCoordinator(context, manager, storage) { LockSettings() }
+        coordinator = PairingCoordinator(context, manager, storage, lockSettings = { LockSettings() })
     }
 
     @After
