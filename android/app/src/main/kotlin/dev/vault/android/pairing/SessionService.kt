@@ -70,12 +70,7 @@ class SessionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Foreground first, on every start: a service started with
         // startForegroundService must call startForeground, even to stop.
-        val n = notification()
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, n)
-        }
+        goForeground()
         if (intent?.action == ACTION_STOP) coordinator.stopAll()
         // Nothing to hold (the pairing already ended, or a Stop): go away.
         if (coordinator.isIdle) shutdown()
@@ -103,7 +98,19 @@ class SessionService : Service() {
     internal fun refresh() {
         // Stopping: re-posting would leave a notification behind.
         if (stopping) return
-        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(NOTIFICATION_ID, notification())
+        // Through startForeground, not NotificationManager.notify: a plain
+        // re-post loses FLAG_FOREGROUND_SERVICE on Android 11 (the
+        // notification becomes dismissable and detached from the service).
+        goForeground()
+    }
+
+    private fun goForeground() {
+        val n = notification()
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, n)
+        }
     }
 
     private fun notification(): Notification {
