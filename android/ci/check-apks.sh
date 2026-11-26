@@ -5,8 +5,10 @@
 # network-security hardening as packaged (release: system CAs only, no cleartext;
 # debug: user CAs added, cleartext to loopback only), exported=true only on the
 # launcher MainActivity, release not debuggable, data extraction rules excluding
-# every domain, and the debug-only code (import CA setting, test hook) absent from release. The assertions live in apk-assertions.sh (self-tested by
-# check-apks-selftest.sh). Needs ANDROID_HOME and ANDROID_BUILD_TOOLS.
+# every domain, the debug-only code (import CA setting, test hook) absent from
+# release, and the release APK's permissions exactly the allowlist. The
+# assertions live in apk-assertions.sh (self-tested by check-apks-selftest.sh).
+# Needs ANDROID_HOME and ANDROID_BUILD_TOOLS.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 bt="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS"
@@ -51,6 +53,9 @@ for apk in "$release" "$debug"; do
   assert_only_launcher_exported /tmp/manifest.txt "$apk"
   if [ "$apk" = "$release" ]; then
     assert_not_debuggable /tmp/manifest.txt "$apk"
+    echo "== permissions of $apk"
+    manifest_permissions /tmp/manifest.txt
+    assert_release_permissions /tmp/manifest.txt "$apk"
   fi
 done
 

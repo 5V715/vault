@@ -123,3 +123,54 @@ assert_dex_lacks_debug_only_code() {
     fi
   done
 }
+
+# The permissions of the release APK, exactly: every <uses-permission> (and
+# <uses-permission-sdk-23>) the merged manifest requests must be on this list and
+# every entry must be requested, so a new permission (from the app or pulled in
+# by a library's manifest) fails CI until it is reviewed and listed here. The
+# same holds for <permission> declarations: only androidx.core's
+# signature-level DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION, which it declares and
+# requests for receivers registered as not exported. "@pkg" stands for the
+# manifest's package (the applicationId).
+RELEASE_USES_PERMISSIONS=(
+  android.permission.ACCESS_NETWORK_STATE        # "Wi-Fi only" replication
+  android.permission.CAMERA                      # scanning the pairing code
+  android.permission.FOREGROUND_SERVICE          # the session service
+  android.permission.FOREGROUND_SERVICE_SPECIAL_USE
+  android.permission.INTERNET                    # relay and replicas (TLS, from Rust)
+  android.permission.POST_NOTIFICATIONS          # the session notification (Stop)
+  android.permission.RECEIVE_BOOT_COMPLETED      # persisted replication jobs
+  android.permission.USE_BIOMETRIC               # the prompt that unwraps a vault's key
+  @pkg.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION  # androidx.core
+)
+RELEASE_DECLARED_PERMISSIONS=(
+  @pkg.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+)
+
+# "<element> <name>" per permission element, and "package <name>" for the manifest.
+manifest_permissions() {
+  awk "$AWK_ATTR"'
+    /^ *E: / { e = $0; sub(/^ *E: /, "", e); sub(/ .*/, "", e); cur = e; next }
+    /^ *A: / && cur == "manifest" && attr_name($0) == "package" { print "package", quoted(attr_val($0)); next }
+    /^ *A: / && cur ~ /^(uses-permission|uses-permission-sdk-23|permission)$/ && attr_name($0) == "name" {
+      print (cur == "permission" ? "declares" : "uses"), quoted(attr_val($0)) }' "$1"
+}
+
+assert_release_permissions() {
+  local dump=$1 label=$2 lines pkg want got
+  lines="$(manifest_permissions "$dump")"
+  pkg="$(awk '$1 == "package" { print $2; exit }' <<<"$lines")"
+  [ -n "$pkg" ] || fail "$label: no package attribute in the manifest dump (aapt2 output format changed?)"
+  for kind in uses declares; do
+    if [ "$kind" = uses ]; then
+      want="$(printf '%s\n' "${RELEASE_USES_PERMISSIONS[@]}")"
+    else
+      want="$(printf '%s\n' "${RELEASE_DECLARED_PERMISSIONS[@]}")"
+    fi
+    want="$(LC_ALL=C sort <<<"${want//@pkg./$pkg.}")"
+    got="$(awk -v k="$kind" '$1 == k { print $2 }' <<<"$lines" | LC_ALL=C sort)"
+    if [ "$got" != "$want" ]; then
+      fail "$label: permissions ($kind) differ from the allowlist in apk-assertions.sh; not allowed: $(comm -13 <(echo "$want") <(echo "$got") | tr '\n' ' ')missing: $(comm -23 <(echo "$want") <(echo "$got") | tr '\n' ' ')(all: $(echo "$got" | tr '\n' ' '))"
+    fi
+  done
+}

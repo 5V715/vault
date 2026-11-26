@@ -30,6 +30,13 @@ expect_fail assert_only_launcher_exported manifest-exported-receiver.txt 'Profil
 expect_fail assert_only_launcher_exported manifest-exported-receiver-hex.txt 'ProfileInstallReceiver'
 expect_fail assert_only_launcher_exported nsc-debug-good.txt 'no components'
 
+expect_pass assert_release_permissions manifest-good.txt
+expect_fail assert_release_permissions manifest-extra-permission.txt 'not allowed: android.permission.READ_CONTACTS'
+expect_fail assert_release_permissions manifest-extra-permission-sdk23.txt 'not allowed: android.permission.ACCESS_FINE_LOCATION'
+expect_fail assert_release_permissions manifest-missing-permission.txt 'missing: android.permission.CAMERA'
+expect_fail assert_release_permissions manifest-extra-declared.txt '[(]declares[)].*not allowed: dev.vault.android.EVIL'
+expect_fail assert_release_permissions nsc-debug-good.txt 'no package attribute'
+
 expect_pass assert_not_debuggable manifest-good.txt
 expect_fail assert_not_debuggable manifest-debuggable.txt 'debuggable'
 
