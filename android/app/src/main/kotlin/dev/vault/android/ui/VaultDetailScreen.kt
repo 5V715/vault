@@ -1,39 +1,59 @@
 // SPDX-License-Identifier: MIT
 package dev.vault.android.ui
 
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
+import dev.vault.android.replication.Replicator
+import dev.vault.android.replication.Trigger
+import dev.vault.android.settings.SettingsStore
 import dev.vault.android.vault.UserPresence
 import dev.vault.android.vault.VaultManager
 import java.text.DateFormat
 import java.util.Date
+import dev.vault.core.DeleteConfirmation
+import dev.vault.core.ReplicationPolicy
+import dev.vault.core.ReplicationStatus
+import dev.vault.core.Untrusted
+import dev.vault.core.VaultSettings
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import uniffi.vault_ffi.NamedReplica
 import uniffi.vault_ffi.VaultStats
 
 /**
  * Vault detail: identity, stats, the re-wrap entry when K_auth was invalidated,
- * and delete (typed app id + screen-lock prompt). Replication targets and
- * settings arrive with background replication (Task 7).
+ * replication (targets, status, last run, Wi-Fi only, replicate now),
+ * compact, and delete (typed app id + screen-lock prompt).
  */
 @Composable
 fun VaultDetailScreen(
     manager: VaultManager,
+    replicator: Replicator,
+    settings: SettingsStore,
     presence: UserPresence,
     entry: VaultEntry,
+    /** The vault pairs or serves a browser now. */
+    inSession: Boolean,
     onRewrap: () -> Unit,
     onDeleted: () -> Unit,
     onBack: () -> Unit,
@@ -46,6 +66,26 @@ fun VaultDetailScreen(
     var deleteError by remember { mutableStateOf<String?>(null) }
     var deleting by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    var replicas by remember { mutableStateOf<List<NamedReplica>>(emptyList()) }
+    var status by remember { mutableStateOf<ReplicationStatus?>(null) }
+    var vaultSettings by remember { mutableStateOf(VaultSettings()) }
+    var adding by remember { mutableStateOf(false) }
+    var replicating by remember { mutableStateOf(false) }
+    var replicationError by remember { mutableStateOf<String?>(null) }
+    var reload by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(entry.dir.id, reload) {
+        try {
+            replicas = replicator.replicas(entry.dir)
+            withContext(Dispatchers.IO) {
+                status = settings.status(entry.dir)
+                vaultSettings = settings.vaultSettings(entry.dir)
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            replicationError = e.userMessage()
+        }
+    }
 
     LaunchedEffect(entry.dir.id) {
         needsRewrap = try {
@@ -85,6 +125,113 @@ fun VaultDetailScreen(
             else -> Working("Reading…")
         }
         HorizontalDivider()
+        Text("Replication", style = MaterialTheme.typography.titleMedium)
+        if (replicas.isEmpty()) Text("No replicas yet. Without one, losing the phone loses the vault.")
+        for (r in replicas) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(Untrusted.display(r.target.describe()), modifier = Modifier.weight(1f))
+                TextButton(onClick = {
+                    scope.launch {
+                        try {
+                            replicator.removeReplica(entry.dir, r.id)
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            replicationError = e.userMessage()
+                        }
+                        reload++
+                    }
+                }) { Text("Remove") }
+            }
+        }
+        if (adding) {
+            ReplicaForm(
+                onSave = { target ->
+                    scope.launch {
+                        try {
+                            replicator.addReplica(entry.dir, target)
+                            adding = false
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            replicationError = e.userMessage()
+                        }
+                        reload++
+                    }
+                },
+                onCancel = { adding = false },
+            )
+        } else {
+            OutlinedButton(onClick = { adding = true }, modifier = Modifier.fillMaxWidth()) { Text("Add a replica…") }
+        }
+        status?.let { ReplicationStatusView(it) }
+        replicationError?.let { ErrorText(it) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Switch(
+                checked = vaultSettings.wifiOnly,
+                onCheckedChange = { on ->
+                    scope.launch {
+                        try {
+                            replicator.setWifiOnly(entry.dir, on)
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            replicationError = e.userMessage()
+                        }
+                        reload++
+                    }
+                },
+            )
+            Text("Background replication on Wi-Fi (unmetered) only")
+        }
+        if (replicas.isNotEmpty()) {
+            Button(
+                onClick = {
+                    replicating = true
+                    replicationError = null
+                    scope.launch {
+                        try {
+                            when (val r = replicator.run(entry.dir.id, Trigger.Manual)) {
+                                is Replicator.Report.Waiting -> replicationError = waitingText(r.gate)
+                                is Replicator.Report.Skipped -> replicationError = "Nothing to replicate (${r.reason})."
+                                is Replicator.Report.Done -> Unit
+                            }
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            replicationError = e.userMessage()
+                        } finally {
+                            replicating = false
+                            reload++
+                        }
+                    }
+                },
+                enabled = !replicating && !inSession,
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(if (inSession) "Replicate now (after the session)" else "Replicate now") }
+            if (replicating) Working("Replicating…")
+        }
+        HorizontalDivider()
+        Text("Compaction", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Compacting needs the vault unlocked and no browser served, which is the case right as a session " +
+                "ends: a requested compaction runs then.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        OutlinedButton(
+            onClick = {
+                scope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            settings.saveVaultSettings(entry.dir, settings.vaultSettings(entry.dir).copy(compactRequested = true))
+                        }
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        replicationError = e.userMessage()
+                    }
+                    reload++
+                }
+            },
+            enabled = !vaultSettings.compactRequested,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text(if (vaultSettings.compactRequested) "Compaction requested (at the next session's end)" else "Compact now") }
+        HorizontalDivider()
         if (!confirmDelete) {
             OutlinedButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth()) { Text("Delete vault…") }
         } else {
@@ -99,11 +246,17 @@ fun VaultDetailScreen(
                     deleting = true
                     scope.launch {
                         try {
-                            if (presence.confirm("Delete ${entry.identity.appId}")) {
-                                manager.delete(entry.dir)
-                                onDeleted()
+                            if (inSession) {
+                                deleteError = "Stop the vault's session first."
                             } else {
-                                deleteError = "Not confirmed at the screen-lock prompt."
+                                when (manager.deleteConfirmed(entry.dir, entry.identity, typedAppId, presence)) {
+                                    VaultManager.DeleteResult.Deleted -> {
+                                        replicator.forget(entry.dir.id)
+                                        onDeleted()
+                                    }
+                                    VaultManager.DeleteResult.NotConfirmed -> deleteError = "Not confirmed at the screen-lock prompt."
+                                    VaultManager.DeleteResult.AppIdNotTyped -> deleteError = "Type the app id exactly."
+                                }
                             }
                         } catch (e: Exception) {
                             if (e is kotlinx.coroutines.CancellationException) throw e
@@ -113,7 +266,7 @@ fun VaultDetailScreen(
                         }
                     }
                 },
-                enabled = typedAppId == entry.identity.appId && !deleting,
+                enabled = DeleteConfirmation.matches(typedAppId, entry.identity.appId) && !deleting,
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Delete for good") }
@@ -128,4 +281,30 @@ private fun formatBytes(n: Long): String = when {
     n >= 1_000_000 -> "%.1f MB".format(n / 1e6)
     n >= 1_000 -> "%.1f kB".format(n / 1e3)
     else -> "$n B"
+}
+
+@Composable
+private fun ReplicationStatusView(s: ReplicationStatus) {
+    fun time(ms: Long?) = ms?.let { DateFormat.getDateTimeInstance().format(Date(it)) } ?: "never"
+    Text("Last run: ${time(s.lastRunMs)} · last success: ${time(s.lastOkMs)}${s.seq?.let { " (seq $it)" } ?: ""}")
+    Text(
+        when (s.state) {
+            ReplicationStatus.State.Never -> "Not replicated yet."
+            ReplicationStatus.State.Ok -> "Replicas are up to date."
+            ReplicationStatus.State.Waiting -> "Waiting (a session, the network or an unlocked phone)."
+            ReplicationStatus.State.Retrying -> "Retrying after ${s.failedRuns} failed run(s)."
+            ReplicationStatus.State.NeedsAttention -> "Needs your attention: background replication is stopped."
+        },
+    )
+    // Rust's and the policy's text; replica errors may quote a provider: escaped.
+    s.problems.forEach { ErrorText(Untrusted.display(it)) }
+    s.warnings.forEach { ErrorText("Warning: ${Untrusted.display(it)}") }
+}
+
+private fun waitingText(gate: ReplicationPolicy.Gate): String = when (gate) {
+    ReplicationPolicy.Gate.WaitForSessionEnd -> "The vault is in a session; it replicates when the session ends."
+    ReplicationPolicy.Gate.WaitForDeviceUnlock -> "Unlock the phone first."
+    ReplicationPolicy.Gate.WaitForNetwork -> "No network; it replicates once there is one."
+    ReplicationPolicy.Gate.WaitForWifi -> "Waiting for Wi-Fi."
+    ReplicationPolicy.Gate.Run -> "Replicating."
 }

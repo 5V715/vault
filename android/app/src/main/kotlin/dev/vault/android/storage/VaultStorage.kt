@@ -20,7 +20,8 @@ import uniffi.vault_ffi.HighWaterStore
  * - `container/` — the vault-container directory (encrypted by itself);
  * - `crk.wrapped` — the CRK wrapped with K_auth;
  * - `identity.sealed`, `high-water.sealed`, `manifest-key.sealed`,
- *   `replicas.sealed` — sealed with K_bg.
+ *   `replicas.sealed`, `settings.sealed`, `replication-status.sealed` —
+ *   sealed with K_bg.
  *
  * `<id>` is random (32 hex characters): a restore only learns the vault's
  * identity after the container is written, and no browser-supplied text
@@ -48,6 +49,8 @@ class VaultDir(val root: File) {
         const val KIND_HIGH_WATER = "high-water"
         const val KIND_MANIFEST_KEY = "manifest-key"
         const val KIND_REPLICAS = "replicas"
+        const val KIND_SETTINGS = "settings"
+        const val KIND_REPLICATION_STATUS = "replication-status"
     }
 }
 
@@ -122,6 +125,9 @@ class VaultStorage(context: Context, private val keys: VaultKeys) : VaultReposit
 
     fun writeIdentity(dir: VaultDir, identity: VaultIdentity) =
         writeSealed(dir, VaultDir.KIND_IDENTITY, "${identity.appId}\n${identity.origin}".toByteArray(Charsets.UTF_8))
+
+    /** The complete vault with this directory id, or null. */
+    fun dirById(id: String): VaultDir? = if (ID.matches(id)) vaultDirs().firstOrNull { it.id == id } else null
 
     fun dirOf(identity: VaultIdentity): VaultDir? = vaultDirs().firstOrNull { identityOf(it) == identity }
 

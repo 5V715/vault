@@ -8,6 +8,7 @@ import dev.vault.android.storage.VaultDir
 import dev.vault.android.storage.VaultStorage
 import dev.vault.android.storage.writeAtomically
 import dev.vault.core.Checked
+import dev.vault.core.DeleteConfirmation
 import dev.vault.core.LockSettings
 import dev.vault.core.VaultIdentity
 import javax.crypto.Cipher
@@ -206,8 +207,22 @@ class VaultManager(
 
     suspend fun stats(dir: VaultDir): VaultStats = open(dir).use { it.stats() }
 
-    /** Deletes a vault and its keys. The UI asks for auth and the typed app id first. */
+    /** Deletes a vault and its keys. Users go through [deleteConfirmed]. */
     suspend fun delete(dir: VaultDir) = withContext(Dispatchers.IO) { storage.delete(dir) }
+
+    enum class DeleteResult { Deleted, AppIdNotTyped, NotConfirmed }
+
+    /**
+     * The vault screen's delete: only with the app id typed exactly, and then
+     * only after the screen-lock prompt passes ([presence]). A mistyped app id
+     * shows no prompt at all.
+     */
+    suspend fun deleteConfirmed(dir: VaultDir, identity: VaultIdentity, typedAppId: String, presence: UserPresence): DeleteResult {
+        if (!DeleteConfirmation.matches(typedAppId, identity.appId)) return DeleteResult.AppIdNotTyped
+        if (!presence.confirm("Delete ${identity.appId}")) return DeleteResult.NotConfirmed
+        delete(dir)
+        return DeleteResult.Deleted
+    }
 
     private suspend fun wrapAndStoreCrk(dir: VaultDir, crk: ByteArray, presence: UserPresence) {
         // Marks "K_auth and crk.wrapped may not match" until the new file is in

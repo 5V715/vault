@@ -15,13 +15,20 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.ui.Modifier
 import androidx.lifecycle.LifecycleOwner
+import dev.vault.core.Checked
+import dev.vault.core.VaultIdentity
 import dev.vault.android.vault.BiometricPresence
 import dev.vault.android.ui.CreateScreen
 import dev.vault.android.ui.PairingScreen
 import dev.vault.android.ui.RestoreScreen
 import dev.vault.android.ui.RewrapScreen
 import dev.vault.android.ui.ScanScreen
+import dev.vault.android.ui.SettingsScreen
 import dev.vault.android.ui.VaultDetailScreen
 import dev.vault.android.ui.VaultEntry
 import dev.vault.android.ui.VaultTheme
@@ -42,6 +49,8 @@ private sealed interface Screen {
     data class Rewrap(val entry: VaultEntry) : Screen
 
     data object Scan : Screen
+
+    data object Settings : Screen
 
     /** The pairing in progress or just ended ([dev.vault.android.pairing.PairingCoordinator.pairing]). */
     data object Pairing : Screen
@@ -87,8 +96,10 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
     LaunchedEffect(reload) {
         vaults = withContext(Dispatchers.IO) {
             app.sweepOnce()
-            app.storage.vaultDirs()
-                .mapNotNull { dir -> app.storage.identityOf(dir)?.let { VaultEntry(dir, it) } }
+            val dirs = app.storage.vaultDirs()
+            // A restored vault (or one WorkManager lost) gets its periodic replication.
+            runCatching { app.replicator.ensureScheduled(dirs) }
+            dirs.mapNotNull { dir -> app.storage.identityOf(dir)?.let { VaultEntry(dir, it) } }
                 .sortedWith(compareBy({ it.identity.appId }, { it.identity.origin }))
         }
     }
@@ -96,7 +107,7 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
         reload++
         screen = Screen.List
     }
-    BackHandler(enabled = screen is Screen.Detail || screen is Screen.Rewrap || screen is Screen.Scan) {
+    BackHandler(enabled = screen is Screen.Detail || screen is Screen.Rewrap || screen is Screen.Scan || screen is Screen.Settings) {
         screen = when (val s = screen) {
             is Screen.Rewrap -> Screen.Detail(s.entry)
             else -> Screen.List
@@ -112,7 +123,10 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
             onScan = { screen = Screen.Scan },
             sessions = sessions,
             onStopSession = pairing::stopSession,
-            footer = { DebugCa.Setting(app.keys) },
+            footer = {
+                OutlinedButton(onClick = { screen = Screen.Settings }, modifier = Modifier.fillMaxWidth()) { Text("Settings") }
+                DebugCa.Setting(app.keys)
+            },
         )
         is Screen.Create -> CreateScreen(
             manager = app.manager,
@@ -126,8 +140,11 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
         Screen.Restore -> RestoreScreen(app.manager, presence, onDone = ::home, onBack = ::home)
         is Screen.Detail -> VaultDetailScreen(
             manager = app.manager,
+            replicator = app.replicator,
+            settings = app.settings,
             presence = presence,
             entry = s.entry,
+            inSession = sessions.any { it.vaultId == s.entry.dir.id },
             onRewrap = { screen = Screen.Rewrap(s.entry) },
             onDeleted = ::home,
             onBack = ::home,
@@ -140,6 +157,7 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
             onDone = { screen = Screen.Detail(s.entry) },
             onBack = { screen = Screen.Detail(s.entry) },
         )
+        Screen.Settings -> SettingsScreen(app.settings, onBack = ::home)
         Screen.Scan -> ScanScreen(
             pairing = pairing,
             lifecycleOwner = owner,
@@ -159,7 +177,13 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
                     onStop = pairing::stopSession,
                     onCreate = { offer ->
                         pairing.dismiss()
-                        screen = Screen.Create(offer.appId, offer.origin)
+                        // Pre-filled only with a valid identity: an offer's text is
+                        // browser-supplied and would show unescaped in the fields.
+                        screen = if (VaultIdentity.of(offer.appId, offer.origin) is Checked.Valid) {
+                            Screen.Create(offer.appId, offer.origin)
+                        } else {
+                            Screen.Create()
+                        }
                     },
                     onRewrap = { id ->
                         pairing.dismiss()

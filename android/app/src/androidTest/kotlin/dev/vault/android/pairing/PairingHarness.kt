@@ -13,7 +13,15 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.vault.android.MainActivity
 import dev.vault.android.VaultApp
 import dev.vault.android.keys.VaultKeys
+import androidx.work.Configuration
+import androidx.work.testing.SynchronousExecutor
+import androidx.work.testing.WorkManagerTestInitHelper
 import dev.vault.android.replacePairingForTest
+import dev.vault.android.replaceReplicatorForTest
+import dev.vault.android.replication.ReplicationScheduler
+import dev.vault.android.replication.Replicator
+import dev.vault.android.replication.VaultLocks
+import dev.vault.android.settings.SettingsStore
 import dev.vault.android.storage.VaultDir
 import dev.vault.android.storage.VaultStorage
 import dev.vault.android.vault.UserPresence
@@ -42,15 +50,23 @@ const val DEVICE = "Stand-in Browser"
  * only in androidTest; the app's approver is the real one.
  */
 class PassingPresence(private val pass: Boolean = true) : UserPresence {
+    /** Prompts with a CryptoObject (key unwraps). */
     @Volatile
     var prompts = 0
+
+    /** Prompts without a key (confirmations such as delete). */
+    @Volatile
+    var confirms = 0
 
     override suspend fun authenticate(title: String, cipher: Cipher): Cipher? {
         prompts++
         return cipher.takeIf { pass }
     }
 
-    override suspend fun confirm(title: String): Boolean = pass
+    override suspend fun confirm(title: String): Boolean {
+        confirms++
+        return pass
+    }
 }
 
 /**
@@ -119,10 +135,17 @@ class PairingHarness {
     lateinit var coordinator: PairingCoordinator
     lateinit var dir: VaultDir
     var recoveryKey: String? = null
+
+    /** With [open]'s `replication`: the test WorkManager and the replicator its jobs run. */
+    lateinit var locks: VaultLocks
+    lateinit var settings: SettingsStore
+    lateinit var scheduler: ReplicationScheduler
+    lateinit var replicator: Replicator
+    val replicaDir: File get() = File(context.noBackupFilesDir, "replica-test")
     private var scenario: ActivityScenario<MainActivity>? = null
 
     /** [fresh]: a new vault; otherwise the one an earlier phase (process) left. */
-    fun open(fresh: Boolean) {
+    fun open(fresh: Boolean, replication: Boolean = false) {
         val port = InstrumentationRegistry.getArguments().getString("standIn")
             ?: throw AssertionError("no browser stand-in: run with -Pandroid.testInstrumentationRunnerArguments.standIn=<control port> (see android/ci/connected-test.sh)")
         standIn = StandIn(port.toInt())
@@ -132,7 +155,24 @@ class PairingHarness {
         keys = VaultKeys(context, requireAuth = false)
         storage = VaultStorage(context, keys)
         manager = VaultManager(storage, keys)
-        coordinator = PairingCoordinator(context, manager, storage) { LockSettings() }
+        locks = VaultLocks()
+        var hooks = SessionHooks.None
+        if (replication) {
+            // A test WorkManager: jobs run when the test driver says their constraints are met.
+            WorkManagerTestInitHelper.initializeTestWorkManager(
+                context,
+                Configuration.Builder().setExecutor(SynchronousExecutor()).build(),
+            )
+            replicaDir.deleteRecursively()
+            settings = SettingsStore(context, keys, storage)
+            scheduler = ReplicationScheduler(context)
+            replicator = Replicator(context, storage, manager, settings, locks, scheduler) { coordinator.holds(it) }
+            app.replaceReplicatorForTest(replicator)
+            hooks = object : SessionHooks {
+                override fun sessionEnded(vaultId: String) = replicator.afterSession(vaultId)
+            }
+        }
+        coordinator = PairingCoordinator(context, manager, storage, { LockSettings() }, locks, hooks)
         app.replacePairingForTest(coordinator)
         if (Build.VERSION.SDK_INT >= 33) {
             instrumentation.uiAutomation.grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
@@ -158,6 +198,9 @@ class PairingHarness {
         }
         scenario?.close()
         app.replacePairingForTest(null)
+        app.replaceReplicatorForTest(null)
+        if (::scheduler.isInitialized) runCatching { androidx.work.WorkManager.getInstance(context).cancelAllWork().result.get() }
+        replicaDir.deleteRecursively()
         File(context.noBackupFilesDir, "vaults").deleteRecursively()
         if (::keys.isInitialized) keys.vaultIdsWithKeys().forEach(keys::deleteKeys)
         if (::manager.isInitialized) manager.close()

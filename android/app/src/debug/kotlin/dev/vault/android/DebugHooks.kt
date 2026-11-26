@@ -2,6 +2,7 @@
 package dev.vault.android
 
 import dev.vault.android.pairing.PairingCoordinator
+import dev.vault.android.replication.Replicator
 
 /**
  * Debug builds only (instrumented tests run on debug): hooks the release
@@ -10,6 +11,14 @@ import dev.vault.android.pairing.PairingCoordinator
 object DebugHooks {
     @Volatile
     var pairingOverride: PairingCoordinator? = null
+
+    @Volatile
+    var replicatorOverride: Replicator? = null
+}
+
+/** Instrumented tests: the replicator WorkManager's jobs run (null restores the app's own). */
+fun VaultApp.replaceReplicatorForTest(replicator: Replicator?) {
+    DebugHooks.replicatorOverride = replicator
 }
 
 /**

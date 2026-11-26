@@ -102,11 +102,11 @@ assert_debug_nsc_loopback_only() {
 }
 
 # Debug-only code (src/debug: the "import CA" setting and the instrumented
-# tests' coordinator hook) is in the debug dex files and absent from release.
+# tests' coordinator and replicator hooks) is in the debug dex files and absent from release.
 # Each marker is a string that only that code holds: the CA setting's label and
 # its sealed file name, and the hook's function name. The dump is the APK's
 # classes*.dex concatenated (`unzip -p <apk> 'classes*.dex'`).
-DEBUG_ONLY_MARKERS=('Import a CA certificate' 'debug-extra-ca.sealed' 'replacePairingForTest')
+DEBUG_ONLY_MARKERS=('Import a CA certificate' 'debug-extra-ca.sealed' 'replacePairingForTest' 'replaceReplicatorForTest')
 assert_dex_has_debug_only_code() {
   local dump=$1 label=$2 m
   [ -s "$dump" ] || fail "$label: no dex content to inspect"
