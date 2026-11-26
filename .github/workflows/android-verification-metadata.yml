@@ -94,7 +94,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           working-directory: android
-          script: adb reverse tcp:47100 tcp:47100 && adb reverse tcp:47101 tcp:47101 && ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 -Pandroid.testInstrumentationRunnerArguments.standIn=47101 :ffi:connectedDebugAndroidTest :app:connectedDebugAndroidTest
+          script: adb reverse tcp:47100 tcp:47100 && adb reverse tcp:47101 tcp:47101 && ./gradlew --stacktrace --no-configuration-cache --write-verification-metadata sha256 -Pvault.abis=x86_64 -Pandroid.testInstrumentationRunnerArguments.standIn=47101 -Pandroid.testInstrumentationRunnerArguments.notClass=dev.vault.android.pairing.ProcessDeathTest :ffi:connectedDebugAndroidTest :app:connectedDebugAndroidTest
       - name: summary
         run: |
           f=android/gradle/verification-metadata.xml

@@ -17,6 +17,8 @@
 //! GET /put?k=..&v=..       -> writes and commits through the vault
 //! GET /get?k=..            -> reads through the vault (404 when absent)
 //! GET /cancel, GET /lock   -> ends the pairing / the session
+//! GET /occupy              -> someone else answers the code first: a second
+//!                             client takes the mailbox, so the phone gets 409
 //! ```
 
 use std::cell::RefCell;
@@ -39,7 +41,12 @@ struct Seen {
 struct Pairing {
     session: Rc<VaultSession>,
     seen: Seen,
+    /// `/occupy`: a third party holding the pairing's relay mailbox.
+    squatter: Option<Ws>,
 }
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 type Current = Rc<RefCell<Option<Pairing>>>;
 
@@ -148,6 +155,7 @@ async fn route(path: &str, query: &str, cur: &Current, relay: &str) -> (u16, Str
         *cur.borrow_mut() = Some(Pairing {
             session: Rc::new(session),
             seen: seen.clone(),
+            squatter: None,
         });
         let qr = until(10_000, || seen.qr.borrow().clone()).await;
         return match qr {
@@ -158,6 +166,28 @@ async fn route(path: &str, query: &str, cur: &Current, relay: &str) -> (u16, Str
     let Some((session, seen)) = current(cur) else {
         return (409, "no pairing".into());
     };
+    if path == "/occupy" {
+        let Some(qr) = seen.qr.borrow().clone() else {
+            return (409, "no offer".into());
+        };
+        let offer = match vault_proto::PairOffer::from_qr(&qr) {
+            Ok(o) => o,
+            Err(e) => return (500, format!("offer: {e}")),
+        };
+        let url = match vault_client::mailbox_url(&offer.relay_url, &offer.mailbox_id) {
+            Ok(u) => u,
+            Err(e) => return (500, format!("mailbox url: {e}")),
+        };
+        return match tokio_tungstenite::connect_async(url.as_str()).await {
+            Ok((ws, _)) => {
+                if let Some(p) = cur.borrow_mut().as_mut() {
+                    p.squatter = Some(ws);
+                }
+                (200, "ok".into())
+            }
+            Err(e) => (500, format!("occupy: {e}")),
+        };
+    }
     match path {
         "/sas" => match until(timeout, || seen.sas.borrow().clone()).await {
             Some(s) => (200, s),
