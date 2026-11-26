@@ -7,7 +7,9 @@
 # 1. Checks the trust root (keys/release.pub, keys/allowed_signers) is a real key, the
 #    release <tag> is a draft and not yet signed, and the key lives outside the repository.
 # 2. Downloads SHA256SUMS from the draft, checks it lists exactly the five archives of
-#    <tag>, prints it and asks for confirmation.
+#    <tag> and the unsigned and signed Android APKs (run scripts/sign-android-apk.sh
+#    first), checks the signed APK on the draft matches its line, prints SHA256SUMS and
+#    asks for confirmation.
 # 3. Signs it: ssh-keygen -Y sign -n vault-release (asks for the key's passphrase).
 # 4. Verifies the signature against keys/allowed_signers, as the install scripts will.
 # 5. Uploads SHA256SUMS.sig and publishes the release (gh release edit --draft=false).
@@ -61,15 +63,18 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/vault-sign.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir "$tmp/dl" "$tmp/check"
+mkdir "$tmp/dl" "$tmp/check" "$tmp/apk"
 gh release download "$tag" --repo "$REPO" -p SHA256SUMS -D "$tmp/dl" > /dev/null ||
   die "could not download SHA256SUMS of $tag"
 sums="$tmp/dl/SHA256SUMS"
 [ -f "$sums" ] || die "release $tag has no SHA256SUMS"
 
-# Exactly the five archives of this version, each once, each an asset of the release.
+# Exactly the five archives and the two APKs of this version, each once, each an asset
+# of the release.
+apk="vault-android-$version.apk"
 listed="$(awk '{print $2}' "$sums" | LC_ALL=C sort)"
-expected=""
+expected="vault-android-$version-unsigned.apk
+$apk"
 for t in $TARGETS; do
   ext=tar.gz
   case "$t" in *windows*) ext=zip ;; esac
@@ -77,13 +82,26 @@ for t in $TARGETS; do
 vault-$version-$t.$ext"
 done
 expected="$(printf '%s\n' "$expected" | sed '/^$/d' | LC_ALL=C sort)"
+if ! printf '%s\n' "$listed" | grep -qxF "$apk" && printf '%s\n' "$assets" | grep -qxF "vault-android-$version-unsigned.apk"; then
+  die "SHA256SUMS of $tag does not list the signed APK $apk: sign it first (scripts/sign-android-apk.sh $tag <keystore>); refusing"
+fi
 if grep -Eqv '^[0-9a-f]{64}  [^ ]+$' "$sums" || [ "$listed" != "$expected" ]; then
   cat "$sums" >&2
-  die "SHA256SUMS of $tag does not list exactly the five archives of $version; refusing"
+  die "SHA256SUMS of $tag does not list exactly the five archives and the two APKs of $version; refusing"
 fi
 for a in $listed; do
   printf '%s\n' "$assets" | grep -qxF "$a" || die "SHA256SUMS lists $a, which is not an asset of $tag"
 done
+
+# The signed APK is the one asset uploaded by hand: it must be the file SHA256SUMS lists.
+sha256_file() {
+  if command -v sha256sum > /dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+gh release download "$tag" --repo "$REPO" -p "$apk" -D "$tmp/apk" > /dev/null ||
+  die "could not download $apk of $tag"
+want="$(awk -v f="$apk" '$2 == f {print $1}' "$sums")"
+got="$(sha256_file "$tmp/apk/$apk")"
+[ "$got" = "$want" ] || die "$apk on the draft does not match SHA256SUMS (got $got, listed $want); refusing"
 
 echo "SHA256SUMS of $tag (draft):"
 echo

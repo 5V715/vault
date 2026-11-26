@@ -17,7 +17,7 @@ Environment:
 
 Supported: auth status; release view [tag] --json F --jq EXPR (EXPR: .tagName, .isDraft,
 .assets[].name); release list [--exclude-drafts] [--exclude-pre-releases] [--limit N]
---json F --jq '.[] | [.tagName, (.isLatest|tostring)] | @tsv'; release download <tag> -p NAME... -D DIR; release upload <tag> FILE...;
+--json F --jq '.[] | [.tagName, (.isLatest|tostring)] | @tsv'; release download <tag> -p NAME... -D DIR; release upload <tag> [--clobber] FILE...;
 release edit <tag> --draft=false. Every command must name --repo 5V715/vault (or -R).
 """
 import fnmatch
@@ -158,11 +158,13 @@ def main():
                 die(f"{dest / p.name} already exists (use `--clobber` to overwrite file)")
             shutil.copyfile(p, dest / p.name)
     elif sub == "upload":
+        clobber = "--clobber" in args
+        args[:] = [a for a in args if a != "--clobber"]
         if len(args) < 2:
             die("fake gh: upload needs a tag and files")
         d = release_dir(args[0])
         for f in args[1:]:
-            if (d / Path(f).name).exists():
+            if (d / Path(f).name).exists() and not clobber:
                 die(f"asset {Path(f).name} already exists")
             shutil.copyfile(f, d / Path(f).name)
     elif sub == "edit":

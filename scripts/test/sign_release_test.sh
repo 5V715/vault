@@ -13,6 +13,8 @@ version=1.3.0
 tag="v$version"
 archives="vault-$version-aarch64-apple-darwin.tar.gz vault-$version-aarch64-unknown-linux-musl.tar.gz
 vault-$version-x86_64-apple-darwin.tar.gz vault-$version-x86_64-pc-windows-msvc.zip vault-$version-x86_64-unknown-linux-musl.tar.gz"
+# As scripts/sign-android-apk.sh leaves the draft (its own test runs it for real).
+apks="vault-android-$version-unsigned.apk vault-android-$version.apk"
 
 sha256_file() {
   if command -v sha256sum > /dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
@@ -34,13 +36,15 @@ repo() {
   echo "$r"
 }
 
-# fake <name>: a fake GitHub holding the draft release $tag, as the workflow leaves it.
+# fake <name>: a fake GitHub holding the draft release $tag, as the workflow and
+# sign-android-apk.sh leave it.
 fake() {
   local f="$tmp/$1/gh" d a
   d="$f/releases/$tag"
   mkdir -p "$d"
-  for a in $archives; do echo "archive $a" > "$d/$a"; done
-  (cd "$d" && for a in $archives; do printf '%s  %s\n' "$(sha256_file "$a")" "$a"; done) > "$d/SHA256SUMS"
+  for a in $archives $apks; do echo "asset $a" > "$d/$a"; done
+  # shellcheck disable=SC2086 # word lists
+  (cd "$d" && for a in $(printf '%s\n' $archives $apks | LC_ALL=C sort); do printf '%s  %s\n' "$(sha256_file "$a")" "$a"; done) > "$d/SHA256SUMS"
   touch "$d/.draft"
   echo "$f"
 }
@@ -94,6 +98,7 @@ sign_happy_path() {
   run happy "$r" "$f" y "$tag" "$tmp/offline/release"
   check "exits 0" succeeded
   check "shows SHA256SUMS before asking" says "vault-$version-x86_64-pc-windows-msvc.zip"
+  check "shows the signed APK's line" says "  vault-android-$version.apk"
   check "uploads a signature valid under keys/allowed_signers" valid_sig "$f" "$r"
   check "publishes the release" published "$f"
   check "never prints the private key" no_key_material
@@ -182,6 +187,24 @@ sign_refuses_unexpected_sums() {
   check "missing entry: uploads nothing" no_upload
 }
 
+sign_requires_signed_apk() {
+  local r f d
+  r="$(repo noapk)"; f="$(fake noapk)"
+  d="$f/releases/$tag"
+  rm "$d/vault-android-$version.apk"
+  grep -v " vault-android-$version.apk\$" "$d/SHA256SUMS" > "$d/s"; mv "$d/s" "$d/SHA256SUMS"
+  run noapk "$r" "$f" y "$tag" "$tmp/offline/release"
+  check "unsigned APK only: fails" failed
+  check "unsigned APK only: says to run sign-android-apk.sh" says "sign-android-apk.sh"
+  check "unsigned APK only: uploads nothing" no_upload
+  r="$(repo swapped)"; f="$(fake swapped)"
+  echo "another apk" > "$f/releases/$tag/vault-android-$version.apk"
+  run swapped "$r" "$f" y "$tag" "$tmp/offline/release"
+  check "signed APK not the listed one: fails" failed
+  check "signed APK not the listed one: says so" says "does not match SHA256SUMS"
+  check "signed APK not the listed one: uploads nothing" no_upload
+}
+
 sign_requires_gh_login() {
   local r f
   r="$(repo login)"; f="$(fake login)"
@@ -203,7 +226,7 @@ sign_validates_arguments() {
 
 all="sign_happy_path sign_aborts_without_confirmation sign_refuses_non_draft sign_refuses_already_signed
 sign_refuses_key_inside_repo sign_refuses_wrong_key sign_refuses_placeholder_trust_root
-sign_refuses_unexpected_sums sign_requires_gh_login sign_validates_arguments"
+sign_refuses_unexpected_sums sign_requires_signed_apk sign_requires_gh_login sign_validates_arguments"
 # shellcheck disable=SC2086 # word list
 [ $# -gt 0 ] || set -- $all
 for t in "$@"; do

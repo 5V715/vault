@@ -133,6 +133,12 @@ jobs:
             android/*/build/test-results/
           if-no-files-found: ignore
 
+  # The release APK exactly as release.yml builds it (android-release-apk.yml: no
+  # Gradle cache, --no-build-cache, APK checks, vault-android-<version>-unsigned.apk),
+  # so the release path is tested on every push and not first on a tag.
+  android-release-apk:
+    uses: ./.github/workflows/android-release-apk.yml
+
   # The instrumented tests (FFI smoke test, Keystore and storage flows, pairing
   # against the browser stand-in) on x86_64 emulators: the oldest supported API
   # level (minSdk 30) and a recent one. Only the x86_64 library is built here.
@@ -275,6 +281,8 @@ jobs:
         run: /bin/bash scripts/test/install_test.sh
       - name: sign-release.sh tests
         run: /bin/bash scripts/test/sign_release_test.sh
+      - name: sign-android-apk.sh tests (fake apksigner; the real one runs in android-release-apk.yml)
+        run: /bin/bash scripts/test/sign_android_apk_test.sh
       # scripts/showcase.sh (macOS runs it under its stock bash 3.2) against stub tools.
       - name: showcase.sh tests
         run: /bin/bash scripts/test/showcase_test.sh
@@ -641,6 +649,7 @@ jobs:
       - rust
       - vault-ffi-android
       - android
+      - android-release-apk
       - android-emulator
       - desktop
       - install-scripts

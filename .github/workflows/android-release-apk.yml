@@ -1,0 +1,80 @@
+name: android release apk
+
+# The unsigned release APK (all three ABIs) as a release ships it, built from a
+# clean state: no Gradle cache restored (setup-gradle cache disabled) and
+# --no-build-cache. release.yml calls this for a tag (version = the tag without
+# the v; the APK's versionName must equal it); ci.yml calls it on every push with
+# no version, so this exact path is tested before a tag needs it. It never signs:
+# the owner signs offline (docs/android.md "Releases").
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The release version (tag without v); empty = the APK's versionName.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # Same JDK pin as ci.yml (checked below).
+  ANDROID_JDK: "21.0.13+9"
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.ANDROID_JDK }}
+      - name: JDK is the pinned build (and the same pin as ci.yml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version 2>&1 | tee /dev/stderr | grep -F "$ANDROID_JDK" > /dev/null
+          grep -qF "ANDROID_JDK: \"$ANDROID_JDK\"" .github/workflows/ci.yml
+      - uses: ./.github/actions/android-toolchain
+        with:
+          sdk-packages: "true"
+      - name: Gradle wrapper pin equals Gradle's published checksum
+        run: android/ci/check-wrapper.sh
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-disabled: true
+      - name: unsigned release APK and debug APK (no build cache)
+        run: android/ci/gradle.sh --no-build-cache --stacktrace assembleDebug assembleRelease
+      - name: APK checks, versionName, vault-android-<version>-unsigned.apk
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: android/ci/release-apk.sh "$VERSION" dist
+      # The owner's offline procedure (scripts/sign-android-apk.sh, then sign-release.sh)
+      # on a fake draft holding this APK, with the SDK's real apksigner and a throwaway
+      # keystore made here: v2 + v3, the certificate pin, SHA256SUMS covering the signed
+      # APK. Nothing is uploaded anywhere (fake gh); the uploaded artifact stays unsigned.
+      - name: offline signing procedure with the real apksigner (throwaway keystore)
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=(dist/vault-android-*-unsigned.apk)
+          [ "${#apk[@]}" = 1 ]
+          VAULT_TEST_APKSIGNER="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" VAULT_TEST_APK="$PWD/${apk[0]}" \
+            scripts/test/sign_android_apk_test.sh apk_happy_path_then_sign_release apk_refuses_wrong_keystore apk_refuses_tampered_unsigned_apk
+          # The artifact is still the unsigned APK the release ships.
+          if "$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS/apksigner" verify "${apk[0]}" > /dev/null 2>&1; then
+            echo "::error::${apk[0]} is signed"; exit 1
+          fi
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-release-apk
+          path: dist/*
+          if-no-files-found: error
