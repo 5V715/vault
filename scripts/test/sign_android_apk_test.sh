@@ -117,7 +117,6 @@ signed_apk_cert_is() {
   local v
   v="$("$apksigner" verify --verbose --print-certs "$1/releases/$tag/$signed" 2>&1)" || return 1
   grep -qx "Signer #1 certificate SHA-256 digest: $2" <<<"$v" &&
-    grep -qx 'Verified using v2 scheme (APK Signature Scheme v2): true' <<<"$v" &&
     grep -qx 'Verified using v3 scheme (APK Signature Scheme v3): true' <<<"$v"
 }
 
@@ -128,7 +127,7 @@ apk_happy_path_then_sign_release() {
   sign_apk happy "$r" "$f" "$tag" "$tmp/offline/android.p12"
   check "exits 0" succeeded
   check "uploads the signed APK" test -s "$f/releases/$tag/$signed"
-  check "signed with the pinned certificate, v2 and v3" signed_apk_cert_is "$f" "$pin"
+  check "signed with the pinned certificate (v3)" signed_apk_cert_is "$f" "$pin"
   check "SHA256SUMS lists the archives and both APKs, matching the assets" sums_match_assets "$f"
   check "keeps the unsigned APK's line" grep -qxF "$before" "$f/releases/$tag/SHA256SUMS"
   check "uploads the APK before SHA256SUMS" test "$(grep -E $'^release\tupload' "$log" | grep -oE "$signed|SHA256SUMS\$" | tr '\n' ' ')" = "$signed SHA256SUMS "

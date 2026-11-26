@@ -10,10 +10,12 @@
 #    has no signed APK yet, and the keystore lives outside the repository.
 # 2. Downloads SHA256SUMS and vault-android-<version>-unsigned.apk and checks the APK's
 #    hash against its one SHA256SUMS line (as CI wrote it).
-# 3. Signs it: apksigner sign --ks <keystore> with the v2 and v3 schemes only (minSdk 30
-#    needs no v1; no v4 file). apksigner asks for the keystore password.
-# 4. Verifies it: apksigner verify --print-certs must report v2 and v3, one signer, and
-#    that signer's certificate SHA-256 must equal keys/android-cert.sha256.
+# 3. Signs it: apksigner sign --ks <keystore> with v2 and v3 enabled, v1 and v4 off
+#    (minSdk 30 needs no v1; no v4 file). apksigner asks for the keystore password. For a
+#    minSdk of 28 or more apksigner writes only the v3 signature: every device that can
+#    install the app verifies v3, so v2 would be dead weight.
+# 4. Verifies it: apksigner verify --print-certs must report v3, one signer, and that
+#    signer's certificate SHA-256 must equal keys/android-cert.sha256.
 # 5. Uploads vault-android-<version>.apk, then SHA256SUMS with its line added, and checks
 #    the draft now serves exactly that SHA256SUMS. sign-release.sh signs it next.
 # The keystore is only ever passed to apksigner by path. Set APKSIGNER to the apksigner
@@ -31,7 +33,7 @@ die() {
 [ $# = 2 ] || [ $# = 3 ] || { sed -n '6p' "$0" | sed 's/^# *//' >&2; exit 2; }
 tag="$1"
 ks="$2"
-alias_args=()
+alias_args=() # empty-safe expansion below: macOS bash 3.2 treats an empty array as unset
 if [ $# = 3 ]; then alias_args=(--ks-key-alias "$3"); fi
 [[ "$tag" =~ $TAG_RE ]] || die "invalid tag '$tag' (expected vX.Y.Z)"
 version="${tag#v}"
@@ -94,7 +96,7 @@ got="$(sha256_file "$tmp/dl/$unsigned")"
 echo "$unsigned matches SHA256SUMS ($got)"
 
 echo "signing with $ks (apksigner asks for the keystore password)"
-"$apksigner" sign --ks "$ks" "${alias_args[@]}" \
+"$apksigner" sign --ks "$ks" ${alias_args[@]+"${alias_args[@]}"} \
   --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false \
   --out "$tmp/out/$signed" "$tmp/dl/$unsigned" || die "apksigner sign failed; nothing was uploaded"
 [ -s "$tmp/out/$signed" ] || die "apksigner wrote no APK; nothing was uploaded"
@@ -103,8 +105,6 @@ echo "signing with $ks (apksigner asks for the keystore password)"
   cat "$tmp/verify.txt" >&2
   die "apksigner verify failed; nothing was uploaded"
 }
-grep -qx 'Verified using v2 scheme (APK Signature Scheme v2): true' "$tmp/verify.txt" ||
-  { cat "$tmp/verify.txt" >&2; die "not signed with the v2 scheme; nothing was uploaded"; }
 grep -qx 'Verified using v3 scheme (APK Signature Scheme v3): true' "$tmp/verify.txt" ||
   { cat "$tmp/verify.txt" >&2; die "not signed with the v3 scheme; nothing was uploaded"; }
 grep -qx 'Number of signers: 1' "$tmp/verify.txt" ||
@@ -112,7 +112,7 @@ grep -qx 'Number of signers: 1' "$tmp/verify.txt" ||
 cert="$(sed -nE 's/^Signer #1 certificate SHA-256 digest: ([0-9a-f]{64})$/\1/p' "$tmp/verify.txt")"
 [ "$cert" = "$pin" ] ||
   die "the APK's signing certificate SHA-256 is '${cert:-none}', but keys/android-cert.sha256 holds $pin (wrong keystore or alias?); nothing was uploaded"
-echo "signed: v2 + v3, certificate SHA-256 $cert (= keys/android-cert.sha256)"
+echo "signed: v3, certificate SHA-256 $cert (= keys/android-cert.sha256)"
 
 # SHA256SUMS with the signed APK's line, sorted by file name like the workflow's.
 printf '%s  %s\n' "$(sha256_file "$tmp/out/$signed")" "$signed" >> "$sums"

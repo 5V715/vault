@@ -9,8 +9,8 @@ sign --ks KS [--ks-key-alias A] --v1-signing-enabled false --v2-signing-enabled 
 verify --verbose --print-certs APK
     prints apksigner's report lines for an APK it signed (fails on anything else).
 
-Environment: VAULT_FAKE_APKSIGNER_SCHEMES (default "v2 v3"): the schemes verify
-reports as true; VAULT_FAKE_APKSIGNER_LOG: every invocation is appended (tab-joined).
+Environment: VAULT_FAKE_APKSIGNER_SCHEMES (default "v3", what the real apksigner
+writes for minSdk >= 28 with v2 and v3 enabled): the schemes verify reports as true; VAULT_FAKE_APKSIGNER_LOG: every invocation is appended (tab-joined).
 """
 import hashlib
 import os
@@ -61,7 +61,7 @@ def main():
         if MARK not in data:
             die("DOES NOT VERIFY\nERROR: Missing META-INF/MANIFEST.MF")
         cert = data.rsplit(MARK, 1)[1].decode()
-        schemes = os.environ.get("VAULT_FAKE_APKSIGNER_SCHEMES", "v2 v3").split()
+        schemes = os.environ.get("VAULT_FAKE_APKSIGNER_SCHEMES", "v3").split()
         print("Verifies")
         print("Verified using v1 scheme (JAR signing): false")
         print(f"Verified using v2 scheme (APK Signature Scheme v2): {str('v2' in schemes).lower()}")

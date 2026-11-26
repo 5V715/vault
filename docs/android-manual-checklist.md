@@ -23,7 +23,7 @@ see item 0).
 ## 1. Install and update
 
 - [ ] **Release build** from a published release: `SHA256SUMS.sig` verifies, the APK's
-      hash matches, `apksigner verify --verbose --print-certs` shows v2 and v3, one
+      hash matches, `apksigner verify --verbose --print-certs` shows v3 (v2 is left out for minSdk 30), one
       signer, and the certificate SHA-256 equals `keys/android-cert.sha256` and the
       published value. Sideload it (Files app and `adb install`).
 - [ ] **Update over the previous release** (`adb install -r` or the Files app): vaults,

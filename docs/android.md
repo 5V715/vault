@@ -65,8 +65,10 @@ installed and is there so the signed APK can be compared with it.
    apksigner verify --verbose --print-certs vault-android-1.2.3.apk
    ```
 
-   It must say `Verified using v2 scheme (APK Signature Scheme v2): true` and the same for
-   v3, `Number of signers: 1`, and `Signer #1 certificate SHA-256 digest: <hex>`. That hex
+   It must say `Verifies`, `Verified using v3 scheme (APK Signature Scheme v3): true`,
+   `Number of signers: 1`, and `Signer #1 certificate SHA-256 digest: <hex>`. (v1 and
+   v2 say `false`: for an app that needs Android 9 or later `apksigner` writes only the
+   v3 signature, which every such device checks.) That hex
    value must equal `keys/android-cert.sha256` in the repository **and** the
    fingerprint the owner publishes outside this repository. Android pins the certificate
    from the first install on: every update must carry the same one, so this check
@@ -340,8 +342,9 @@ covers the signed APK that is published, not only CI's unsigned one.
    `keys/android-cert.sha256` is set. It downloads the unsigned APK and checks it against
    `SHA256SUMS`, signs it with
    `apksigner sign --ks <keystore> --v1-signing-enabled false --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false`
-   (apksigner asks for the keystore password), then runs `apksigner verify --print-certs`
-   and requires v2, v3, one signer and the pinned certificate. Only then does it upload
+   (apksigner asks for the keystore password; with minSdk 30 it writes only the v3
+   signature), then runs `apksigner verify --print-certs` and requires v3, one signer
+   and the pinned certificate. Only then does it upload
    `vault-android-1.2.3.apk`, replace `SHA256SUMS` with one that also lists it, and check
    the draft serves that file.
 4. Then sign and publish as for every release ([`docs/install.md`](install.md),

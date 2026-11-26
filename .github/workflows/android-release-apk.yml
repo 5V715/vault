@@ -58,7 +58,7 @@ jobs:
         run: android/ci/release-apk.sh "$VERSION" dist
       # The owner's offline procedure (scripts/sign-android-apk.sh, then sign-release.sh)
       # on a fake draft holding this APK, with the SDK's real apksigner and a throwaway
-      # keystore made here: v2 + v3, the certificate pin, SHA256SUMS covering the signed
+      # keystore made here: v3, the certificate pin, SHA256SUMS covering the signed
       # APK. Nothing is uploaded anywhere (fake gh); the uploaded artifact stays unsigned.
       - name: offline signing procedure with the real apksigner (throwaway keystore)
         shell: bash
