@@ -69,6 +69,7 @@ dependencies {
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
     implementation(libs.zxing.core)
+    implementation(libs.work.runtime)
 
     testImplementation(libs.junit)
 
@@ -77,4 +78,5 @@ dependencies {
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.kotlinx.coroutines.core)
+    androidTestImplementation(libs.work.testing)
 }
