@@ -113,14 +113,22 @@ beyond what Compose gives for free.
     shows "No vault for this app" and offers to create one. Pairing never
     silently creates a vault.
 - **Replication:** see the owner decision below. Background replication runs
-  through WorkManager with the manifest key only, plus immediately after each
-  session. "Wi-Fi only" uses the network capability check before starting.
+  through Android's JobScheduler (no WorkManager, no app-side job database) with
+  the manifest key only, plus right after each session. "Wi-Fi only" is the
+  job's unmetered-network constraint and a capability check before starting.
 - **Network trust:** release builds trust only system CAs. Debug builds also trust
   user CAs, for the LAN showcase. `network_security_config` sets
   `cleartextTrafficPermitted=false` everywhere except loopback in debug.
-- **Settings** (per vault): auto-lock on screen off (default on), idle timeout,
-  Wi-Fi-only replication, replicate now, show stats (size, segments, last
-  replication, seq), compact now, delete vault (requires auth + typed app id).
+- **Settings:** app-wide auto-lock on screen off (default on) and idle timeout
+  (owner decision 2026-11-26: it applies to every session started after a
+  change, a running one keeps its own; no restart). Per vault: Wi-Fi-only
+  replication, replicate now, show stats (size, segments, last replication,
+  seq), compact now, delete vault (requires auth + typed app id).
+- **Compact now** (owner decision 2026-11-26) runs at once: the fingerprint/PIN
+  prompt unwraps the CRK (the approval's unlock path, re-wrap check included),
+  the vault is unlocked only for the compaction (`VaultHandle.compact_with_crk`),
+  then locked and the CRK wiped. Refused while a session or replication holds
+  the vault.
 
 ## UI flows (screens)
 
@@ -246,8 +254,15 @@ beyond what Compose gives for free.
 ## Owner decisions (2026-11-20, continued)
 
 - **Background replication (option B):**
-  - Replication also runs while the vault is locked, via WorkManager, optionally
-    on Wi-Fi only, whenever the device is unlocked or the job runs.
+  - Replication also runs while the vault is locked, via JobScheduler (owner
+    decision 2026-11-26, replacing WorkManager: no unsealed app-side job
+    database), optionally on Wi-Fi only, whenever the device is unlocked or the
+    job runs. Jobs: one persisted periodic job per vault (6 h; any network or
+    unmetered), a one-shot after each session end, and retries; "replicate now"
+    runs in the app. A job's id and extras carry only the random vault id (and
+    its kind). Scheduling sits behind a small interface (`ReplicationJobs`) whose
+    decisions come from `:core`'s `ReplicationPolicy`, so iOS can later put
+    BGTaskScheduler behind the same interface.
   - It uses only the manifest key, which cannot read vault data, plus the replica
     credentials. Both are sealed with a per-vault background Keystore key
     (AES-GCM, `setUnlockedDeviceRequired(true)`, no user authentication), the same

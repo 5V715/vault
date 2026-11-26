@@ -22,8 +22,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
+import dev.vault.android.replication.ReplicaInfo
 import dev.vault.android.replication.Replicator
-import dev.vault.android.replication.Trigger
 import dev.vault.android.settings.SettingsStore
 import dev.vault.android.vault.UserPresence
 import dev.vault.android.vault.VaultManager
@@ -37,7 +37,7 @@ import dev.vault.core.VaultSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import uniffi.vault_ffi.NamedReplica
+import uniffi.vault_ffi.ReplicaTarget
 import uniffi.vault_ffi.VaultStats
 
 /**
@@ -66,7 +66,10 @@ fun VaultDetailScreen(
     var deleteError by remember { mutableStateOf<String?>(null) }
     var deleting by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    var replicas by remember { mutableStateOf<List<NamedReplica>>(emptyList()) }
+    var replicas by remember { mutableStateOf<List<ReplicaInfo>>(emptyList()) }
+    var editing by remember { mutableStateOf<Pair<String, ReplicaTarget>?>(null) }
+    var compacting by remember { mutableStateOf(false) }
+    var compactMessage by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf<ReplicationStatus?>(null) }
     var vaultSettings by remember { mutableStateOf(VaultSettings()) }
     var adding by remember { mutableStateOf(false) }
@@ -76,7 +79,7 @@ fun VaultDetailScreen(
 
     LaunchedEffect(entry.dir.id, reload) {
         try {
-            replicas = replicator.replicas(entry.dir)
+            replicas = replicator.replicaInfos(entry.dir)
             withContext(Dispatchers.IO) {
                 status = settings.status(entry.dir)
                 vaultSettings = settings.vaultSettings(entry.dir)
@@ -129,7 +132,12 @@ fun VaultDetailScreen(
         if (replicas.isEmpty()) Text("No replicas yet. Without one, losing the phone loses the vault.")
         for (r in replicas) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(Untrusted.display(r.target.describe()), modifier = Modifier.weight(1f))
+                Text(Untrusted.display(r.description), modifier = Modifier.weight(1f))
+                TextButton(onClick = {
+                    scope.launch {
+                        replicator.replicaForEdit(entry.dir, r.id)?.let { editing = r.id to it }
+                    }
+                }) { Text("Edit") }
                 TextButton(onClick = {
                     scope.launch {
                         try {
@@ -143,7 +151,25 @@ fun VaultDetailScreen(
                 }) { Text("Remove") }
             }
         }
-        if (adding) {
+        val edit = editing
+        if (edit != null) {
+            ReplicaForm(
+                initial = edit.second,
+                onSave = { target ->
+                    scope.launch {
+                        try {
+                            replicator.updateReplica(entry.dir, edit.first, target)
+                            editing = null
+                        } catch (e: Exception) {
+                            if (e is kotlinx.coroutines.CancellationException) throw e
+                            replicationError = e.userMessage()
+                        }
+                        reload++
+                    }
+                },
+                onCancel = { editing = null },
+            )
+        } else if (adding) {
             ReplicaForm(
                 onSave = { target ->
                     scope.launch {
@@ -162,7 +188,13 @@ fun VaultDetailScreen(
         } else {
             OutlinedButton(onClick = { adding = true }, modifier = Modifier.fillMaxWidth()) { Text("Add a replica…") }
         }
-        status?.let { ReplicationStatusView(it) }
+        status?.let { st ->
+            ReplicationStatusView(st)
+            // A scheduler that never runs would otherwise go unnoticed.
+            if (st.isStale(System.currentTimeMillis(), replicas.isNotEmpty())) {
+                ErrorText("No successful replication in the last 24 hours. Check the replicas, or use Replicate now.")
+            }
+        }
         replicationError?.let { ErrorText(it) }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Switch(
@@ -188,7 +220,8 @@ fun VaultDetailScreen(
                     replicationError = null
                     scope.launch {
                         try {
-                            when (val r = replicator.run(entry.dir.id, Trigger.Manual)) {
+                            // Runs in the replicator's scope: leaving the screen doesn't cancel it.
+                            when (val r = replicator.replicateNow(entry.dir.id).await()) {
                                 is Replicator.Report.Waiting -> replicationError = waitingText(r.gate)
                                 is Replicator.Report.Skipped -> replicationError = "Nothing to replicate (${r.reason})."
                                 is Replicator.Report.Done -> Unit
@@ -210,27 +243,30 @@ fun VaultDetailScreen(
         HorizontalDivider()
         Text("Compaction", style = MaterialTheme.typography.titleMedium)
         Text(
-            "Compacting needs the vault unlocked and no browser served, which is the case right as a session " +
-                "ends: a requested compaction runs then.",
+            "Rewrites the vault without its dead data. The vault is unlocked (fingerprint or PIN) only while it compacts.",
             style = MaterialTheme.typography.bodySmall,
         )
         OutlinedButton(
             onClick = {
+                compacting = true
+                compactMessage = null
                 scope.launch {
-                    try {
-                        withContext(Dispatchers.IO) {
-                            settings.saveVaultSettings(entry.dir, settings.vaultSettings(entry.dir).copy(compactRequested = true))
-                        }
+                    compactMessage = try {
+                        "Compacted (seq ${manager.compactNow(entry.dir, presence)})."
                     } catch (e: Exception) {
                         if (e is kotlinx.coroutines.CancellationException) throw e
-                        replicationError = e.userMessage()
+                        e.userMessage()
+                    } finally {
+                        compacting = false
+                        reload++
                     }
-                    reload++
                 }
             },
-            enabled = !vaultSettings.compactRequested,
+            enabled = !compacting && !inSession,
             modifier = Modifier.fillMaxWidth(),
-        ) { Text(if (vaultSettings.compactRequested) "Compaction requested (at the next session's end)" else "Compact now") }
+        ) { Text(if (inSession) "Compact now (after the session)" else "Compact now") }
+        if (compacting) Working("Compacting…")
+        compactMessage?.let { Text(it) }
         HorizontalDivider()
         if (!confirmDelete) {
             OutlinedButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth()) { Text("Delete vault…") }
@@ -250,12 +286,11 @@ fun VaultDetailScreen(
                                 deleteError = "Stop the vault's session first."
                             } else {
                                 when (manager.deleteConfirmed(entry.dir, entry.identity, typedAppId, presence)) {
-                                    VaultManager.DeleteResult.Deleted -> {
-                                        replicator.forget(entry.dir.id)
-                                        onDeleted()
-                                    }
+                                    VaultManager.DeleteResult.Deleted -> onDeleted()
                                     VaultManager.DeleteResult.NotConfirmed -> deleteError = "Not confirmed at the screen-lock prompt."
                                     VaultManager.DeleteResult.AppIdNotTyped -> deleteError = "Type the app id exactly."
+                                    VaultManager.DeleteResult.Busy ->
+                                        deleteError = "The vault is in use (a session or a replication). Try again in a moment."
                                 }
                             }
                         } catch (e: Exception) {

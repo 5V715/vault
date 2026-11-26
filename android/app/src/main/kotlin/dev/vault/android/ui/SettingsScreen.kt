@@ -8,6 +8,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -24,12 +25,17 @@ import kotlinx.coroutines.withContext
 
 /** App-wide lock settings (every vault): auto-lock on screen off, idle timeout. Sealed when saved. */
 @Composable
-fun SettingsScreen(settings: SettingsStore, onBack: () -> Unit) {
-    val current = remember { settings.lockSettings() }
-    var screenOff by remember { mutableStateOf(current.lockOnScreenOff) }
-    var idle by remember { mutableStateOf(current.idleTimeoutMinutes.toString()) }
+fun SettingsScreen(settings: SettingsStore, onSaved: (LockSettings) -> Unit, onBack: () -> Unit) {
+    var screenOff by remember { mutableStateOf(LockSettings().lockOnScreenOff) }
+    var idle by remember { mutableStateOf(LockSettings().idleTimeoutMinutes.toString()) }
     var message by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    // A Keystore read: off the main thread.
+    LaunchedEffect(Unit) {
+        val current = withContext(Dispatchers.IO) { settings.lockSettings() }
+        screenOff = current.lockOnScreenOff
+        idle = current.idleTimeoutMinutes.toString()
+    }
 
     VaultScaffold("Settings", onBack) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -44,7 +50,7 @@ fun SettingsScreen(settings: SettingsStore, onBack: () -> Unit) {
         )
         Text(
             "A session ends (and its vault locks) after this long without a request from the browser. " +
-                "A new idle timeout applies from the next app start.",
+                "A new idle timeout applies to every session started from now on; a running one keeps its own.",
             style = MaterialTheme.typography.bodySmall,
         )
         message?.let { Text(it) }
@@ -56,9 +62,9 @@ fun SettingsScreen(settings: SettingsStore, onBack: () -> Unit) {
                 } else {
                     scope.launch {
                         message = try {
-                            withContext(Dispatchers.IO) {
-                                settings.saveLockSettings(LockSettings(lockOnScreenOff = screenOff, idleTimeoutMinutes = minutes))
-                            }
+                            val s = LockSettings(lockOnScreenOff = screenOff, idleTimeoutMinutes = minutes)
+                            withContext(Dispatchers.IO) { settings.saveLockSettings(s) }
+                            onSaved(s)
                             "Saved."
                         } catch (e: Exception) {
                             if (e is kotlinx.coroutines.CancellationException) throw e

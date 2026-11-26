@@ -13,6 +13,7 @@ import dev.vault.core.LockSettings
 import dev.vault.core.VaultIdentity
 import javax.crypto.Cipher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import uniffi.vault_ffi.FactoryConfig
@@ -54,6 +55,10 @@ class VaultManager(
     private val keys: VaultKeys,
     lockSettings: LockSettings = LockSettings(),
     extraCaPem: String? = null,
+    /** Shared with pairing and replication: one handle per container. */
+    val locks: VaultLocks = VaultLocks(),
+    /** A vault was deleted (its background jobs go too). */
+    private val onDeleted: (vaultId: String) -> Unit = {},
 ) : AutoCloseable {
     val factory = VaultFactory(
         FactoryConfig(
@@ -62,6 +67,13 @@ class VaultManager(
             idleTimeoutSecs = lockSettings.idleTimeoutSecs.toULong(),
         ),
     )
+
+    /**
+     * The app-wide idle timeout for sessions from now on: every pairing opens
+     * its own handle, so a change applies to the next session at once, while
+     * a running session keeps the timeout it started with.
+     */
+    fun applyLockSettings(s: LockSettings) = factory.setIdleTimeoutSecs(s.idleTimeoutSecs.toULong())
 
     /**
      * A new vault whose recovery key is being shown and checked. It is not
@@ -170,11 +182,15 @@ class VaultManager(
      * "Re-wrap" (the wrapped file is replaced only on success).
      */
     suspend fun rewrap(dir: VaultDir, recoveryKey: String, presence: UserPresence) = withContext(Dispatchers.IO) {
-        val crk = factory.rewrapWithRecoveryKey(dir.container.path, recoveryKey, storage.highWaterStore(dir))
-        try {
-            wrapAndStoreCrk(dir, crk, presence)
-        } finally {
-            crk.fill(0)
+        // Under the vault's lock: a replication run writing the anti-rollback
+        // state at the same time would overwrite the raised mark (or vice versa).
+        locks.of(dir.id).withLock {
+            val crk = factory.rewrapWithRecoveryKey(dir.container.path, recoveryKey, storage.highWaterStore(dir))
+            try {
+                wrapAndStoreCrk(dir, crk, presence)
+            } finally {
+                crk.fill(0)
+            }
         }
     }
 
@@ -205,12 +221,41 @@ class VaultManager(
     /** Opens [dir] locked, for stats; the caller closes the handle. */
     suspend fun open(dir: VaultDir): VaultHandle = factory.open(dir.container.path, storage.highWaterStore(dir))
 
-    suspend fun stats(dir: VaultDir): VaultStats = open(dir).use { it.stats() }
+    /** Throws [VaultBusyException] while a session or replication holds the vault. */
+    suspend fun stats(dir: VaultDir): VaultStats = withVault(dir) { open(dir).use { it.stats() } }
+
+    /**
+     * "Compact now": after the fingerprint/PIN prompt (the approval's unlock
+     * path: a vault that needs a re-wrap shows no prompt), the vault is
+     * unlocked only for the compaction, then locked; the CRK is wiped.
+     * Refused ([VaultBusyException]) while a session or replication holds it.
+     * Returns the new manifest seq.
+     */
+    suspend fun compactNow(dir: VaultDir, presence: UserPresence): Long = withVault(dir) {
+        if (needsRewrap(dir)) throw AuthKeyInvalidatedException()
+        val crk = unwrapCrk(dir, presence)
+        try {
+            open(dir).use { it.compactWithCrk(crk) }.toLong()
+        } finally {
+            crk.fill(0)
+        }
+    }
+
+    /** Runs [block] holding the vault's lock, or throws [VaultBusyException] at once. */
+    private suspend fun <T> withVault(dir: VaultDir, block: suspend () -> T): T {
+        val lock = locks.of(dir.id)
+        if (!lock.tryLock()) throw VaultBusyException()
+        try {
+            return block()
+        } finally {
+            lock.unlock()
+        }
+    }
 
     /** Deletes a vault and its keys. Users go through [deleteConfirmed]. */
     suspend fun delete(dir: VaultDir) = withContext(Dispatchers.IO) { storage.delete(dir) }
 
-    enum class DeleteResult { Deleted, AppIdNotTyped, NotConfirmed }
+    enum class DeleteResult { Deleted, AppIdNotTyped, NotConfirmed, Busy }
 
     /**
      * The vault screen's delete: only with the app id typed exactly, and then
@@ -219,9 +264,17 @@ class VaultManager(
      */
     suspend fun deleteConfirmed(dir: VaultDir, identity: VaultIdentity, typedAppId: String, presence: UserPresence): DeleteResult {
         if (!DeleteConfirmation.matches(typedAppId, identity.appId)) return DeleteResult.AppIdNotTyped
-        if (!presence.confirm("Delete ${identity.appId}")) return DeleteResult.NotConfirmed
-        delete(dir)
-        return DeleteResult.Deleted
+        // Never under an open handle (a session, a pairing, a replication run).
+        return try {
+            withVault(dir) {
+                if (!presence.confirm("Delete ${identity.appId}")) return@withVault DeleteResult.NotConfirmed
+                delete(dir)
+                onDeleted(dir.id)
+                DeleteResult.Deleted
+            }
+        } catch (e: VaultBusyException) {
+            DeleteResult.Busy
+        }
     }
 
     private suspend fun wrapAndStoreCrk(dir: VaultDir, crk: ByteArray, presence: UserPresence) {

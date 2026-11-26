@@ -22,9 +22,11 @@ import java.io.File
  * - per vault, `settings.sealed` and `replication-status.sealed` under the
  *   vault's own K_bg.
  *
- * The lock settings are read once and cached (the service needs them when the
- * screen goes off, when K_bg-class keys are unusable). An unreadable file means
- * the defaults.
+ * The lock settings are cached once read (the service needs them when the
+ * screen goes off, when K_bg-class keys are unusable). Only a good read (or no
+ * file) is cached: a read that failed (the process started while the phone
+ * was locked) gives the defaults for now and is tried again next time, so a
+ * stricter setting the user chose comes back once the phone is unlocked.
  */
 class SettingsStore(context: Context, private val keys: VaultKeys, private val storage: VaultStorage) {
     private val appFile = File(context.noBackupFilesDir, "app-settings.sealed")
@@ -32,9 +34,10 @@ class SettingsStore(context: Context, private val keys: VaultKeys, private val s
     @Volatile
     private var lock: LockSettings? = null
 
-    fun lockSettings(): LockSettings = lock ?: readLock().also { lock = it }
+    fun lockSettings(): LockSettings = lock ?: (readLock()?.also { lock = it } ?: LockSettings())
 
-    private fun readLock(): LockSettings = try {
+    /** Null if the file can't be read now. */
+    private fun readLock(): LockSettings? = try {
         if (!appFile.isFile) {
             LockSettings()
         } else {
@@ -46,8 +49,11 @@ class SettingsStore(context: Context, private val keys: VaultKeys, private val s
             }
         }
     } catch (e: Exception) {
-        LockSettings()
+        null
     }
+
+    /** Whether the lock settings were read (not just defaulted after a failed read). */
+    val lockSettingsKnown: Boolean get() = lock != null
 
     fun saveLockSettings(s: LockSettings) {
         keys.createBackgroundKey(APP_KEY_ID)

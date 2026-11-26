@@ -4,7 +4,7 @@ package dev.vault.android.pairing
 import android.content.Context
 import android.content.Intent
 import dev.vault.android.keys.AuthKeyInvalidatedException
-import dev.vault.android.replication.VaultLocks
+import dev.vault.android.vault.VaultLocks
 import dev.vault.android.storage.VaultDir
 import dev.vault.android.storage.VaultStorage
 import dev.vault.android.vault.PresenceCancelledException
@@ -100,10 +100,10 @@ internal class ApprovalSlot {
     }
 }
 
-/** What the app does around a session's end (compaction, replication); tests use [None]. */
+/** What the app does around a pairing (background replication); tests may use [None]. */
 interface SessionHooks {
-    /** The session ended by itself; [handle] is still unlocked and serves no browser. */
-    suspend fun beforeLock(dir: VaultDir, handle: VaultHandle) {}
+    /** A pairing of [vaultId] is about to open the vault: background work on it gives way. */
+    suspend fun pairingStarting(vaultId: String) {}
 
     /** A session of [vaultId] ended (it may have committed). Main thread; return quickly. */
     fun sessionEnded(vaultId: String) {}
@@ -163,9 +163,11 @@ class PairingCoordinator(
     private val storage: VaultStorage,
     lockSettings: () -> LockSettings,
     /** Shared with background replication: one handle per container. */
-    private val locks: VaultLocks = VaultLocks(),
-    private val hooks: SessionHooks = SessionHooks.None,
+    private val locks: VaultLocks,
+    private val hooks: SessionHooks,
 ) {
+    private val lockSettings = lockSettings
+
     private val context = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val supervisor = SessionSupervisor(lockSettings)
@@ -438,8 +440,11 @@ class PairingCoordinator(
         // container allows one): wait for it.
         closing[e.id]?.join()
         if (e.closed) return
-        // A background replication run may hold the vault: wait for it.
+        // A background replication run may hold the vault: it gives way.
+        hooks.pairingStarting(e.id)
         locks.of(e.id).lock()
+        // The idle timeout as set now (it may have changed since the last session).
+        manager.applyLockSettings(lockSettings())
         e.lockHeld = true
         val handle = try {
             manager.open(e.dir)
@@ -555,21 +560,11 @@ class PairingCoordinator(
         // as "locked" instead. Forced ends (Stop, screen off, a running
         // session) lock at once. The vault was never unlocked in between.
         val graceful = !forced && e.machine.state is State.Ended && e.answered && !e.sessionOver.isCompleted
-        // A session that ended by itself: still unlocked, no browser served,
-        // the one moment a requested compaction can run. Forced ends skip it.
-        val beforeLock = !forced && e.wasRunning
         val job = scope.launch {
             withContext(NonCancellable) {
                 if (graceful) withTimeoutOrNull(ANSWER_GRACE_MS) { e.sessionOver.await() }
                 if (h != null) {
                     try {
-                        if (beforeLock) {
-                            try {
-                                hooks.beforeLock(e.dir, h)
-                            } catch (x: Exception) {
-                                // Compaction is best effort; the lock is not.
-                            }
-                        }
                         h.lock()
                     } finally {
                         h.close()

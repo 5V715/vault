@@ -157,7 +157,7 @@ private fun App(app: VaultApp, presence: BiometricPresence, owner: LifecycleOwne
             onDone = { screen = Screen.Detail(s.entry) },
             onBack = { screen = Screen.Detail(s.entry) },
         )
-        Screen.Settings -> SettingsScreen(app.settings, onBack = ::home)
+        Screen.Settings -> SettingsScreen(app.settings, onSaved = { app.manager.applyLockSettings(it) }, onBack = ::home)
         Screen.Scan -> ScanScreen(
             pairing = pairing,
             lifecycleOwner = owner,

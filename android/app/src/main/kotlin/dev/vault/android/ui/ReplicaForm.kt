@@ -18,18 +18,26 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import dev.vault.core.Checked
+import dev.vault.core.ReplicaAddress
 import uniffi.vault_ffi.ReplicaTarget
 
-/** The replica editor: S3 (endpoint, region, bucket, prefix, key id, secret) or WebDAV (URL, user, password). */
+/**
+ * The replica editor: S3 (endpoint, region, bucket, prefix, key id, secret) or
+ * WebDAV (URL, user, password). Editing ([initial]) fills in everything but
+ * the secret, which is typed again. Addresses are checked as vault-ffi will.
+ */
 @Composable
-fun ReplicaForm(onSave: (ReplicaTarget) -> Unit, onCancel: () -> Unit) {
-    var s3 by remember { mutableStateOf(true) }
-    var endpoint by remember { mutableStateOf("") }
-    var region by remember { mutableStateOf("") }
-    var bucket by remember { mutableStateOf("") }
-    var prefix by remember { mutableStateOf("") }
-    var pathStyle by remember { mutableStateOf(true) }
-    var user by remember { mutableStateOf("") }
+fun ReplicaForm(onSave: (ReplicaTarget) -> Unit, onCancel: () -> Unit, initial: ReplicaTarget? = null) {
+    val s3Initial = initial as? ReplicaTarget.S3
+    val davInitial = initial as? ReplicaTarget.WebDav
+    var s3 by remember { mutableStateOf(davInitial == null) }
+    var endpoint by remember { mutableStateOf(s3Initial?.endpoint ?: davInitial?.url ?: "") }
+    var region by remember { mutableStateOf(s3Initial?.region ?: "") }
+    var bucket by remember { mutableStateOf(s3Initial?.bucket ?: "") }
+    var prefix by remember { mutableStateOf(s3Initial?.prefix ?: "") }
+    var pathStyle by remember { mutableStateOf(s3Initial?.pathStyle ?: true) }
+    var user by remember { mutableStateOf(s3Initial?.accessKeyId ?: davInitial?.user ?: "") }
     var secret by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -66,8 +74,11 @@ fun ReplicaForm(onSave: (ReplicaTarget) -> Unit, onCancel: () -> Unit) {
                     if (user.isBlank()) add(if (s3) "access key id" else "user")
                     if (secret.isEmpty()) add(if (s3) "secret" else "password")
                 }
+                val addressProblem = (ReplicaAddress.check(endpoint) as? Checked.Invalid)?.reason
                 if (missing.isNotEmpty()) {
                     error = "Missing: ${missing.joinToString(", ")}"
+                } else if (addressProblem != null) {
+                    error = addressProblem
                 } else {
                     error = null
                     onSave(
@@ -84,11 +95,4 @@ fun ReplicaForm(onSave: (ReplicaTarget) -> Unit, onCancel: () -> Unit) {
         ) { Text("Save replica") }
         OutlinedButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
     }
-}
-
-/** A replica in the list: where it is, never its credentials. */
-fun ReplicaTarget.describe(): String = when (this) {
-    is ReplicaTarget.S3 -> "S3 · $endpoint · $bucket${if (prefix.isNotEmpty()) "/$prefix" else ""}"
-    is ReplicaTarget.WebDav -> "WebDAV · $url"
-    is ReplicaTarget.Local -> "Local · $path"
 }

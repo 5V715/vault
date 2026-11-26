@@ -11,6 +11,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- "Wi-Fi only" replication: is the network unmetered? -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Persisted replication jobs survive a reboot (JobInfo.setPersisted needs it;
+         the app registers no boot receiver of its own). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- The screen-lock prompt that unwraps each vault's key (BiometricPrompt). -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <!-- Scanning the pairing code (CameraX + ZXing on the device; no Play Services). -->
@@ -84,26 +87,15 @@
             <meta-data
                 android:name="androidx.profileinstaller.ProfileInstallerInitializer"
                 tools:node="remove" />
-            <!-- WorkManager starts on demand (VaultApp is its Configuration.Provider):
-                 its database exists only once a vault has replicas to schedule. -->
-            <meta-data
-                android:name="androidx.work.WorkManagerInitializer"
-                tools:node="remove" />
         </provider>
 
-        <!-- WorkManager's JobScheduler service: the system binds it (BIND_JOB_SERVICE)
-             as the system uid, which needs no export. check-apks asserts that only
-             MainActivity is exported. -->
+        <!-- Background replication (JobScheduler; the system keeps the jobs, the
+             app keeps no job database). Only the system binds it (BIND_JOB_SERVICE,
+             as the system uid: no export needed; check-apks asserts that only
+             MainActivity is exported). -->
         <service
-            android:name="androidx.work.impl.background.systemjob.SystemJobService"
+            android:name=".replication.ReplicationJobService"
             android:exported="false"
-            tools:ignore="MissingClass"
-            tools:replace="android:exported" />
-
-        <!-- WorkManager's diagnostics broadcast (exported, adb-only): not needed. -->
-        <receiver
-            android:name="androidx.work.impl.diagnostics.DiagnosticsReceiver"
-            tools:ignore="MissingClass"
-            tools:node="remove" />
+            android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>

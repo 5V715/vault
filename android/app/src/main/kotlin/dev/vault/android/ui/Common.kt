@@ -27,7 +27,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.vault.android.keys.AuthKeyInvalidatedException
 import dev.vault.android.keys.BackgroundKeyMissingException
+import dev.vault.android.replication.InvalidReplicaException
 import dev.vault.android.vault.DuplicateVaultException
+import dev.vault.android.vault.VaultBusyException
 import dev.vault.android.vault.PresenceCancelledException
 import dev.vault.android.vault.PresenceUnavailableException
 import uniffi.vault_ffi.FfiException
@@ -113,6 +115,8 @@ fun ErrorText(text: String) {
 /** What a failed operation tells the user. Never includes secrets or raw details. */
 fun Throwable.userMessage(): String = when (this) {
     is PresenceCancelledException -> "Cancelled at the unlock prompt. Nothing was kept."
+    is VaultBusyException -> "The vault is in use (a session or a replication). Try again in a moment."
+    is InvalidReplicaException -> reason
     is PresenceUnavailableException ->
         if (locked) {
             "Too many attempts. Unlock the phone with its PIN, then try again."

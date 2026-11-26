@@ -13,14 +13,12 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.vault.android.MainActivity
 import dev.vault.android.VaultApp
 import dev.vault.android.keys.VaultKeys
-import androidx.work.Configuration
-import androidx.work.testing.SynchronousExecutor
-import androidx.work.testing.WorkManagerTestInitHelper
 import dev.vault.android.replacePairingForTest
 import dev.vault.android.replaceReplicatorForTest
-import dev.vault.android.replication.ReplicationScheduler
+import dev.vault.android.replication.JobSchedulerJobs
+import dev.vault.android.replication.ReplicationSessionHooks
 import dev.vault.android.replication.Replicator
-import dev.vault.android.replication.VaultLocks
+import dev.vault.android.vault.VaultLocks
 import dev.vault.android.settings.SettingsStore
 import dev.vault.android.storage.VaultDir
 import dev.vault.android.storage.VaultStorage
@@ -136,10 +134,10 @@ class PairingHarness {
     lateinit var dir: VaultDir
     var recoveryKey: String? = null
 
-    /** With [open]'s `replication`: the test WorkManager and the replicator its jobs run. */
+    /** The real JobScheduler adapter; with [open]'s `replication`, its jobs run [replicator]. */
+    val jobs = JobSchedulerJobs(context)
     lateinit var locks: VaultLocks
     lateinit var settings: SettingsStore
-    lateinit var scheduler: ReplicationScheduler
     lateinit var replicator: Replicator
     val replicaDir: File get() = File(context.noBackupFilesDir, "replica-test")
     private var scenario: ActivityScenario<MainActivity>? = null
@@ -154,25 +152,19 @@ class PairingHarness {
         if (fresh) File(context.noBackupFilesDir, "vaults").deleteRecursively()
         keys = VaultKeys(context, requireAuth = false)
         storage = VaultStorage(context, keys)
-        manager = VaultManager(storage, keys)
         locks = VaultLocks()
+        // As the app wires it: a deleted vault's jobs are cancelled by the delete itself.
+        manager = VaultManager(storage, keys, locks = locks, onDeleted = { jobs.cancelAll(it) })
+        settings = SettingsStore(context, keys, storage)
         var hooks = SessionHooks.None
         if (replication) {
-            // A test WorkManager: jobs run when the test driver says their constraints are met.
-            WorkManagerTestInitHelper.initializeTestWorkManager(
-                context,
-                Configuration.Builder().setExecutor(SynchronousExecutor()).build(),
-            )
             replicaDir.deleteRecursively()
-            settings = SettingsStore(context, keys, storage)
-            scheduler = ReplicationScheduler(context)
-            replicator = Replicator(context, storage, manager, settings, locks, scheduler) { coordinator.holds(it) }
+            replicator = Replicator(context, storage, manager, settings, locks, jobs) { coordinator.holds(it) }
             app.replaceReplicatorForTest(replicator)
-            hooks = object : SessionHooks {
-                override fun sessionEnded(vaultId: String) = replicator.afterSession(vaultId)
-            }
+            // The app's own hooks (a pairing makes replication give way; a session's end queues a run).
+            hooks = ReplicationSessionHooks { replicator }
         }
-        coordinator = PairingCoordinator(context, manager, storage, { LockSettings() }, locks, hooks)
+        coordinator = PairingCoordinator(context, manager, storage, lockSettings = { LockSettings() }, locks = locks, hooks = hooks)
         app.replacePairingForTest(coordinator)
         if (Build.VERSION.SDK_INT >= 33) {
             instrumentation.uiAutomation.grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
@@ -199,7 +191,7 @@ class PairingHarness {
         scenario?.close()
         app.replacePairingForTest(null)
         app.replaceReplicatorForTest(null)
-        if (::scheduler.isInitialized) runCatching { androidx.work.WorkManager.getInstance(context).cancelAllWork().result.get() }
+        (context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as android.app.job.JobScheduler).cancelAll()
         replicaDir.deleteRecursively()
         File(context.noBackupFilesDir, "vaults").deleteRecursively()
         if (::keys.isInitialized) keys.vaultIdsWithKeys().forEach(keys::deleteKeys)

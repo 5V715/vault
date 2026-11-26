@@ -25,8 +25,6 @@ jna = "5.19.1"
 # core decoder (Apache-2.0, plain Java). No Play Services / ML Kit.
 camerax = "1.4.2"
 zxing = "3.5.3"
-# Background replication (periodic + one-shot jobs); no GMS (work-gcm is not used).
-work = "2.10.1"
 junit = "4.13.2"
 androidxTestCore = "1.7.0"
 androidxTestRunner = "1.7.0"
@@ -45,8 +43,6 @@ camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "cam
 camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camerax" }
 camera-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
-work-runtime = { module = "androidx.work:work-runtime", version.ref = "work" }
-work-testing = { module = "androidx.work:work-testing", version.ref = "work" }
 junit = { module = "junit:junit", version.ref = "junit" }
 androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTestCore" }
 androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidxTestRunner" }
