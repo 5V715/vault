@@ -27,6 +27,8 @@ use crate::types::{
 pub struct VaultFactory {
     rt: Arc<OwnedRuntime>,
     config: FactoryConfig,
+    /// `config.idle_timeout_secs`, changeable later ([`VaultFactory::set_idle_timeout_secs`]).
+    idle_timeout_secs: Arc<std::sync::Mutex<Option<u64>>>,
 }
 
 impl std::fmt::Debug for VaultFactory {
@@ -107,10 +109,17 @@ fn parse_recovery_key(text: Zeroizing<String>) -> Result<RecoveryKey, FfiError> 
 }
 
 impl VaultFactory {
+    fn idle_timeout(&self) -> Option<u64> {
+        *self
+            .idle_timeout_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn server_config(&self, watch: Arc<Watch>) -> ServerConfig {
         ServerConfig {
             approval_timeout: Duration::from_secs(self.config.approval_timeout_secs.max(1)),
-            idle_timeout: self.config.idle_timeout_secs.map(Duration::from_secs),
+            idle_timeout: self.idle_timeout().map(Duration::from_secs),
             extra_ca_pem: self.config.extra_ca_pem.clone().map(String::into_bytes),
             observer: Some(Observer(watch)),
             ..ServerConfig::default()
@@ -153,8 +162,19 @@ impl VaultFactory {
         }
         Ok(Arc::new(Self {
             rt: OwnedRuntime::new()?,
+            idle_timeout_secs: Arc::new(std::sync::Mutex::new(config.idle_timeout_secs)),
             config,
         }))
+    }
+
+    /// Change the idle timeout (`None`: none). Handles opened from now on use
+    /// it; open handles (and their sessions) keep theirs. The app opens a
+    /// handle per pairing, so it applies to every new session at once.
+    pub fn set_idle_timeout_secs(&self, secs: Option<u64>) {
+        *self
+            .idle_timeout_secs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = secs;
     }
 
     /// Checks a scanned pairing code and returns what it asks for, without
@@ -341,6 +361,7 @@ impl VaultFactory {
         Arc::new(Self {
             rt: self.rt.clone(),
             config: self.config.clone(),
+            idle_timeout_secs: self.idle_timeout_secs.clone(),
         })
     }
 }

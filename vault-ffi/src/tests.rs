@@ -833,6 +833,70 @@ async fn rewrap_with_recovery_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn compact_with_crk_unlocks_only_for_the_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let f = factory();
+    let st = store();
+    let c = create(&f, &dir, &st).await;
+    let crk = c.crk.clone();
+    c.handle.clone().lock().await;
+    drop(c);
+    let h = f.open(path_str(&dir), st.clone()).await.unwrap();
+    assert!(h.is_locked());
+    let before = st.seq().unwrap();
+
+    // Another key, or a malformed one: refused, still locked.
+    let wrong = h.clone().compact_with_crk(vec![7u8; 32]).await;
+    assert!(matches!(wrong, Err(FfiError::WrongKey { .. })), "{wrong:?}");
+    let short = h.clone().compact_with_crk(vec![1u8; 31]).await;
+    assert!(
+        matches!(short, Err(FfiError::InvalidInput { .. })),
+        "{short:?}"
+    );
+    assert!(h.is_locked());
+
+    // The right CRK: compacted, the new mark saved, and locked again.
+    let seq = h.clone().compact_with_crk(crk).await.unwrap();
+    assert!(seq > before, "{seq} > {before}");
+    assert!(h.is_locked());
+    eventually("mark saved", || st.seq() == Some(seq)).await;
+    assert!(h.clone().stats().await.unwrap().locked);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_timeout_set_later_applies_to_new_handles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("v");
+    let f = factory();
+    let st = store();
+    let c = create(&f, &dir, &st).await;
+    let crk = c.crk.clone();
+    c.handle.clone().lock().await;
+    drop(c);
+    // Set after the factory was built: a handle opened now uses it.
+    f.set_idle_timeout_secs(Some(1));
+    let h = f.open(path_str(&dir), st.clone()).await.unwrap();
+    let relay = relay().await;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = Arc::new(TestListener::default());
+            let (session, seen, info) = pair(
+                &relay,
+                &h,
+                TestApprover::new(Mode::Approve(crk)),
+                listener.clone(),
+            )
+            .await;
+            info.unwrap();
+            confirm_and_wait_active(&session, &seen).await;
+            assert_eq!(wait_ended(&listener).await, EndReasonFfi::IdleTimeout);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn errors_map_to_ffi_enum() {
     use vault_container::Error as E;
     fn kind(e: &FfiError) -> &'static str {

@@ -8,7 +8,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use vault_container::Crk;
 use vault_container::backend::ContainerBackend;
-use vault_container::engine::HighWater;
+use vault_container::engine::{Container, HighWater};
 use vault_container::replicate::{ReplicaId, ReplicaSet};
 use vault_proto::PairOffer;
 use vault_server::{
@@ -349,8 +349,41 @@ impl VaultHandle {
             .await
     }
 
-    /// Compact the container now (the user's "compact now"). Needs an unlocked
-    /// vault without an active session. Returns the new manifest seq.
+    /// The app's "compact now" on a locked vault: open the container with the
+    /// CRK (unwrapped by Kotlin after a BiometricPrompt on K_auth), compact,
+    /// and lock again, so the vault is unlocked only for the compaction and
+    /// the CRK is dropped (zeroized) before this returns. Refused (`Busy`)
+    /// while a session is active; `WrongKey` for another vault's CRK;
+    /// `Rollback` if the container is older than the saved mark. Returns the
+    /// new manifest seq. Kotlin wipes its `ByteArray` right after the call.
+    pub async fn compact_with_crk(self: Arc<Self>, crk: Vec<u8>) -> Result<u64, FfiError> {
+        let crk = Zeroizing::new(crk);
+        let this = self.clone();
+        self.rt
+            .run(async move {
+                let key =
+                    Crk::from_slice(&crk).map_err(|_| FfiError::invalid("the CRK has 32 bytes"))?;
+                drop(crk);
+                if this.server.active_session().is_some() {
+                    return Err(FfiError::busy("a session is active"));
+                }
+                let floor = this.shared.state.get().high_water;
+                let container = Container::open_with_crk(this.primary.clone(), key, floor).await?;
+                this.server.unlock(container).await;
+                let result = this.server.compact_now().await;
+                // Locked again whatever the compaction did.
+                this.server.lock().await;
+                match result? {
+                    Some(seq) => Ok(seq),
+                    None => Err(FfiError::busy("a session started; not compacted")),
+                }
+            })
+            .await
+    }
+
+    /// Compact the container now. Needs an unlocked vault without an active
+    /// session (the app uses [`Self::compact_with_crk`]). Returns the new
+    /// manifest seq.
     pub async fn compact(self: Arc<Self>) -> Result<u64, FfiError> {
         let this = self.clone();
         self.rt
