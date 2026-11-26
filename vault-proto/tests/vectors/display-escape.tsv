@@ -1,0 +1,43 @@
+# Display escaping of untrusted text (device name, relay host, offered app id and
+# origin): vault-server's approver prints them with Rust's str::escape_debug, and
+# android/core's Untrusted.display must give the same text, except that quotes
+# stay unescaped (they are not delimiters on a screen). Pinned on both sides by
+# vault-server (approver.rs) and android/core (UntrustedTest).
+#
+# One case per line: input<TAB>expected display. The input column is written in
+# the same notation: \u{hex} is that code point and \\ a backslash (so the
+# vectors can hold controls and tabs); the expected column is literal.
+Firefox on laptop	Firefox on laptop
+Fire\u{202e}fox	Fire\u{202e}fox
+relay.example\u{202e}	relay.example\u{202e}
+Pixel \u{202e}✓ deifirev sedoc	Pixel \u{202e}✓ deifirev sedoc
+a\u{200b}b	a\u{200b}b
+a\u{200e}b\u{200f}c	a\u{200e}b\u{200f}c
+\u{2066}x\u{2069}	\u{2066}x\u{2069}
+\u{feff}bom	\u{feff}bom
+soft\u{ad}hyphen	soft\u{ad}hyphen
+arabic\u{61c}mark	arabic\u{61c}mark
+nb\u{a0}sp	nb\u{a0}sp
+ideo\u{3000}space	ideo\u{3000}space
+line\u{2028}sep	line\u{2028}sep
+para\u{2029}sep	para\u{2029}sep
+tab\u{9}x	tab\tx
+nl\u{a}x	nl\nx
+cr\u{d}x	cr\rx
+nul\u{0}x	nul\0x
+bell\u{7}x	bell\u{7}x
+del\u{7f}x	del\u{7f}x
+c1\u{85}x	c1\u{85}x
+private\u{e000}use	private\u{e000}use
+plane15\u{f0000}x	plane15\u{f0000}x
+noncharacter\u{ffff}x	noncharacter\u{ffff}x
+back\\slash	back\\slash
+fake \\u{202e} escape	fake \\u{202e} escape
+it's "quoted"	it's "quoted"
+\u{301}leading combining	\u{301}leading combining
+e\u{301} combining inside	é combining inside
+café	café
+Grüße aus Lichtenberg	Grüße aus Lichtenberg
+日本語のブラウザ	日本語のブラウザ
+emoji 🦊 fox	emoji 🦊 fox
+plain space	plain space

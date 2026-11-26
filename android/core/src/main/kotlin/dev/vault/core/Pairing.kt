@@ -145,6 +145,9 @@ class PairingMachine {
 
         data object ConnectFailed : Event
 
+        /** `serve_offer` timed out: the browser left the mailbox (an old code). */
+        data object OfferExpired : Event
+
         /**
          * `serve_offer` failed because the relay mailbox was already taken
          * (after the approver was warned, if the warning got through).
@@ -233,6 +236,7 @@ class PairingMachine {
                     emptyList()
                 }
                 Event.ConnectFailed -> end(s.vault, PairingOutcome.RelayUnreachable)
+                Event.OfferExpired -> end(s.vault, PairingOutcome.Expired)
                 Event.MailboxTaken -> {
                     end(s.vault, PairingOutcome.MailboxTaken)
                     listOf(Effect.CancelServe)

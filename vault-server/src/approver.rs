@@ -533,4 +533,50 @@ mod tests {
             ApprovalDecision::Approve(UnlockMaterial::Crk { .. })
         ));
     }
+
+    /// The input notation of `display-escape.tsv`: `\u{hex}` is that code
+    /// point, `\\` a backslash.
+    fn decode_vector(s: &str) -> String {
+        let mut out = String::new();
+        let mut rest = s;
+        while let Some(i) = rest.find('\\') {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i + 1..];
+            if let Some(t) = tail.strip_prefix('\\') {
+                out.push('\\');
+                rest = t;
+            } else if let Some(t) = tail.strip_prefix("u{") {
+                let end = t.find('}').expect("unterminated \\u{");
+                let cp = u32::from_str_radix(&t[..end], 16).expect("hex");
+                out.push(char::from_u32(cp).expect("code point"));
+                rest = &t[end + 1..];
+            } else {
+                panic!("bad escape in vector: {s}");
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The prompt's escaping (`escape_debug`) against the vectors android/core
+    /// pins too (`Untrusted.display`); on a screen quotes stay as they are.
+    #[test]
+    fn display_escape_vectors() {
+        let text = include_str!("../../vault-proto/tests/vectors/display-escape.tsv");
+        let mut n = 0;
+        for line in text
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        {
+            let (input, want) = line.split_once('\t').expect("input<TAB>expected");
+            let got = decode_vector(input)
+                .escape_debug()
+                .to_string()
+                .replace("\\'", "'")
+                .replace("\\\"", "\"");
+            assert_eq!(got, want, "{input}");
+            n += 1;
+        }
+        assert!(n > 20, "vector file looks truncated");
+    }
 }

@@ -27,6 +27,7 @@ data class SessionNotice(val title: String, val lines: List<String>) {
             return SessionNotice(title, shown)
         }
 
-        private fun line(v: VaultIdentity) = "${v.appId} · ${v.origin}"
+        // Identities are validated ASCII; escaped anyway, as everything a browser named.
+        private fun line(v: VaultIdentity) = "${Untrusted.display(v.appId)} · ${Untrusted.display(v.origin)}"
     }
 }

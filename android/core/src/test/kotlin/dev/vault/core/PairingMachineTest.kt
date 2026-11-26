@@ -197,6 +197,22 @@ class PairingMachineTest {
     }
 
     @Test
+    fun an_expired_code_is_told_apart_from_an_unreachable_relay() {
+        val r = Run()
+        r.on(Event.Scanned(offer, vault = identity))
+        r.effects.clear()
+        assertEquals(State.Ended(identity, PairingOutcome.Expired), r.on(Event.OfferExpired))
+        assertEquals(emptyList<Effect>(), r.effects)
+        assertTrue(PairingOutcome.Expired.message != PairingOutcome.RelayUnreachable.message)
+        // Once a prompt is up, serve_offer has returned: a late report changes nothing.
+        val shown = Run()
+        toPrompt(shown)
+        shown.effects.clear()
+        assertTrue(shown.on(Event.OfferExpired) is State.AwaitingApproval)
+        assertEquals(emptyList<Effect>(), shown.effects)
+    }
+
+    @Test
     fun a_new_scan_needs_an_ended_machine() {
         val r = Run()
         toPrompt(r)
