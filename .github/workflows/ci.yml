@@ -500,6 +500,8 @@ jobs:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: pinned base images still current? (notice only)
+        # A Docker Hub hiccup or rate limit must not block the image tests.
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -513,6 +515,19 @@ jobs:
               echo "::notice::newer base image: $ref is now $now (pinned ${pinned#*@})"
             fi
           done
+      - name: publish-todo-image needs every other job
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A job missing from publish-todo-image's `needs` would not block publishing.
+          f=.github/workflows/ci.yml
+          jobs=$(awk '/^jobs:/{j=1; next} j && /^  [a-z0-9-]+:$/{sub(/:$/,""); sub(/^  /,""); print}' "$f" | grep -vxE 'publish-todo-image|attest-todo-image' | sort)
+          needs=$(awk '/^  publish-todo-image:/{p=1; next} p && /^    needs:/{n=1; next} n && /^      - /{sub(/^      - /,""); print; next} n{exit}' "$f" | sort)
+          if [ "$jobs" != "$needs" ]; then
+            echo "::error::publish-todo-image needs must list exactly the other jobs"
+            diff <(echo "$jobs") <(echo "$needs") || true
+            exit 1
+          fi
       - name: build (amd64) and start read-only as non-root
         shell: bash
         run: |
@@ -609,8 +624,10 @@ jobs:
 
   # Publishes the vault-todo-demo image (docs/deploy-todo-demo.md) for amd64,
   # arm64 and arm/v7 from a push to main, after every other job of this run
-  # passed. Pull requests, other branches and tags never reach it. Tags:
-  # sha-<commit>, and `main` only while this commit is still the tip of main.
+  # passed (todo-demo-image checks that `needs` lists them all). Pull requests,
+  # other branches and tags never reach it. Pushes sha-<commit>; then moves
+  # `main` to it only if this commit is still the tip of main at that moment.
+  # No concurrency lock: a lock lets GitHub cancel a newer pending publish.
   # Not signed: the owner's release key never enters CI.
   publish-todo-image:
     needs:
@@ -626,12 +643,9 @@ jobs:
       - todo-example
       - relay-image
       - todo-demo-image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.repository == '5V715/vault' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    concurrency:
-      group: publish-todo-image
-      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -644,22 +658,6 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - name: tags (main only while this commit is the tip of main)
-        id: tags
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)
-          [ -n "$tip" ] || { echo "::error::cannot read the tip of main"; exit 1; }
-          tags="${IMAGE}:sha-${GITHUB_SHA}"
-          if [ "$tip" = "$GITHUB_SHA" ]; then
-            tags="${tags},${IMAGE}:main"
-          else
-            echo "::notice::${GITHUB_SHA} is no longer the tip of main (${tip}); not moving :main"
-          fi
-          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -674,7 +672,9 @@ jobs:
           file: Dockerfile.todo-demo
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            VERSION=${{ github.sha }}
           # Records the exact base-image digests and build arguments.
           provenance: mode=max
           labels: |
@@ -683,18 +683,37 @@ jobs:
             org.opencontainers.image.title=vault-todo-demo
             org.opencontainers.image.description=vault to-do demo page and vault-relay
             org.opencontainers.image.licenses=MIT
+      - name: move main to this image if still the tip of main
+        id: main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Checked right before retagging, after the (long) build: an older
+          # commit finishing late never moves `main` backwards.
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          [ -n "$tip" ] || { echo "::error::cannot read the tip of main"; exit 1; }
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            docker buildx imagetools create -t "${IMAGE}:main" "${IMAGE}@${DIGEST}"
+            echo "moved=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${GITHUB_SHA} is no longer the tip of main (${tip}); :main not moved"
+            echo "moved=no" >> "$GITHUB_OUTPUT"
+          fi
       - name: summary
         shell: bash
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.tags.outputs.tags }}
+          MOVED: ${{ steps.main.outputs.moved }}
         run: |
           {
             echo "### vault-todo-demo"
             echo
             echo "- digest: \`${IMAGE}@${DIGEST}\`"
-            echo "- tags: \`${TAGS}\`"
-            echo "- platforms: linux/amd64, linux/arm64, linux/arm/v7"
+            echo "- tags: \`${IMAGE}:sha-${GITHUB_SHA}\`; \`:main\` moved: ${MOVED}"
+            echo "- platforms: linux/amd64, linux/arm64, linux/arm/v7 (only amd64 is smoke-tested; the arm images are the same cross-build)"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # GitHub artifact attestation for the published image. Private repositories
@@ -702,7 +721,7 @@ jobs:
   # its permissions live here, not in the publishing job.
   attest-todo-image:
     needs: publish-todo-image
-    if: ${{ !github.event.repository.private }}
+    if: ${{ !github.event.repository.private && github.repository == '5V715/vault' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
