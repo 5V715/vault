@@ -50,12 +50,16 @@ installed and is there so the signed APK can be compared with it.
    `SHA256SUMS`, then the APK's hash.
 
    ```sh
-   gh release download v1.2.3 --repo 5V715/vault -p SHA256SUMS -p SHA256SUMS.sig -p vault-android-1.2.3.apk
-   ssh-keygen -Y verify -f keys/allowed_signers -I release@vault -n vault-release -s SHA256SUMS.sig < SHA256SUMS
+   base=https://github.com/5V715/vault/releases/download/v1.2.3
+   for f in SHA256SUMS SHA256SUMS.sig vault-android-1.2.3.apk; do curl --proto '=https' --tlsv1.2 -fsSLO "$base/$f"; done
+   curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/5V715/vault/v1.2.3/keys/allowed_signers
+   ssh-keygen -Y verify -f allowed_signers -I release@vault -n vault-release -s SHA256SUMS.sig < SHA256SUMS
    sha256sum --check --ignore-missing SHA256SUMS
    ```
 
-   The key in `keys/allowed_signers` must match the release-key fingerprint the owner
+   (`--ignore-missing` skips the other release files you did not download; on macOS use
+   `grep ' vault-android-1.2.3.apk$' SHA256SUMS | shasum -a 256 --check`.) The key in
+   `allowed_signers` must match the release-key fingerprint the owner
    publishes outside this repository ([`docs/install.md`](install.md), "Verify the
    release key").
 

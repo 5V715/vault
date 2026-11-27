@@ -277,8 +277,8 @@ Use the same `rev` for every vault crate you depend on and commit `Cargo.lock`
 (build with `--locked`). Bump it deliberately: push or pick a commit whose CI
 is green, change the `rev`, run your tests.
 
-If the repository is private (or your fork is), CI needs a read-only deploy
-key: create an ed25519 key, add the public half under the vault repository's
+The repository is public, so CI fetches it without credentials. A private fork
+needs a read-only deploy key: create an ed25519 key, add the public half under the vault repository's
 *Settings, Deploy keys* with "Allow write access" off, and store the private
 half as a secret of the consuming repository. Load it into an `ssh-agent` only
 for the fetch steps, map `https://github.com/5V715/vault` to

@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Pester 5 tests for scripts/install.ps1 against a local fake release: a throwaway OpenSSH
-# key, archives and SHA256SUMS generated here, and a fake `gh` (scripts/test/fake-gh,
-# gh.cmd -> gh.py) first on PATH. Windows only; run under both Windows PowerShell 5.1
-# and PowerShell 7:  Invoke-Pester -Path scripts/test/install.Tests.ps1 -Output Detailed
+# key, archives and SHA256SUMS generated here, served over HTTPS by a local stand-in for
+# github.com and its API (scripts/test/fake-github/server.py, python). Its throwaway
+# self-signed certificate is added to LocalMachine\Root for the run and removed after (CI
+# runners are administrators). No network, no gh. Windows only; run under both Windows
+# PowerShell 5.1 and PowerShell 7:  Invoke-Pester -Path scripts/test/install.Tests.ps1 -Output Detailed
 
 Describe 'install.ps1' {
     BeforeAll {
         $ErrorActionPreference = 'Stop'
         $script:Install = Join-Path $PSScriptRoot '..\install.ps1' | Resolve-Path | Select-Object -ExpandProperty Path
-        $script:Shim = Join-Path $PSScriptRoot 'fake-gh' | Resolve-Path | Select-Object -ExpandProperty Path
         $script:Placeholder = 'PLACEHOLDER ' + [char]0x2014 + ' owner must replace'
         $script:Target = 'x86_64-pc-windows-msvc'
         $script:Root = Join-Path $TestDrive 'root with spaces'
@@ -29,6 +30,32 @@ Describe 'install.ps1' {
             if ($p.ExitCode -ne 0) { throw "$File $($psi.Arguments) failed: $($o.Result)$($e.Result)" }
         }
         $script:SshKeygen = (Get-Command ssh-keygen.exe -CommandType Application | Select-Object -First 1).Source
+
+        # The HTTPS stand-in for github.com, with a throwaway certificate trusted for the run.
+        $tls = Join-Path $TestDrive 'tls'
+        New-Item -ItemType Directory -Path $tls | Out-Null
+        $openssl = Get-Command openssl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object Source
+        if (-not $openssl) { $openssl = Join-Path $env:ProgramFiles 'Git\usr\bin\openssl.exe' }
+        $cert = Join-Path $tls 'cert.pem'
+        $key = Join-Path $tls 'key.pem'
+        Invoke-Tool $openssl @('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2', '-config',
+            (Join-Path $PSScriptRoot 'fake-github\cert.cnf'), '-keyout', $key, '-out', $cert)
+        $script:TestCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cert)
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+        $store.Open('ReadWrite'); $store.Add($script:TestCert); $store.Close()
+        $python = (Get-Command python.exe -CommandType Application | Select-Object -First 1).Source
+        $portFile = Join-Path $tls 'port'
+        $q = { param($v) '"' + $v + '"' }
+        $script:Server = Start-Process -FilePath $python -PassThru -NoNewWindow -RedirectStandardError (Join-Path $tls 'server.log') `
+            -ArgumentList ('-I ' + (& $q (Join-Path $PSScriptRoot 'fake-github\server.py')) + ' ' + (& $q $script:Root) + ' ' + (& $q $cert) + ' ' + (& $q $key) + ' ' + (& $q $portFile))
+        for ($i = 0; $i -lt 100 -and -not (Test-Path -LiteralPath $portFile); $i++) { Start-Sleep -Milliseconds 100 }
+        if (-not (Test-Path -LiteralPath $portFile)) { throw "the test server did not start: $(Get-Content -Raw (Join-Path $tls 'server.log'))" }
+        $script:Port = (Get-Content -LiteralPath $portFile -Raw).Trim()
+        # install.ps1 needs no GitHub CLI: a gh that records any call comes first on PATH.
+        $script:Poison = Join-Path $TestDrive 'poison'
+        New-Item -ItemType Directory -Path $script:Poison | Out-Null
+        $script:GhCalled = Join-Path $TestDrive 'gh-called'
+        Set-Content -LiteralPath (Join-Path $script:Poison 'gh.cmd') -Value "@echo %* >> `"$script:GhCalled`"`r`n@exit /b 1"
 
         function New-Key([string]$Path) {
             Invoke-Tool $script:SshKeygen @('-q', '-t', 'ed25519', '-N', '', '-C', 'release@vault', '-f', $Path)
@@ -77,9 +104,9 @@ Describe 'install.ps1' {
             New-Release $f 'v1.2.3'
             New-Release $f 'v1.3.0'
             Set-Content -LiteralPath (Join-Path $f 'latest') -Value 'v1.3.0'
-            $env:VAULT_FAKE_GH_DIR = $f
-            $env:VAULT_FAKE_GH_LOG = Join-Path $script:Root "$Name\gh.log"
-            Set-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Value '' -NoNewline
+            $env:VAULT_INSTALL_TEST_BASE_URL = "https://localhost:$script:Port/$Name"
+            $script:Log = Join-Path $script:Root "$Name\requests.log"
+            Set-Content -LiteralPath $script:Log -Value '' -NoNewline
             $script:Scratch = Join-Path $script:Root "$Name\scratch"
             New-Item -ItemType Directory -Path $script:Scratch -Force | Out-Null
             $env:TEMP = $script:Scratch
@@ -103,13 +130,13 @@ Describe 'install.ps1' {
             }
             return $true
         }
-        function Get-Log { Get-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Raw }
+        function Get-Log { if (Test-Path -LiteralPath $script:Log) { [IO.File]::ReadAllText($script:Log) } else { '' } }
 
         $script:SavedEnv = @{}
-        foreach ($n in 'PATH', 'TEMP', 'TMP', 'VAULT_INSTALL_TEST', 'VAULT_INSTALL_TEST_ALLOWED_SIGNERS', 'VAULT_INSTALL_TEST_PATH_KEY', 'VAULT_FAKE_GH_AUTH_FAIL', 'VAULT_INSTALL_TEST_FAIL_RENAME') {
+        foreach ($n in 'PATH', 'TEMP', 'TMP', 'VAULT_INSTALL_TEST', 'VAULT_INSTALL_TEST_ALLOWED_SIGNERS', 'VAULT_INSTALL_TEST_PATH_KEY', 'VAULT_INSTALL_TEST_BASE_URL', 'VAULT_INSTALL_TEST_FAIL_RENAME', 'HTTPS_PROXY') {
             $script:SavedEnv[$n] = [Environment]::GetEnvironmentVariable($n, 'Process')
         }
-        $env:PATH = "$script:Shim;$env:PATH"
+        $env:PATH = "$script:Poison;$env:PATH"
         # The user PATH is written to this test key, never to HKCU\Environment.
         $script:PathKey = 'Software\VaultInstallTest\Environment-' + [guid]::NewGuid()
     }
@@ -117,14 +144,19 @@ Describe 'install.ps1' {
     AfterAll {
         foreach ($n in $script:SavedEnv.Keys) { [Environment]::SetEnvironmentVariable($n, $script:SavedEnv[$n], 'Process') }
         [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree('Software\VaultInstallTest', $false)
+        if ($script:Server) { Stop-Process -Id $script:Server.Id -Force -ErrorAction SilentlyContinue }
+        if ($script:TestCert) {
+            $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'LocalMachine')
+            $store.Open('ReadWrite'); $store.Remove($script:TestCert); $store.Close()
+        }
     }
 
     BeforeEach {
         $env:VAULT_INSTALL_TEST = '1'
         $env:VAULT_INSTALL_TEST_ALLOWED_SIGNERS = $script:TestSigners
         $env:VAULT_INSTALL_TEST_PATH_KEY = $script:PathKey
-        Remove-Item Env:VAULT_FAKE_GH_AUTH_FAIL -ErrorAction SilentlyContinue
         Remove-Item Env:VAULT_INSTALL_TEST_FAIL_RENAME -ErrorAction SilentlyContinue
+        Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
     }
 
     It 'install_happy_path' {
@@ -134,7 +166,10 @@ Describe 'install.ps1' {
         Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
         Get-Listing $d | Should -Be 'vault-dev.exe vault-relay.exe vaultctl.exe'
         Get-Listing $script:Scratch | Should -Be ''
-        Get-Log | Should -Match "release`tlist`t--repo`t5V715/vault`t--exclude-drafts`t--exclude-pre-releases"
+        Get-Log | Should -Match '(?m)^GET /happy/api/repos/5V715/vault/releases/latest$'
+        Get-Log | Should -Match "(?m)^GET /happy/5V715/vault/releases/download/v1\.3\.0/vault-1\.3\.0-$script:Target\.zip$"
+        Get-Log | Should -Match "(?m)^GET /happy/cdn/v1\.3\.0/vault-1\.3\.0-$script:Target\.zip$"
+        Test-Path -LiteralPath $script:GhCalled | Should -BeFalse
         & $script:Install -Dir $d
         Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
     }
@@ -205,7 +240,7 @@ Describe 'install.ps1' {
         $d = Join-Path $script:Root 'placeholder\dest'
         $env:VAULT_INSTALL_TEST_ALLOWED_SIGNERS = $script:Placeholder
         { & $script:Install -Dir $d } | Should -Throw '*release key not configured*'
-        Get-Log | Should -Not -Match "release`tdownload"
+        Get-Log | Should -Not -Match '/releases/download/'
         $env:VAULT_INSTALL_TEST_ALLOWED_SIGNERS = 'release@vault ssh-ed25519 AAAAgarbage'
         { & $script:Install -Dir $d } | Should -Throw '*release key not configured*'
         if ((Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\..\keys\allowed_signers') -Raw) -match 'PLACEHOLDER') {
@@ -215,13 +250,33 @@ Describe 'install.ps1' {
         Get-Listing $d | Should -Be ''
     }
 
-    It 'install_requires_gh_login' {
-        New-Fake 'login' | Out-Null
-        $env:VAULT_FAKE_GH_AUTH_FAIL = '1'
-        $d = Join-Path $script:Root 'login\dest'
-        { & $script:Install -Dir $d } | Should -Throw '*gh auth login*'
-        Get-Log | Should -Not -Match "release`tdownload"
+    It 'install_refuses_foreign_redirect' {
+        foreach ($u in 'https://evil.example/assets', "http://127.0.0.1:$script:Port/redirect/cdn", "https://user@127.0.0.1:$script:Port/redirect/cdn") {
+            $r = Join-Path $script:Root 'redirect'
+            if (Test-Path -LiteralPath $r) { Remove-Item -LiteralPath $r -Recurse -Force }
+            $f = New-Fake 'redirect'
+            Set-Content -LiteralPath (Join-Path $f 'redirect-to') -Value $u
+            $d = Join-Path $script:Root 'redirect\dest'
+            { & $script:Install -Dir $d } | Should -Throw '*refusing to download from*'
+            Get-Log | Should -Not -Match '/cdn/'
+            Get-Listing $d | Should -Be ''
+        }
+        New-Fake 'plainhttp' | Out-Null
+        $env:VAULT_INSTALL_TEST_BASE_URL = "http://localhost:$script:Port/plainhttp"
+        { & $script:Install -Dir (Join-Path $script:Root 'plainhttp\dest') } | Should -Throw '*must be an https URL*'
+    }
+
+    It 'install_reports_rate_limit' {
+        $f = New-Fake 'ratelimit'
+        Set-Content -LiteralPath (Join-Path $f 'ratelimit') -Value ''
+        $d = Join-Path $script:Root 'ratelimit\dest'
+        { & $script:Install -Dir $d } | Should -Throw '*rate limit*-Version vX.Y.Z*'
+        Get-Log | Should -Not -Match '/releases/download/'
         Get-Listing $d | Should -Be ''
+        Set-Content -LiteralPath $script:Log -Value '' -NoNewline
+        & $script:Install -Version v1.3.0 -Dir $d
+        Get-Installed $d | Should -Be "vaultctl 1.3.0 $script:Target"
+        Get-Log | Should -Not -Match '/api/'
     }
 
     It 'install_pins_version' {
@@ -229,13 +284,13 @@ Describe 'install.ps1' {
         $d = Join-Path $script:Root 'pin\dest'
         & $script:Install -Version v1.2.3 -Dir $d
         Get-Installed $d | Should -Be "vaultctl 1.2.3 $script:Target"
-        Get-Log | Should -Not -Match "release`t(view|list)"
-        # Invalid versions are refused before gh downloads anything.
-        Set-Content -LiteralPath $env:VAULT_FAKE_GH_LOG -Value '' -NoNewline
+        Get-Log | Should -Not -Match '/api/'
+        # Invalid versions are refused before anything is downloaded.
+        Set-Content -LiteralPath $script:Log -Value '' -NoNewline
         foreach ($bad in '1.2.3', 'v1.2', 'v1.2.3*', 'v1.2.3 x', '..\v1.2.3') {
             { & $script:Install -Version $bad -Dir $d } | Should -Throw '*invalid version*'
         }
-        Get-Log | Should -Not -Match "release`tdownload"
+        Get-Log | Should -Not -Match '/releases/download/'
         { & $script:Install -Version v9.9.9 -Dir (Join-Path $script:Root 'pin\bad') } | Should -Throw
         Get-Listing (Join-Path $script:Root 'pin\bad') | Should -Be ''
     }
@@ -262,12 +317,17 @@ Describe 'install.ps1' {
     It 'test_override_ignored_without_test_mode' {
         New-Fake 'notest' | Out-Null
         $d = Join-Path $script:Root 'notest\dest'
+        $env:HTTPS_PROXY = 'http://127.0.0.1:9'
         foreach ($mode in $null, '0', 'yes') {
             if ($null -eq $mode) { Remove-Item Env:VAULT_INSTALL_TEST } else { $env:VAULT_INSTALL_TEST = $mode }
             $err = $null
             try { & $script:Install -Dir $d } catch { $err = $_.Exception.Message }
             $err | Should -Not -BeNullOrEmpty
-            ($err -like '*release key not configured*' -or $err -like '*signature check failed*') | Should -BeTrue
+            # The embedded trust root and the real github.com: the placeholder is refused, or
+            # (with a real key) the dead proxy below stops the connection. PowerShell 7
+            # honours HTTPS_PROXY; Windows PowerShell 5.1 uses the system proxy instead.
+            ($err -like '*release key not configured*' -or $err -like '*could not connect to https://api.github.com/*') | Should -BeTrue
+            Get-Log | Should -Be ''
             Get-Listing $d | Should -Be ''
         }
     }

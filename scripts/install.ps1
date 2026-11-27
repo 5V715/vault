@@ -4,15 +4,19 @@
 Installs vaultctl, vault-dev and vault-relay from a signed GitHub release of 5V715/vault (Windows).
 
 .DESCRIPTION
-Downloads with the GitHub CLI (gh, logged in), then verifies before installing:
+Downloads over HTTPS from github.com (no login, no GitHub CLI), then verifies before
+installing:
   1. SHA256SUMS.sig is a valid `ssh-keygen -Y` signature over SHA256SUMS by the release
      key embedded below (principal release@vault, namespace vault-release);
   2. the archive's SHA-256 matches its single entry in SHA256SUMS.
 Only then is the archive extracted (in a temporary directory) and the three binaries
 installed to -Dir (default %LOCALAPPDATA%\vault\bin), which is added to the user PATH
 once. Any failure installs nothing; the temporary directory is always removed.
-Needs gh and ssh-keygen.exe (OpenSSH 8.2 or later: the Windows 10/11 OpenSSH client or
-Git for Windows). Works in Windows PowerShell 5.1 and PowerShell 7. See docs/install.md.
+Needs ssh-keygen.exe (OpenSSH 8.2 or later: the Windows 10/11 OpenSSH client or Git for
+Windows). Downloads go only to github.com and GitHub's release-asset hosts, over TLS 1.2+
+only; any other redirect is refused. Without -Version, one or two unauthenticated GitHub
+API requests find the latest stable release. Works in Windows PowerShell 5.1 and
+PowerShell 7. See docs/install.md.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -36,6 +40,11 @@ $Target = 'x86_64-pc-windows-msvc'
 $Binaries = @('vaultctl.exe', 'vault-dev.exe', 'vault-relay.exe')
 # \z, not $: .NET's $ also matches before a trailing newline.
 $VersionPattern = '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?\z'
+$StablePattern = '^v[0-9]+\.[0-9]+\.[0-9]+\z'
+$Web = 'https://github.com'
+$Api = 'https://api.github.com'
+# The hosts a download may be served from: github.com redirects release assets to these.
+$AssetHosts = @('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
 
 # The release trust root: must equal keys/allowed_signers (scripts/test/trust_root_test.sh
 # enforces it). Replace it only together with keys/release.pub and keys/allowed_signers.
@@ -166,38 +175,104 @@ $arch = $env:PROCESSOR_ARCHITEW6432
 if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
 if ($arch -ne 'AMD64') { Fail "unsupported platform Windows/$arch (prebuilt: Windows x86_64; build from source instead)" }
 
-$Gh = Find-Program 'gh'
 $SshKeygen = Find-Program 'ssh-keygen'
+
+# Test mode only: a local HTTPS stand-in for github.com (scripts/test/fake-github).
+if ($env:VAULT_INSTALL_TEST -ceq '1' -and $env:VAULT_INSTALL_TEST_BASE_URL) {
+    if ($env:VAULT_INSTALL_TEST_BASE_URL -cnotmatch '^https://[^/@]+(/[A-Za-z0-9._-]+)*\z') { Fail 'VAULT_INSTALL_TEST_BASE_URL must be an https URL' }
+    $Web = $env:VAULT_INSTALL_TEST_BASE_URL
+    $Api = "$Web/api"
+    $AssetHosts = @('localhost', '127.0.0.1')
+    if ($env:VAULT_INSTALL_TEST_ASSET_HOSTS) { $AssetHosts = @($env:VAULT_INSTALL_TEST_ASSET_HOSTS -split ' ') }
+}
+
+# HTTPS: System.Net.Http with redirects followed by hand (each hop is checked), the same in
+# Windows PowerShell 5.1 and PowerShell 7.
+Add-Type -AssemblyName System.Net.Http
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+$HttpHandler = New-Object System.Net.Http.HttpClientHandler
+$HttpHandler.AllowAutoRedirect = $false
+$Http = New-Object System.Net.Http.HttpClient($HttpHandler)
+$Http.Timeout = [TimeSpan]::FromMinutes(10)
+
+function Test-AllowedUrl([Uri]$Uri) {
+    if ($Uri.Scheme -cne 'https' -or $Uri.UserInfo) { return $false }
+    if ($AssetHosts -contains $Uri.Host) { return $true }
+    return $Uri.AbsoluteUri.StartsWith("$Web/", [StringComparison]::Ordinal) -or $Uri.AbsoluteUri.StartsWith("$Api/", [StringComparison]::Ordinal)
+}
+
+# GET over TLS into $OutFile, following at most 3 redirects, each of which must stay https
+# and on $AssetHosts. Returns the final status (200 = written) and whether a 403/429 was the
+# API rate limit. Connection and TLS failures stop the install.
+function Get-Https([string]$Url, [string]$OutFile, [switch]$ApiRequest) {
+    $uri = [Uri]$Url
+    for ($hop = 0; ; $hop++) {
+        if (-not (Test-AllowedUrl $uri)) { Fail "refusing to download from $uri (not GitHub or not https); nothing was installed" }
+        $req = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $uri)
+        [void]$req.Headers.TryAddWithoutValidation('User-Agent', 'vault-install')
+        if ($ApiRequest) {
+            [void]$req.Headers.TryAddWithoutValidation('Accept', 'application/vnd.github+json')
+            [void]$req.Headers.TryAddWithoutValidation('X-GitHub-Api-Version', '2022-11-28')
+        }
+        try {
+            $resp = $Http.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        } catch {
+            Fail "could not connect to $($uri.GetLeftPart([UriPartial]::Path)): $($_.Exception.GetBaseException().Message)"
+        }
+        try {
+            $code = [int]$resp.StatusCode
+            if ($code -eq 200) {
+                $in = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $fs = [IO.File]::Create($OutFile)
+                try { $in.CopyTo($fs) } finally { $fs.Dispose(); $in.Dispose() }
+                return [pscustomobject]@{ Status = 200; RateLimited = $false }
+            }
+            if (@(301, 302, 303, 307, 308) -contains $code) {
+                if ($hop -ge 3) { Fail "too many redirects for $($uri.GetLeftPart([UriPartial]::Path))" }
+                $loc = $resp.Headers.Location
+                if (-not $loc) { Fail "redirect without a location for $($uri.GetLeftPart([UriPartial]::Path))" }
+                if (-not $loc.IsAbsoluteUri) { $loc = New-Object Uri($uri, $loc) }
+                $uri = $loc
+                continue
+            }
+            $limited = $false
+            $vals = $null
+            if (($code -eq 403 -or $code -eq 429) -and $resp.Headers.TryGetValues('X-RateLimit-Remaining', [ref]$vals)) {
+                $limited = @($vals) -contains '0'
+            }
+            return [pscustomobject]@{ Status = $code; RateLimited = $limited }
+        } finally {
+            $resp.Dispose()
+        }
+    }
+}
+
+# An unauthenticated GitHub API request: the JSON text, or $null for 404. (The caller
+# parses it: a function returning an array would unroll it.)
+function Get-Api([string]$Path, [string]$OutFile) {
+    $r = Get-Https "$Api/repos/$Repo/$Path" $OutFile -ApiRequest
+    if ($r.Status -eq 200) { return [IO.File]::ReadAllText($OutFile) }
+    if ($r.RateLimited) {
+        Fail 'the GitHub API rate limit for your address is used up (60 requests per hour without login); wait for it to reset, or name the release: -Version vX.Y.Z (needs no API request)'
+    }
+    if ($r.Status -eq 404) { return $null }
+    Fail "could not look up the releases of $Repo (HTTP $($r.Status))"
+}
+
+function Test-StableRelease($Release) {
+    if ($null -eq $Release) { return $false }
+    $names = @($Release.PSObject.Properties | ForEach-Object Name)
+    if (-not ($names -contains 'tag_name' -and $names -contains 'draft' -and $names -contains 'prerelease')) { return $false }
+    return ([string]$Release.tag_name -cmatch $StablePattern) -and ($Release.draft -eq $false) -and ($Release.prerelease -eq $false)
+}
 
 if (-not $Dir) {
     if (-not $env:LOCALAPPDATA) { Fail 'LOCALAPPDATA is not set; pass -Dir' }
     $Dir = Join-Path $env:LOCALAPPDATA 'vault\bin'
 }
 $Dir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dir)
-
-if ((Invoke-Native $Gh @('auth', 'status')).ExitCode -ne 0) {
-    Fail 'gh is not logged in to GitHub; run: gh auth login'
-}
-
-if (-not $PSBoundParameters.ContainsKey('Version')) {
-    # The latest stable release: published (no drafts), not marked as a pre-release, and a
-    # plain vX.Y.Z tag (an unmarked -rc tag is skipped too). Among those, the one GitHub
-    # marks latest; otherwise the newest. Pre-releases install only with -Version.
-    $r = Invoke-Native $Gh @('release', 'list', '--repo', $Repo, '--exclude-drafts', '--exclude-pre-releases', '--limit', '100',
-        '--json', 'tagName,isLatest', '--jq', '.[] | [.tagName, (.isLatest|tostring)] | @tsv')
-    if ($r.ExitCode -ne 0) { Fail "could not list the releases of ${Repo} (gh too old for 'release list --json'? update gh): $($r.Err.Trim())" }
-    $first = $null
-    $Version = $null
-    foreach ($line in ($r.Out -split "`n")) {
-        $fields = $line.TrimEnd("`r") -split "`t"
-        if ($fields[0] -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+\z') { continue }
-        if (-not $first) { $first = $fields[0] }
-        if ($fields.Count -ge 2 -and $fields[1] -ceq 'true') { $Version = $fields[0]; break }
-    }
-    if (-not $Version) { $Version = $first }
-    if (-not $Version) { Fail "no published stable release of $Repo found (pre-releases install only with -Version)" }
-}
-$Archive = "vault-$($Version.Substring(1))-$Target.zip"
 
 $Tmp = Join-Path ([IO.Path]::GetTempPath()) ('vault-install-' + [guid]::NewGuid().ToString('N'))
 $Staged = @()
@@ -208,20 +283,47 @@ New-Item -ItemType Directory -Path $Tmp | Out-Null
 try {
     $Dl = Join-Path $Tmp 'dl'
     $X = Join-Path $Tmp 'x'
-    New-Item -ItemType Directory -Path $Dl, $X | Out-Null
+    $HttpDir = Join-Path $Tmp 'http'
+    New-Item -ItemType Directory -Path $Dl, $X, $HttpDir | Out-Null
+
+    if (-not $PSBoundParameters.ContainsKey('Version')) {
+        # The latest stable release: published (no drafts), not marked as a pre-release, and
+        # a plain vX.Y.Z tag (an unmarked -rc tag is skipped too). The one GitHub marks
+        # latest if it is one; otherwise the newest such release. Pre-releases install only
+        # with -Version.
+        $Version = $null
+        $text = Get-Api 'releases/latest' (Join-Path $HttpDir 'latest.json')
+        if ($null -ne $text) {
+            $latest = ConvertFrom-Json $text
+            if (Test-StableRelease $latest) { $Version = [string]$latest.tag_name }
+        }
+        if (-not $Version) {
+            $text = Get-Api 'releases?per_page=100' (Join-Path $HttpDir 'releases.json')
+            if ($null -eq $text) { Fail "could not list the releases of $Repo (HTTP 404)" }
+            # Windows PowerShell 5.1 returns a JSON array as one object; foreach over the
+            # variable enumerates it in both editions.
+            $list = ConvertFrom-Json $text
+            foreach ($rel in $list) {
+                if (Test-StableRelease $rel) { $Version = [string]$rel.tag_name; break }
+            }
+        }
+        if (-not $Version) { Fail "no published stable release of $Repo found (pre-releases install only with -Version)" }
+    }
+    $Archive = "vault-$($Version.Substring(1))-$Target.zip"
+    function Get-Asset([string]$Name) {
+        Get-Https "$Web/$Repo/releases/download/$Version/$Name" (Join-Path $Dl $Name)
+    }
     Write-Host "vault $Version for $Target"
 
     # 1. The signature over SHA256SUMS, before anything else is downloaded.
     $Sums = Join-Path $Dl 'SHA256SUMS'
     $Sig = Join-Path $Dl 'SHA256SUMS.sig'
-    $r = Invoke-Native $Gh @('release', 'download', $Version, '--repo', $Repo, '-p', 'SHA256SUMS', '-D', $Dl)
-    if ($r.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Sums -PathType Leaf)) {
-        Fail "could not download SHA256SUMS of release ${Version}: $($r.Err.Trim())"
-    }
-    [void](Invoke-Native $Gh @('release', 'download', $Version, '--repo', $Repo, '-p', 'SHA256SUMS.sig', '-D', $Dl))
-    if (-not (Test-Path -LiteralPath $Sig -PathType Leaf)) {
-        Fail "release $Version is not signed (no SHA256SUMS.sig); nothing was installed"
-    }
+    $r = Get-Asset 'SHA256SUMS'
+    if ($r.Status -eq 404) { Fail "release $Version not found (or it has no SHA256SUMS)" }
+    if ($r.Status -ne 200) { Fail "could not download SHA256SUMS of release $Version (HTTP $($r.Status))" }
+    $r = Get-Asset 'SHA256SUMS.sig'
+    if ($r.Status -eq 404) { Fail "release $Version is not signed (no SHA256SUMS.sig); nothing was installed" }
+    if ($r.Status -ne 200) { Fail "could not download SHA256SUMS.sig of release $Version (HTTP $($r.Status))" }
     $SignersFile = Join-Path $Tmp 'allowed_signers'
     [IO.File]::WriteAllText($SignersFile, $Signers + "`n")
     $r = Invoke-Native $SshKeygen @('-Y', 'verify', '-f', $SignersFile, '-I', 'release@vault', '-n', 'vault-release', '-s', $Sig) $Sums
@@ -246,9 +348,9 @@ try {
     if ($count -eq 0) { Fail "SHA256SUMS does not list $Archive (no build for $Target in $($Version)?)" }
     if ($count -ne 1) { Fail "SHA256SUMS lists $Archive more than once; refusing an ambiguous release" }
     $Zip = Join-Path $Dl $Archive
-    $r = Invoke-Native $Gh @('release', 'download', $Version, '--repo', $Repo, '-p', $Archive, '-D', $Dl)
-    if ($r.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Zip -PathType Leaf)) {
-        Fail "could not download ${Archive}: $($r.Err.Trim())"
+    $r = Get-Asset $Archive
+    if ($r.Status -ne 200 -or -not (Test-Path -LiteralPath $Zip -PathType Leaf)) {
+        Fail "could not download $Archive (HTTP $($r.Status))"
     }
     $actual = (Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -cne $expected) {

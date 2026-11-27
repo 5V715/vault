@@ -16,20 +16,20 @@ for five targets (and the Android vault app, `vault-android-<version>.apk`: see
 the hash of every archive, and `SHA256SUMS.sig` is the owner's offline OpenSSH signature
 over `SHA256SUMS`.
 
-While the repository is private, everything goes through the GitHub CLI
-([`gh`](https://cli.github.com/)) with your own login. There is no `curl | sh` path.
+The repository is public: the scripts and releases download over plain HTTPS from
+github.com, with no GitHub account and no GitHub CLI. There is still no `curl | sh` path:
+download the script, read it, then run it.
 
 ## Install (users)
 
-You need `gh`, logged in (`gh auth login`) with read access to `5V715/vault`, and
-`ssh-keygen` from OpenSSH 8.2 or later. `gh` must be recent enough for
-`gh release list --json` (tested with gh 2.89). Linux and macOS ship it. On Windows 10/11 it
-comes with the OpenSSH client (Settings > Optional features) or with Git for Windows.
+You need `ssh-keygen` from OpenSSH 8.2 or later. Linux and macOS ship it. On Windows
+10/11 it comes with the OpenSSH client (Settings > Optional features) or with Git for
+Windows. On Linux and macOS you also need `curl` (or else `wget`).
 
 ### Linux and macOS
 
 ```sh
-gh api repos/5V715/vault/contents/scripts/install.sh --jq .content | base64 --decode > install.sh
+curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/5V715/vault/main/scripts/install.sh
 less install.sh            # read it: it is short, and it is what decides what you trust
 bash install.sh            # latest stable release, into ~/.local/bin
 bash install.sh --version v1.2.3 --dir /opt/vault/bin
@@ -46,8 +46,8 @@ reports, and it does not guess.
 ### Windows (PowerShell 5.1 or 7)
 
 ```powershell
-$b64 = (gh api repos/5V715/vault/contents/scripts/install.ps1 --jq .content) -join ''
-[IO.File]::WriteAllBytes("$PWD\install.ps1", [Convert]::FromBase64String($b64))
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 'Tls12'   # Windows PowerShell 5.1 only
+Invoke-WebRequest -UseBasicParsing -OutFile install.ps1 https://raw.githubusercontent.com/5V715/vault/main/scripts/install.ps1
 notepad .\install.ps1       # read it
 powershell -ExecutionPolicy Bypass -File .\install.ps1          # latest stable, into %LOCALAPPDATA%\vault\bin
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v1.2.3 -Dir C:\tools\vault
@@ -65,13 +65,22 @@ nothing installed:
 
 1. The trust root embedded in the script is a real key. Until the owner has created the
    release key, the scripts stop with `release key not configured`.
-2. `gh` is installed and logged in.
+2. The tools they need are there (`ssh-keygen`, and `curl` or `wget` for `install.sh`).
 3. The version is either `--version vX.Y.Z` / `-Version vX.Y.Z` (checked against
    `^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`) or the latest stable release. The
    latest stable release is the published `vX.Y.Z` release that GitHub marks latest, or
-   else the newest one. Drafts are never installable. Pre-releases (tags with a suffix,
-   such as `v1.3.0-rc.1`) are only installed when named with `--version` / `-Version`.
-4. They download `SHA256SUMS` and `SHA256SUMS.sig` into a fresh temporary directory, then run
+   else the newest one. Finding it takes one or two unauthenticated requests to the GitHub
+   API (`api.github.com`, 60 requests per hour per address); if that limit is used up the
+   scripts say so, and `--version` / `-Version` needs no API request at all. Drafts are
+   never installable. Pre-releases (tags with a suffix, such as `v1.3.0-rc.1`) are only
+   installed when named with `--version` / `-Version`.
+4. They download `SHA256SUMS` and `SHA256SUMS.sig` from
+   `https://github.com/5V715/vault/releases/download/<tag>/` into a fresh temporary
+   directory. Every download is TLS only (TLS 1.2 or later) and fails on any HTTP error;
+   redirects are followed by hand, at most three, and only to `github.com` and GitHub's
+   release-asset hosts (`release-assets.githubusercontent.com`,
+   `objects.githubusercontent.com`). A redirect anywhere else, or to plain http, stops
+   the install. Then they run
    `ssh-keygen -Y verify -f <allowed_signers> -I release@vault -n vault-release -s SHA256SUMS.sig < SHA256SUMS`
    against the allowed-signers line embedded in the script. A release without
    `SHA256SUMS.sig` is "not signed" and is refused.
@@ -95,7 +104,10 @@ The temporary directory is removed on every exit path.
 You can check a release by hand the same way:
 
 ```sh
-gh release download v1.2.3 --repo 5V715/vault -p SHA256SUMS -p SHA256SUMS.sig -p 'vault-1.2.3-x86_64-unknown-linux-musl.tar.gz'
+base=https://github.com/5V715/vault/releases/download/v1.2.3
+for f in SHA256SUMS SHA256SUMS.sig vault-1.2.3-x86_64-unknown-linux-musl.tar.gz; do
+  curl --proto '=https' --tlsv1.2 -fsSLO "$base/$f"
+done
 ssh-keygen -Y verify -f keys/allowed_signers -I release@vault -n vault-release -s SHA256SUMS.sig < SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS                                    # Linux
 grep ' vault-1.2.3-aarch64-apple-darwin.tar.gz$' SHA256SUMS | shasum -a 256 --check  # macOS
@@ -242,8 +254,12 @@ but the compiled binaries are not claimed to be reproducible.
 ## Testing the scripts
 
 The tests use a local fake release. Throwaway keys and archives are generated in a
-temporary directory, and a fake `gh` (`scripts/test/fake-gh`) serves them. Nothing
-touches the network or a real key.
+temporary directory. The install tests serve them over HTTPS from a local stand-in for
+github.com and its API (`scripts/test/fake-github/server.py`, with a throwaway certificate;
+it also serves redirects off GitHub, plain-http redirects and an exhausted API rate limit,
+which the scripts must refuse or report). The signing tests use a fake `gh`
+(`scripts/test/fake-gh`). Nothing touches the network or a real key. The install tests
+need `python3` and `openssl`.
 
 ```sh
 scripts/test/install_test.sh         # install.sh (Linux, macOS)

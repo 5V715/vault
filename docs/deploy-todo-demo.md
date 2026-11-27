@@ -32,37 +32,47 @@ Pin the **digest** for a server you don't want to change under you; it is shown 
 the run's summary: `ghcr.io/5v715/vault-todo-demo@sha256:…`. Tags can move, a
 digest can't.
 
-The package is created **private**, and it stays private until its visibility is
-changed in the package settings; making the repository public does not change it.
-While private, log in once on the host with a personal access token (classic) that
-has only `read:packages`, typed at the prompt so it doesn't land in the shell history:
+The repository is public, but the package was created **private** and stays private
+until the owner changes its visibility (package settings → "Change visibility");
+making the repository public did not change it.
 
-```sh
-docker login ghcr.io -u <github-user>      # paste the token as the password
-docker pull ghcr.io/5v715/vault-todo-demo:main
-```
+- **Public package:** no login, just `docker pull ghcr.io/5v715/vault-todo-demo:main`.
+- **While it is private:** log in once on the host with a personal access token
+  (classic) that has only `read:packages`, typed at the prompt so it doesn't land in
+  the shell history:
 
-Docker keeps that token in `~/.docker/config.json` (or a credential helper); use a
-token with no other scope.
+  ```sh
+  docker login ghcr.io -u <github-user>      # paste the token as the password
+  docker pull ghcr.io/5v715/vault-todo-demo:main
+  ```
+
+  Docker keeps that token in `~/.docker/config.json` (or a credential helper); use a
+  token with no other scope.
 
 The image carries BuildKit provenance (`mode=max`: the exact base-image digests and
 build arguments):
 `docker buildx imagetools inspect ghcr.io/5v715/vault-todo-demo:main --format '{{ json .Provenance }}'`.
-It is not signed: the owner's release key never enters CI. Once the repository is
-public, a GitHub artifact attestation is added as well. Check it including the
-workflow and the branch it came from:
+It is not signed: the owner's release key never enters CI. Since the repository is
+public, each published image also gets a GitHub artifact attestation (SLSA build
+provenance, `attest-todo-image` job), stored with the repository and pushed to the
+registry next to the image. Check it including the workflow and the branch it came
+from (with the GitHub CLI, logged in with any account; while the package is private,
+`gh` also needs the `docker login` above to read the image):
 
 ```sh
 gh attestation verify oci://ghcr.io/5v715/vault-todo-demo@sha256:… -R 5V715/vault \
   --signer-workflow 5V715/vault/.github/workflows/ci.yml --source-ref refs/heads/main
 ```
 
+It must print `✓ Verification succeeded!` for the digest you deploy. Images published
+before the repository became public have no attestation.
+
 What this does and doesn't protect against: only a push to `main` runs the publish
 job, but GitHub grants the job's token from the workflow file of the pushed branch,
 so anyone with write access to the repository could push a branch whose workflow
-publishes an image of their own. Pinning a digest you checked (and, once
-available, the attestation check above with `--source-ref refs/heads/main`) is what
-ties a deployment to a reviewed commit on `main`.
+publishes an image of their own. Pinning a digest you checked, and the attestation
+check above with `--source-ref refs/heads/main`, is what ties a deployment to a
+reviewed commit on `main`.
 
 ### Raspberry Pi
 

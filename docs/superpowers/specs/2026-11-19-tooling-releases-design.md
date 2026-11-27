@@ -43,6 +43,10 @@ with the user's login.
   5. Only then extract and install: to `~/.local/bin` (or `--dir`) on Unix, or
      to `%LOCALAPPDATA%\vault\bin` on Windows, added to the user PATH.
   Any failure aborts with nothing installed.
+  *(2026-11-27: the repository is public, so steps 1 and 3 are now plain HTTPS from
+  github.com with curl/wget or System.Net.Http, no `gh` and no login; the latest
+  release comes from the unauthenticated API. Trust model unchanged. See
+  `docs/install.md`.)*
 - **Windows:** `--passphrase-fd` stays Unix-only and is not shown in Windows
   `--help`; the interactive prompt and `--passphrase-file` work everywhere.
 - **Honest limit:** the offline signature protects the release assets and the

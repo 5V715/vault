@@ -1,0 +1,14 @@
+# Test-only certificate for scripts/test/fake-github/server.py: self-signed, used as its
+# own trust anchor, for localhost and 127.0.0.1 (the two hosts the fake serves).
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = vault install test server
+[ext]
+subjectAltName = DNS:localhost, IP:127.0.0.1
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, digitalSignature, keyEncipherment, keyCertSign
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash

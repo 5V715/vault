@@ -5,20 +5,27 @@
 #
 #   install.sh [--version vX.Y.Z] [--dir DIR]
 #
-# Downloads with the GitHub CLI (`gh`, logged in), then verifies before installing:
+# Downloads over HTTPS from github.com (no login, no GitHub CLI; curl, or else wget), then
+# verifies before installing:
 #   1. SHA256SUMS.sig is a valid `ssh-keygen -Y` signature over SHA256SUMS by the release
 #      key embedded below (principal release@vault, namespace vault-release);
 #   2. the archive's SHA-256 matches its single entry in SHA256SUMS.
 # Only then is the archive extracted (in a temporary directory) and the three binaries
 # installed to DIR (default ~/.local/bin) with mode 0755. Any failure installs nothing;
-# the temporary directory is always removed. Needs gh, ssh-keygen (OpenSSH 8.2+), tar and
-# sha256sum or shasum.
+# the temporary directory is always removed. Needs curl or wget, ssh-keygen (OpenSSH 8.2+),
+# tar and sha256sum or shasum. Downloads go only to github.com and GitHub's release-asset
+# hosts, over TLS only; any other redirect is refused. Without --version, one or two
+# unauthenticated GitHub API requests find the latest stable release.
 set -euo pipefail
 
 REPO=5V715/vault
 BINARIES="vaultctl vault-dev vault-relay"
 VERSION_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
 STABLE_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'
+WEB=https://github.com
+API=https://api.github.com
+# The hosts a download may be served from: github.com redirects release assets to these.
+ASSET_HOSTS="github.com objects.githubusercontent.com release-assets.githubusercontent.com"
 
 # The release trust root: must equal keys/allowed_signers (scripts/test/trust_root_test.sh
 # enforces it). Replace it only together with keys/release.pub and keys/allowed_signers.
@@ -62,9 +69,29 @@ if ! [[ "$signers" =~ ^release@vault\ namespaces=\"vault-release\"\ ssh-ed25519\
   die "release key not configured: this copy of install.sh has no release key (the owner has not created one yet, see docs/install.md). Nothing was installed."
 fi
 
-for tool in gh ssh-keygen tar; do
+# Test mode only: a local HTTPS stand-in for github.com (scripts/test/fake-github), and
+# which downloader to use.
+downloader=""
+if [ "${VAULT_INSTALL_TEST:-}" = 1 ]; then
+  if [ -n "${VAULT_INSTALL_TEST_BASE_URL:-}" ]; then
+    [[ "$VAULT_INSTALL_TEST_BASE_URL" =~ ^https://[^/@]+(/[A-Za-z0-9._-]+)*$ ]] || die "VAULT_INSTALL_TEST_BASE_URL must be an https URL"
+    WEB="$VAULT_INSTALL_TEST_BASE_URL"
+    API="$VAULT_INSTALL_TEST_BASE_URL/api"
+    ASSET_HOSTS="${VAULT_INSTALL_TEST_ASSET_HOSTS:-localhost 127.0.0.1}"
+  fi
+  downloader="${VAULT_INSTALL_TEST_DOWNLOADER:-}"
+fi
+
+for tool in ssh-keygen tar; do
   command -v "$tool" > /dev/null 2>&1 || die "$tool is required but not installed"
 done
+if [ -z "$downloader" ]; then
+  if command -v curl > /dev/null 2>&1; then downloader=curl
+  elif command -v wget > /dev/null 2>&1; then downloader=wget
+  else die "curl or wget is required but neither is installed"
+  fi
+fi
+command -v "$downloader" > /dev/null 2>&1 || die "$downloader is required but not installed"
 if command -v sha256sum > /dev/null 2>&1; then
   sha256() { sha256sum "$1" | awk '{print $1}'; }
 elif command -v shasum > /dev/null 2>&1; then
@@ -83,26 +110,6 @@ case "$os/$arch" in
   Darwin/x86_64) target=x86_64-apple-darwin ;;
   *) die "unsupported platform $os/$arch (prebuilt: Linux x86_64/aarch64, macOS arm64/x86_64; build from source instead)" ;;
 esac
-
-gh auth status > /dev/null 2>&1 || die "gh is not logged in to GitHub; run: gh auth login"
-
-if [ -z "$version" ]; then
-  # The latest stable release: published (no drafts), not marked as a pre-release, and a
-  # plain vX.Y.Z tag (an unmarked -rc tag is skipped too). Among those, the one GitHub
-  # marks latest; otherwise the newest. Pre-releases install only with --version.
-  releases="$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
-    --json tagName,isLatest --jq '.[] | [.tagName, (.isLatest|tostring)] | @tsv')" ||
-    die "could not list the releases of $REPO (gh too old for 'release list --json'? update gh)"
-  first=""
-  while IFS=$'\t' read -r t is_latest; do
-    [[ "$t" =~ $STABLE_RE ]] || continue
-    [ -n "$first" ] || first="$t"
-    if [ "$is_latest" = true ]; then version="$t"; break; fi
-  done <<< "$releases"
-  [ -n "$version" ] || version="$first"
-  [ -n "$version" ] || die "no published stable release of $REPO found (pre-releases install only with --version)"
-fi
-archive="vault-${version#v}-$target.tar.gz"
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/vault-install.XXXXXX")" || die "could not create a temporary directory"
 # Install state, for cleanup and rollback. Only the fixed binary names are ever split on
@@ -130,16 +137,120 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir "$tmp/dl" "$tmp/x"
+mkdir "$tmp/dl" "$tmp/x" "$tmp/http"
+
+# fetch <url> <out> [api]: GET over TLS into <out>, following at most 3 redirects, each of
+# which must stay https and on $ASSET_HOSTS. Sets $status to the final HTTP status and
+# returns 0 only for 200. Connection and TLS failures stop the install.
+status=""
+host_allowed() {
+  local rest="${1#https://}" host h
+  [ "$rest" != "$1" ] || return 1
+  host="${rest%%/*}"
+  case "$host" in *@*) return 1 ;; esac
+  host="${host%:*}"
+  for h in $ASSET_HOSTS; do [ "$host" = "$h" ] && return 0; done
+  case "$1" in "$WEB"/* | "$API"/*) return 0 ;; esac
+  return 1
+}
+fetch() {
+  local url="$1" out="$2" hops=0 res location
+  local extra=()
+  if [ "${3:-}" = api ]; then extra=(--header 'Accept: application/vnd.github+json' --header 'X-GitHub-Api-Version: 2022-11-28'); fi
+  while :; do
+    host_allowed "$url" || die "refusing to download from $url (not GitHub or not https); nothing was installed"
+    rm -f "$out" "$tmp/http/headers"
+    if [ "$downloader" = curl ]; then
+      res="$(curl --silent --show-error --proto '=https' --tlsv1.2 --max-redirs 0 --connect-timeout 30 \
+        --user-agent vault-install ${extra[@]+"${extra[@]}"} --dump-header "$tmp/http/headers" --output "$out" \
+        --write-out '%{http_code} %{redirect_url}' "$url")" || die "could not connect to ${url%%\?*} (curl failed)"
+      status="${res%% *}"
+      location="${res#* }"
+    else
+      local wh=()
+      if [ "${3:-}" = api ]; then wh=(--header='Accept: application/vnd.github+json' --header='X-GitHub-Api-Version: 2022-11-28'); fi
+      # wget exits 8 for any HTTP error, including a redirect it did not follow: the status
+      # line decides. Exit codes 4 (network) and 5 (TLS) stop the install.
+      wget --quiet --server-response --https-only --secure-protocol=TLSv1_2 --max-redirect=0 --timeout=30 \
+        --user-agent=vault-install ${wh[@]+"${wh[@]}"} --output-document="$out" "$url" 2> "$tmp/http/headers" || {
+        local rc=$?
+        [ "$rc" = 8 ] || die "could not connect to ${url%%\?*} (wget exit $rc)"
+      }
+      status="$(awk '$1 ~ /^HTTP\// { s = $2 } END { print s }' "$tmp/http/headers")"
+      location="$(awk 'tolower($1) == "location:" { l = $2 } END { print l }' "$tmp/http/headers" | tr -d '\r')"
+    fi
+    case "$status" in
+      200) return 0 ;;
+      301 | 302 | 303 | 307 | 308)
+        hops=$((hops + 1))
+        [ "$hops" -le 3 ] || die "too many redirects for ${url%%\?*}"
+        [ -n "$location" ] || die "redirect without a location for ${url%%\?*}"
+        url="$location"
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
+rate_limited() {
+  [ "$status" = 403 ] || [ "$status" = 429 ] || return 1
+  tr -d '\r' < "$tmp/http/headers" | grep -qiE '^ *x-ratelimit-remaining: *0$'
+}
+api_get() { # api_get <path> <out>: an unauthenticated GitHub API request
+  fetch "$API/repos/$REPO/$1" "$2" api && return 0
+  if rate_limited; then
+    die "the GitHub API rate limit for your address is used up (60 requests per hour without login); wait for it to reset, or name the release: --version vX.Y.Z (needs no API request)"
+  fi
+  return 1
+}
+# One "tag draft prerelease" line per release in a release (list) JSON document, from its
+# "tag_name", "draft" and "prerelease" fields in document order (GitHub writes them in
+# that order). Fields inside strings (a release's name or notes) have escaped quotes and
+# do not match. No awk regex: the caller checks each tag against $STABLE_RE.
+releases_in() {
+  grep -oE '"(tag_name|draft|prerelease)"[[:space:]]*:[[:space:]]*("[^"\\]*"|true|false)' "$1" |
+    sed -E 's/^"([a-z_]+)"[[:space:]]*:[[:space:]]*"?([^"]*)"?$/\1 \2/' |
+    awk '$1 == "tag_name" { if (n++) print tag, draft, pre; tag = $2; draft = "?"; pre = "?" }
+         $1 == "draft" { draft = $2 } $1 == "prerelease" { pre = $2 }
+         END { if (n) print tag, draft, pre }'
+}
+
+if [ -z "$version" ]; then
+  # The latest stable release: published (no drafts), not marked as a pre-release, and a
+  # plain vX.Y.Z tag (an unmarked -rc tag is skipped too). The one GitHub marks latest if it
+  # is one; otherwise the newest such release. Pre-releases install only with --version.
+  if api_get releases/latest "$tmp/http/latest.json"; then
+    while read -r t d p; do
+      if [[ "$t" =~ $STABLE_RE ]] && [ "$d" = false ] && [ "$p" = false ]; then version="$t"; fi
+      break
+    done < <(releases_in "$tmp/http/latest.json")
+  elif [ "$status" != 404 ]; then
+    die "could not look up the latest release of $REPO (HTTP $status)"
+  fi
+  if [ -z "$version" ]; then
+    api_get "releases?per_page=100" "$tmp/http/releases.json" ||
+      die "could not list the releases of $REPO (HTTP $status)"
+    while read -r t d p; do
+      if [[ "$t" =~ $STABLE_RE ]] && [ "$d" = false ] && [ "$p" = false ]; then version="$t"; break; fi
+    done < <(releases_in "$tmp/http/releases.json")
+  fi
+  [ -n "$version" ] || die "no published stable release of $REPO found (pre-releases install only with --version)"
+fi
+archive="vault-${version#v}-$target.tar.gz"
+download() { # download <file>: the release asset into $tmp/dl
+  fetch "$WEB/$REPO/releases/download/$version/$1" "$tmp/dl/$1"
+}
 
 echo "vault $version for $target"
 
 # 1. The signature over SHA256SUMS, before anything else is downloaded.
-gh release download "$version" --repo "$REPO" -p SHA256SUMS -D "$tmp/dl" > /dev/null ||
-  die "could not download SHA256SUMS of release $version"
-gh release download "$version" --repo "$REPO" -p SHA256SUMS.sig -D "$tmp/dl" > /dev/null 2>&1 || true
-[ -f "$tmp/dl/SHA256SUMS" ] || die "release $version has no SHA256SUMS"
-[ -f "$tmp/dl/SHA256SUMS.sig" ] || die "release $version is not signed (no SHA256SUMS.sig); nothing was installed"
+if ! download SHA256SUMS; then
+  [ "$status" = 404 ] && die "release $version not found (or it has no SHA256SUMS)"
+  die "could not download SHA256SUMS of release $version (HTTP $status)"
+fi
+if ! download SHA256SUMS.sig; then
+  [ "$status" = 404 ] && die "release $version is not signed (no SHA256SUMS.sig); nothing was installed"
+  die "could not download SHA256SUMS.sig of release $version (HTTP $status)"
+fi
 printf '%s\n' "$signers" > "$tmp/allowed_signers"
 if ! ssh-keygen -Y verify -f "$tmp/allowed_signers" -I release@vault -n vault-release \
   -s "$tmp/dl/SHA256SUMS.sig" < "$tmp/dl/SHA256SUMS" > "$tmp/verify.log" 2>&1; then
@@ -162,8 +273,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$tmp/dl/SHA256SUMS"
 [ "$count" -gt 0 ] || die "SHA256SUMS does not list $archive (no build for $target in $version?)"
 [ "$count" = 1 ] || die "SHA256SUMS lists $archive more than once; refusing an ambiguous release"
-gh release download "$version" --repo "$REPO" -p "$archive" -D "$tmp/dl" > /dev/null ||
-  die "could not download $archive"
+download "$archive" || die "could not download $archive (HTTP $status)"
 [ -f "$tmp/dl/$archive" ] || die "could not download $archive"
 actual="$(sha256 "$tmp/dl/$archive")"
 expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"

@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Tests for scripts/install.sh against a local fake release: a throwaway OpenSSH key,
-# archives and SHA256SUMS generated here, and a fake `gh` (scripts/test/fake-gh) that
-# serves them from a directory. No network, no real release key. Runs on Linux and macOS
-# (bash 3.2 compatible). Usage: scripts/test/install_test.sh [test-name...]
+# archives and SHA256SUMS generated here, served over HTTPS by a local stand-in for
+# github.com and its API (scripts/test/fake-github/server.py, with a throwaway certificate
+# that curl and wget are told to trust). No network, no real release key, no gh. Runs on
+# Linux and macOS (bash 3.2 compatible); needs python3 and openssl.
+# Usage: scripts/test/install_test.sh [test-name...]
 set -uo pipefail
 scripts="$(cd "$(dirname "$0")/.." && pwd)"
 install="$scripts/install.sh"
-shim="$scripts/test/fake-gh"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/vault-install-test.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+server_pid=""
+trap '[ -z "$server_pid" ] || kill "$server_pid" 2> /dev/null; rm -rf "$tmp"' EXIT
 fails=0
 export COPYFILE_DISABLE=1 # macOS tar: no AppleDouble entries in the test archives
 placeholder='PLACEHOLDER — owner must replace'
@@ -35,6 +37,21 @@ host="$(host_target)"
 ssh-keygen -q -t ed25519 -N '' -C 'release@vault' -f "$tmp/key"
 ssh-keygen -q -t ed25519 -N '' -C 'release@vault' -f "$tmp/foreign"
 test_signers="release@vault namespaces=\"vault-release\" $(awk '{print $1 " " $2}' "$tmp/key.pub")"
+
+# The HTTPS stand-in for github.com: a throwaway self-signed certificate for localhost
+# and 127.0.0.1, trusted by curl (CURL_CA_BUNDLE) and wget (WGETRC) in each run below.
+mkdir -p "$tmp/tls" "$tmp/bin"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -config "$scripts/test/fake-github/cert.cnf" \
+  -keyout "$tmp/tls/key.pem" -out "$tmp/tls/cert.pem" > /dev/null 2>&1 || { echo "openssl could not make the test certificate"; exit 1; }
+printf 'ca_certificate = %s\n' "$tmp/tls/cert.pem" > "$tmp/tls/wgetrc"
+python3 -I "$scripts/test/fake-github/server.py" "$tmp" "$tmp/tls/cert.pem" "$tmp/tls/key.pem" "$tmp/tls/port" 2> "$tmp/server.log" &
+server_pid=$!
+for _ in $(seq 100); do [ -s "$tmp/tls/port" ] && break; sleep 0.1; done
+[ -s "$tmp/tls/port" ] || { echo "the test server did not start:"; cat "$tmp/server.log"; exit 1; }
+port="$(cat "$tmp/tls/port")"
+# install.sh needs no GitHub CLI: a gh that records any call comes first on PATH.
+printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$tmp/gh-called" > "$tmp/bin/gh"
+chmod +x "$tmp/bin/gh"
 
 # make_archive <out.tar.gz> <version> <target> [binaries...]
 make_archive() {
@@ -84,8 +101,9 @@ fake() {
   echo "$f"
 }
 
-# run <name> <fake-dir> [args...]: runs install.sh in test mode with the test key.
-# Sets $out, $rc, $log (fake gh invocations), $home and $scratch (TMPDIR, must stay empty).
+# run <name> <fake-dir> [args...]: runs install.sh in test mode with the test key, against
+# the HTTPS stand-in serving <fake-dir>. Sets $out, $rc, $log (the requests the server got),
+# $home and $scratch (TMPDIR, must stay empty).
 # Extra environment comes from $extra (space-separated NAME=VALUE, no spaces in values); $use_test_mode=0 drops
 # VAULT_INSTALL_TEST=1; $path_prefix is put in front of PATH.
 # shellcheck disable=SC2086 # $extra is split into NAME=VALUE words on purpose
@@ -96,14 +114,15 @@ run() {
   [ -n "$f" ] && [ -s "$f/latest" ] || { echo "FAIL fixture for '$name' was not created"; exit 1; }
   home="$tmp/$name/home"
   scratch="$tmp/$name/scratch"
-  log="$tmp/$name/gh.log"
+  log="$(dirname "$f")/requests.log"
   mkdir -p "$home" "$scratch"
   : > "$log"
   if [ "${use_test_mode:-1}" = 1 ]; then mode=(VAULT_INSTALL_TEST=1); fi
   rc=0
-  out="$(env -u VAULT_INSTALL_TEST -u VAULT_INSTALL_TEST_ALLOWED_SIGNERS \
-    PATH="${path_prefix:+$path_prefix:}$shim:$PATH" HOME="$home" TMPDIR="$scratch" \
-    VAULT_FAKE_GH_DIR="$f" VAULT_FAKE_GH_LOG="$log" \
+  out="$(env -u VAULT_INSTALL_TEST -u VAULT_INSTALL_TEST_ALLOWED_SIGNERS -u VAULT_INSTALL_TEST_BASE_URL \
+    PATH="${path_prefix:+$path_prefix:}$tmp/bin:$PATH" HOME="$home" TMPDIR="$scratch" \
+    CURL_CA_BUNDLE="$tmp/tls/cert.pem" WGETRC="$tmp/tls/wgetrc" \
+    VAULT_INSTALL_TEST_BASE_URL="${base_override-https://localhost:$port/$(basename "$(dirname "$f")")}" \
     VAULT_INSTALL_TEST_ALLOWED_SIGNERS="${signers_override-$test_signers}" \
     ${mode[@]+"${mode[@]}"} $extra \
     "$BASH" "$install" "$@" 2>&1)" || rc=$?
@@ -128,7 +147,9 @@ listing() { ls -A "$1" | LC_ALL=C sort | tr '\n' ' '; }
 says_either() { says "$1" || says "$2"; }
 empty_dir() { [ -d "$1" ] && [ -z "$(ls -A "$1")" ]; }
 absent_or_empty() { [ ! -e "$1" ] || empty_dir "$1"; }
-no_download() { ! grep -q $'^release\tdownload' "$log"; }
+no_download() { ! grep -q '/releases/download/' "$log"; }
+no_api() { ! grep -q '/api/' "$log"; }
+no_gh() { [ ! -e "$tmp/gh-called" ]; }
 installed_version() { [ "$("$1/vaultctl")" = "vaultctl $2 ${3:-$host}" ]; }
 logged() { grep -q "$1" "$log"; }
 all_versions() { # all_versions <dir> <version>: every binary is that version
@@ -147,8 +168,11 @@ install_happy_path() {
     test "$(find "$d" -type f -perm 755 \( -name vaultctl -o -name vault-dev -o -name vault-relay \) | wc -l | tr -d ' ')" = 3
   check "installs nothing else" test "$(listing "$d")" = "vault-dev vault-relay vaultctl "
   check "temporary files are removed" empty_dir "$scratch"
-  check "asked gh for published releases, without drafts and pre-releases" \
-    logged $'^release\tlist\t--repo\t5V715/vault\t--exclude-drafts\t--exclude-pre-releases'
+  check "asked the API for the latest release" logged '^GET /happy/api/repos/5V715/vault/releases/latest$'
+  check "downloaded from the release URLs, redirected to the asset host" \
+    logged "^GET /happy/5V715/vault/releases/download/v1.3.0/vault-1.3.0-$host.tar.gz\$"
+  check "followed the redirect to the asset host" logged "^GET /happy/cdn/v1.3.0/vault-1.3.0-$host.tar.gz\$"
+  check "never ran gh" no_gh
   run happy "$f"
   check "default directory is ~/.local/bin" installed_version "$home/.local/bin" 1.3.0
   run happy "$f" --dir "$d"
@@ -243,14 +267,65 @@ install_refuses_placeholder_key() {
   fi
 }
 
-install_requires_gh_login() {
-  local f
-  f="$(fake login)"
-  extra="VAULT_FAKE_GH_AUTH_FAIL=1" run login "$f" --dir "$tmp/login/dest"
-  check "fails" failed
-  check "tells the user to run gh auth login" says "gh auth login"
-  check "downloads nothing" no_download
-  check "installs nothing" absent_or_empty "$tmp/login/dest"
+install_refuses_foreign_redirect() {
+  local f u
+  # A release download that redirects off GitHub (and off https) is refused before any
+  # byte is fetched from there.
+  for u in https://evil.example/assets http://127.0.0.1:$port/redirect/cdn "https://user@127.0.0.1:$port/redirect/cdn"; do
+    f="$tmp/redirect/gh"
+    rm -rf "$tmp/redirect"
+    release "$f" v1.3.0
+    echo v1.3.0 > "$f/latest"
+    echo "$u" > "$f/redirect-to"
+    run redirect "$f" --dir "$tmp/redirect/dest"
+    check "redirect to $u: fails" failed
+    check "redirect to $u: says it refuses the host" says "refusing to download from"
+    check "redirect to $u: fetched nothing from the redirect target" bash -c "! grep -q '/cdn/' '$log'"
+    check "redirect to $u: installs nothing" absent_or_empty "$tmp/redirect/dest"
+  done
+  # The test-mode base URL itself must be https.
+  f="$(fake plainhttp)"
+  base_override="http://localhost:$port/plainhttp" run plainhttp "$f" --dir "$tmp/plainhttp/dest"
+  check "http base URL: refused" says "must be an https URL"
+  check "http base URL: installs nothing" absent_or_empty "$tmp/plainhttp/dest"
+}
+
+install_reports_rate_limit() {
+  local f d
+  f="$(fake ratelimit)"
+  touch "$f/ratelimit"
+  d="$tmp/ratelimit/dest"
+  run ratelimit "$f" --dir "$d"
+  check "latest without API quota: fails" failed
+  check "latest without API quota: says the rate limit is used up and how to avoid it" says "rate limit"
+  check "latest without API quota: suggests --version" says "--version vX.Y.Z"
+  check "latest without API quota: downloads nothing" no_download
+  run ratelimit "$f" --version v1.3.0 --dir "$d"
+  check "--version needs no API request: installs" installed_version "$d" 1.3.0
+  check "--version needs no API request: none made" no_api
+}
+
+install_with_wget() {
+  local f d
+  if ! command -v wget > /dev/null 2>&1; then
+    echo "  skip (no wget on this host)"
+    return 0
+  fi
+  f="$(fake wget)"
+  d="$tmp/wget/dest"
+  extra="VAULT_INSTALL_TEST_DOWNLOADER=wget" run wget "$f" --dir "$d"
+  check "wget: installs the latest release" installed_version "$d" 1.3.0
+  check "wget: followed the redirect to the asset host" logged "^GET /wget/cdn/v1.3.0/vault-1.3.0-$host.tar.gz\$"
+  check "wget: temporary files are removed" empty_dir "$scratch"
+  make_archive "$f/releases/v1.3.0/vault-1.3.0-$host.tar.gz" 6.6.6 "$host"
+  extra="VAULT_INSTALL_TEST_DOWNLOADER=wget" run wget "$f" --dir "$tmp/wget/tampered"
+  check "wget: tampered archive refused" says "does not match SHA256SUMS"
+  rm "$f/releases/v1.3.0/SHA256SUMS.sig"
+  extra="VAULT_INSTALL_TEST_DOWNLOADER=wget" run wget "$f" --dir "$tmp/wget/unsigned"
+  check "wget: unsigned release refused" says "not signed"
+  echo https://evil.example/x > "$f/redirect-to"
+  extra="VAULT_INSTALL_TEST_DOWNLOADER=wget" run wget "$f" --version v1.2.3 --dir "$tmp/wget/redirect"
+  check "wget: foreign redirect refused" says "refusing to download from"
 }
 
 install_pins_version() {
@@ -260,7 +335,7 @@ install_pins_version() {
   run pin "$f" --version v1.2.3 --dir "$d"
   check "exits 0" succeeded
   check "installs the pinned version, not the latest" installed_version "$d" 1.2.3
-  check "does not look up the latest release" bash -c "! grep -qE $'^release\t(view|list)' '$log'"
+  check "does not look up the latest release" no_api
   run pin "$f" --version=v1.2.3 --dir "$d"
   check "--version=TAG form works" succeeded
   local bad
@@ -304,19 +379,22 @@ install_cleans_up_on_failure() {
 }
 
 test_override_ignored_without_test_mode() {
-  local f
+  local f mode
   f="$(fake notest)"
-  # A valid release signed by the test key, and the override pointing at that key: without
-  # VAULT_INSTALL_TEST=1 the embedded trust root is used, so this must not install.
-  use_test_mode=0 run notest "$f" --dir "$tmp/notest/dest"
-  check "fails" failed
-  check "uses the embedded trust root (placeholder refused or test key rejected)" \
-    says_either "release key not configured" "signature check failed"
-  check "installs nothing" absent_or_empty "$tmp/notest/dest"
-  use_test_mode=0 extra="VAULT_INSTALL_TEST=0" run notest "$f" --dir "$tmp/notest/dest"
-  check "VAULT_INSTALL_TEST=0 is not test mode" absent_or_empty "$tmp/notest/dest"
-  use_test_mode=0 extra="VAULT_INSTALL_TEST=yes" run notest "$f" --dir "$tmp/notest/dest"
-  check "VAULT_INSTALL_TEST=yes is not test mode" absent_or_empty "$tmp/notest/dest"
+  # A valid release signed by the test key, and the overrides pointing at that key and at
+  # the local server: without VAULT_INSTALL_TEST=1 the embedded trust root and the real
+  # github.com are used, so this must not install. A dead proxy keeps the run off the
+  # network (a real key would get as far as connecting).
+  for mode in unset VAULT_INSTALL_TEST=0 VAULT_INSTALL_TEST=yes; do
+    if [ "$mode" = unset ]; then mode=""; fi
+    use_test_mode=0 extra="$mode https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 no_proxy= NO_PROXY=" \
+      run notest "$f" --dir "$tmp/notest/dest"
+    check "${mode:-no test mode}: fails" failed
+    check "${mode:-no test mode}: uses the embedded trust root and github.com (placeholder refused, or no connection)" \
+      says_either "release key not configured" "could not connect to https://api.github.com/"
+    check "${mode:-no test mode}: never contacted the test server" test ! -s "$log"
+    check "${mode:-no test mode}: installs nothing" absent_or_empty "$tmp/notest/dest"
+  done
 }
 
 install_detects_target() {
@@ -438,7 +516,8 @@ pinned_prerelease_installs() {
 }
 
 all="install_happy_path install_rejects_tampered_archive install_rejects_foreign_signature
-install_rejects_unsigned_release install_refuses_placeholder_key install_requires_gh_login
+install_rejects_unsigned_release install_refuses_placeholder_key install_refuses_foreign_redirect
+install_reports_rate_limit install_with_wget
 install_pins_version install_cleans_up_on_failure test_override_ignored_without_test_mode
 install_detects_target install_partial_failure_rolls_back install_dir_with_spaces_cleanup_is_safe latest_skips_prerelease pinned_prerelease_installs"
 # shellcheck disable=SC2086 # word list
