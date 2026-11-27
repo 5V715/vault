@@ -322,6 +322,7 @@ class ReplicationTest {
         val replicated = replicaFiles()
         assertTrue(replicated.isNotEmpty())
         assertNotNull(pending(JobKind.Periodic))
+        val lastRun0 = status().lastRunMs
 
         // While a session holds the vault: refused before any prompt.
         h.toRunning()
@@ -331,6 +332,14 @@ class ReplicationTest {
         assertTrue(h.standIn.ok("/lock").startsWith("closed"))
         h.awaitServiceStopped()
         awaitHandleClosed()
+        // The session's end queues an after-session replication, which takes the vault's
+        // lock while it runs (delete would rightly say Busy: CI run 46031365491, API 36).
+        // Let it be queued or run, drop it, and wait until no run holds the vault.
+        h.awaitTrue("the after-session job queued or run") {
+            pending(JobKind.AfterSession) != null || status().lastRunMs != lastRun0
+        }
+        scheduler.cancel(jobId(JobKind.AfterSession))
+        h.awaitTrue("no replication holds the vault") { !h.locks.of(h.dir.id).isLocked }
 
         // A mistyped app id: refused before any prompt.
         for (typed in listOf("", "tod", "Todo", " todo")) {

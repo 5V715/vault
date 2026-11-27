@@ -13,7 +13,10 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import dev.vault.android.MainActivity
 import dev.vault.android.R
 import dev.vault.android.VaultApp
@@ -38,6 +41,13 @@ class SessionService : Service() {
 
     /** [shutdown] was asked for (nothing left to hold), as opposed to a system stop. */
     private var stopping = false
+
+    // Notification updates are throttled: Android drops ("sheds") updates from an app
+    // that posts more than about 5 per second, and a dropped last update leaves a stale
+    // notification (CI run 46031365491, API 36: the Running notification never showed).
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastPostMs = 0L
+    private var refreshQueued = false
 
     private val screenOff = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -80,6 +90,7 @@ class SessionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         unregisterReceiver(screenOff)
         coordinator.detach(this, requested = stopping)
         if (live?.get() === this) live = null
@@ -101,10 +112,22 @@ class SessionService : Service() {
         // Through startForeground, not NotificationManager.notify: a plain
         // re-post loses FLAG_FOREGROUND_SERVICE on Android 11 (the
         // notification becomes dismissable and detached from the service).
-        goForeground()
+        // At most one update per MIN_UPDATE_MS; a refresh inside that window is
+        // posted at its end (trailing), so the latest state always shows.
+        val wait = lastPostMs + MIN_UPDATE_MS - SystemClock.uptimeMillis()
+        if (wait <= 0) {
+            goForeground()
+        } else if (!refreshQueued) {
+            refreshQueued = true
+            handler.postDelayed({
+                refreshQueued = false
+                if (!stopping) goForeground()
+            }, wait)
+        }
     }
 
     private fun goForeground() {
+        lastPostMs = SystemClock.uptimeMillis()
         val n = notification()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -153,6 +176,9 @@ class SessionService : Service() {
     companion object {
         const val ACTION_STOP = "dev.vault.android.action.STOP_SESSIONS"
         const val NOTIFICATION_ID = 1
+
+        /** The shortest gap between two notification updates (Android sheds more than ~5/s). */
+        const val MIN_UPDATE_MS = 300L
         const val CHANNEL = "sessions"
         const val STOP_LABEL = "Stop"
 
