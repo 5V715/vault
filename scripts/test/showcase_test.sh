@@ -254,7 +254,9 @@ sc() {
   rc=$?
 }
 
-has() { printf '%s' "$out" | grep -qF -- "$1"; }
+# Here-strings, not `printf | grep -q`: under pipefail, grep -q exiting at the first match
+# can kill printf with SIGPIPE and fail the pipeline (CI run 46028931294, macOS).
+has() { grep -qF -- "$1" <<< "$out"; }
 logged() { grep -qF -- "$1" "$tmp/$2/log" 2> /dev/null; }
 count_log() { grep -cF -- "$1" "$tmp/$2/log" 2> /dev/null || true; }
 want() { [ -z "$selected" ] || case " $selected " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
@@ -763,7 +765,9 @@ EOF
   lan $n "$r" "$b" --lan-ip 127.0.0.1
   check "$n: works without name constraints" "$rc" "$out"
   { has "cannot add name constraints" && has "not name-constrained"; }; check "$n: warns" $? "$out"
-  ! openssl x509 -noout -text -in "$tmp/$n/demo/ca/ca.pem" | grep -q "Name Constraints"
+  local text
+  text="$(openssl x509 -noout -text -in "$tmp/$n/demo/ca/ca.pem")"
+  { [ -n "$text" ] && ! grep -q "Name Constraints" <<< "$text"; }
   check "$n: the CA has no name constraints" $?
 }
 
@@ -776,7 +780,7 @@ t_lan_ca_scoped_to_ip() {
   lan $n "$r" "$b"
   check "$n: run" "$rc" "$out"
   openssl x509 -noout -text -in "$ca/ca.pem" > "$tmp/$n/ca.txt" 2>&1
-  { grep -A4 "Name Constraints: critical" "$tmp/$n/ca.txt" | grep -q "Permitted:" &&
+  { grep -q "Permitted:" <<< "$(grep -A4 "Name Constraints: critical" "$tmp/$n/ca.txt")" &&
     grep -q "IP:192.168.1.77/255.255.255.255" "$tmp/$n/ca.txt" && grep -q "DNS:localhost" "$tmp/$n/ca.txt" &&
     [ "$(grep -c "IP:" "$tmp/$n/ca.txt")" = 1 ] && ! grep -q "Excluded" "$tmp/$n/ca.txt"; }
   check "$n: critical name constraints permit exactly IP:<ip>/32 and DNS:localhost" $? "$(cat "$tmp/$n/ca.txt")"
@@ -790,7 +794,7 @@ t_lan_ca_scoped_to_ip() {
   local v
   v="$(openssl verify -CAfile "$ca/ca.pem" "$tmp/$n/other.pem" 2>&1)"
   { [ -s "$tmp/$n/other.pem" ] && ! openssl verify -CAfile "$ca/ca.pem" "$tmp/$n/other.pem" > /dev/null 2>&1 &&
-    printf '%s' "$v" | grep -qi "subtree"; }
+    grep -qi "subtree" <<< "$v"; }
   check "$n: a certificate for another LAN host fails on the name constraints" $? "$v"
 }
 
