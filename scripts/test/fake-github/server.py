@@ -88,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
         name, rest = parts[0], parts[1:]
         base = ROOT / name
         gh = base / "gh"
-        with open(base / "requests.log", "a", encoding="utf-8") as f:
+        with open(base / "requests.log", "a", encoding="utf-8", newline="\n") as f:
             f.write(f"GET {self.path}\n")
         port = self.server.server_address[1]
         tags = tags_of(gh)
